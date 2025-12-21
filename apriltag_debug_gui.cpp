@@ -1,0 +1,3248 @@
+// AprilTag Detection Debugging GUI Tool
+// Displays all debugging stages side by side for two input images
+// Allows comparison of different preprocessing and detection stages
+
+#include <opencv2/opencv.hpp>
+#include <apriltag/apriltag.h>
+#include <apriltag/tag36h11.h>
+#include <apriltag/common/image_u8.h>
+#include <apriltag/common/zarray.h>
+#include <apriltag/common/workerpool.h>
+
+#include <QApplication>
+#include <QWidget>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QPushButton>
+#include <QLabel>
+#include <QComboBox>
+#include <QGroupBox>
+#include <QFileDialog>
+#include <QScrollArea>
+#include <QMessageBox>
+#include <QImage>
+#include <QPixmap>
+#include <QGraphicsView>
+#include <QGraphicsScene>
+#include <QGraphicsPixmapItem>
+#include <QDebug>
+#include <QSlider>
+#include <QSpinBox>
+#include <QCheckBox>
+#include <QTextEdit>
+#include <QSplitter>
+#include <QTabWidget>
+#include <QTimer>
+#include <QSlider>
+#include <QSpinBox>
+#include <QFormLayout>
+#include <QDir>
+#include <QDateTime>
+#include <QFileInfo>
+#include <QLineEdit>
+#include <QRadioButton>
+
+// MindVision SDK (optional)
+#ifdef HAVE_MINDVISION_SDK
+extern "C" {
+#include "CameraApi.h"
+}
+#endif
+
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <chrono>
+#include <thread>
+#include <mutex>
+
+using namespace cv;
+using namespace std;
+
+// Camera mode structures
+struct Mode {
+    int width;
+    int height;
+    double fps;
+    string label;
+};
+
+struct MVMode {
+    int width;
+    int height;
+    int frame_speed_index;
+    string label;
+};
+
+// Tag36h11 bit positions (1-indexed, from tag36h11.c)
+static const int TAG36H11_BIT_X[36] = {
+    1, 2, 3, 4, 5, 2, 3, 4, 3, 6, 6, 6, 6, 6, 5, 5, 5, 4, 6, 5, 4, 3, 2, 5, 4, 3, 4, 1, 1, 1, 1, 1, 2, 2, 2, 3
+};
+static const int TAG36H11_BIT_Y[36] = {
+    1, 1, 1, 1, 1, 2, 2, 2, 3, 1, 2, 3, 4, 5, 2, 3, 4, 3, 6, 6, 6, 6, 6, 5, 5, 5, 4, 6, 5, 4, 3, 2, 5, 4, 3, 4
+};
+
+class AprilTagDebugGUI : public QWidget {
+    Q_OBJECT
+
+public:
+    AprilTagDebugGUI(QWidget *parent = nullptr) : QWidget(parent),
+        useMindVision_(false),
+        cameraOpen_(false),
+        selectedCameraIndex_(-1),
+        previewTimer_(nullptr),
+        fisheye_undistort_enabled_(false) {
+#ifdef HAVE_MINDVISION_SDK
+        mvHandle_ = 0;
+#else
+        mvHandle_ = nullptr;
+#endif
+        setupUI();
+        
+        // Load fisheye calibration on startup
+        QString calib_path = "/home/nav/9202/Hiru/Apriltag/calibration_data/camera_params.yaml";
+        loadFisheyeCalibration(calib_path);
+        
+        // Initialize AprilTag detector
+        tf_ = tag36h11_create();
+        td_ = apriltag_detector_create();
+        apriltag_detector_add_family(td_, tf_);
+        td_->quad_decimate = 1.0;
+        td_->quad_sigma = 0.0;
+        td_->refine_edges = 1;
+        td_->decode_sharpening = 0.25;
+        td_->nthreads = 4;
+        td_->wp = workerpool_create(4);
+    }
+
+    ~AprilTagDebugGUI() {
+        apriltag_detector_destroy(td_);
+        tag36h11_destroy(tf_);
+    }
+
+private slots:
+    void loadImage1() {
+        QString filename = QFileDialog::getOpenFileName(this, "Load Image 1", "", "Images (*.png *.jpg *.jpeg *.bmp)");
+        if (!filename.isEmpty()) {
+            image1_ = imread(filename.toStdString(), IMREAD_GRAYSCALE);
+            if (!image1_.empty()) {
+                image1_path_ = filename.toStdString();
+                processImages();
+            } else {
+                QMessageBox::warning(this, "Error", "Failed to load image 1");
+            }
+        }
+    }
+
+    void loadImage2() {
+        QString filename = QFileDialog::getOpenFileName(this, "Load Image 2", "", "Images (*.png *.jpg *.jpeg *.bmp)");
+        if (!filename.isEmpty()) {
+            image2_ = imread(filename.toStdString(), IMREAD_GRAYSCALE);
+            if (!image2_.empty()) {
+                image2_path_ = filename.toStdString();
+                processImages();
+            } else {
+                QMessageBox::warning(this, "Error", "Failed to load image 2");
+            }
+        }
+    }
+
+    void stageChanged() {
+        processImages();
+    }
+
+private:
+    void setupUI() {
+        QVBoxLayout *mainLayout = new QVBoxLayout(this);
+        
+        // Create tab widget
+        tabWidget_ = new QTabWidget(this);
+        
+        // ========== PROCESSING TAB ==========
+        QWidget *processingTab = new QWidget(this);
+        QVBoxLayout *processingLayout = new QVBoxLayout(processingTab);
+        
+        // Control panel
+        QHBoxLayout *controlLayout = new QHBoxLayout();
+        
+        QPushButton *loadBtn1 = new QPushButton("Load Image 1", this);
+        QPushButton *loadBtn2 = new QPushButton("Load Image 2", this);
+        connect(loadBtn1, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage1);
+        connect(loadBtn2, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage2);
+        
+        controlLayout->addWidget(loadBtn1);
+        controlLayout->addWidget(loadBtn2);
+        controlLayout->addStretch();
+        
+        processingLayout->addLayout(controlLayout);
+
+        // Stage selection
+        QGroupBox *stageGroup = new QGroupBox("Stage Selection", this);
+        QHBoxLayout *stageLayout = new QHBoxLayout();
+        
+        // Preprocessing stage
+        QLabel *preprocessLabel = new QLabel("Preprocessing:", this);
+        preprocessCombo_ = new QComboBox(this);
+        preprocessCombo_->addItems({
+            "Original", "Histogram Equalization", "CLAHE (clip=2.0)", 
+            "CLAHE (clip=3.0)", "CLAHE (clip=4.0)", "Gamma 1.2", 
+            "Gamma 1.5", "Gamma 2.0", "Contrast Enhancement"
+        });
+        connect(preprocessCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::stageChanged);
+        
+        // Edge detection stage
+        QLabel *edgeLabel = new QLabel("Edge Detection:", this);
+        edgeCombo_ = new QComboBox(this);
+        edgeCombo_->addItems({
+            "None", "Canny (50,150)", "Canny (75,200)", "Canny (100,200)",
+            "Sobel", "Laplacian", "Adaptive Threshold"
+        });
+        connect(edgeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::stageChanged);
+        
+        // Detection stage
+        QLabel *detectionLabel = new QLabel("Detection:", this);
+        detectionCombo_ = new QComboBox(this);
+        detectionCombo_->addItems({
+            "Original", "With Detection", "Contours Only", "Quadrilaterals Only",
+            "Convex Quads Only", "Tag-Sized Quads"
+        });
+        connect(detectionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::stageChanged);
+        
+        // Advanced visualization stage
+        QLabel *advancedLabel = new QLabel("Advanced:", this);
+        advancedCombo_ = new QComboBox(this);
+        advancedCombo_->addItems({
+            "None", "Corner Refinement", "Warped Tags", "Pattern Extraction", "Hamming Decode"
+        });
+        connect(advancedCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::stageChanged);
+        
+        // Quad selection (for Warped Tags and later stages) - independent for each image
+        QLabel *quadLabel1 = new QLabel("Quad (Img1):", this);
+        quadCombo1_ = new QComboBox(this);
+        quadCombo1_->setEnabled(false);  // Disabled until a quad stage is selected
+        connect(quadCombo1_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &AprilTagDebugGUI::stageChanged);
+        
+        QLabel *quadLabel2 = new QLabel("Quad (Img2):", this);
+        quadCombo2_ = new QComboBox(this);
+        quadCombo2_->setEnabled(false);  // Disabled until a quad stage is selected
+        connect(quadCombo2_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &AprilTagDebugGUI::stageChanged);
+        
+        connect(advancedCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), [this](int index) {
+            // Enable quad selection for Warped Tags (2), Pattern Extraction (3), and Hamming Decode (4)
+            bool enable = (index >= 2 && index <= 4);
+            if (quadCombo1_) quadCombo1_->setEnabled(enable);
+            if (quadCombo2_) quadCombo2_->setEnabled(enable);
+            if (enable) {
+                // Update quad list when switching to these modes
+                stageChanged();
+            }
+        });
+        
+        stageLayout->addWidget(preprocessLabel);
+        stageLayout->addWidget(preprocessCombo_);
+        stageLayout->addWidget(edgeLabel);
+        stageLayout->addWidget(edgeCombo_);
+        stageLayout->addWidget(detectionLabel);
+        stageLayout->addWidget(detectionCombo_);
+        stageLayout->addWidget(advancedLabel);
+        stageLayout->addWidget(advancedCombo_);
+        stageLayout->addWidget(quadLabel1);
+        stageLayout->addWidget(quadCombo1_);
+        stageLayout->addWidget(quadLabel2);
+        stageLayout->addWidget(quadCombo2_);
+        
+        // Mirror options (independent for each image)
+        QLabel *mirrorLabel = new QLabel("Mirror:", this);
+        mirrorCheckbox1_ = new QCheckBox("Image 1", this);
+        mirrorCheckbox2_ = new QCheckBox("Image 2", this);
+        connect(mirrorCheckbox1_, &QCheckBox::toggled, this, &AprilTagDebugGUI::stageChanged);
+        connect(mirrorCheckbox2_, &QCheckBox::toggled, this, &AprilTagDebugGUI::stageChanged);
+        stageLayout->addWidget(mirrorLabel);
+        stageLayout->addWidget(mirrorCheckbox1_);
+        stageLayout->addWidget(mirrorCheckbox2_);
+        stageLayout->addStretch();
+        
+        stageGroup->setLayout(stageLayout);
+        mainLayout->addWidget(stageGroup);
+
+        // Create splitter for image and info panel
+        QSplitter *mainSplitter = new QSplitter(Qt::Horizontal, this);
+        
+        // Image display area (side by side)
+        QWidget *imageWidget = new QWidget(this);
+        QHBoxLayout *imageLayout = new QHBoxLayout(imageWidget);
+        
+        // Image 1
+        QGroupBox *img1Group = new QGroupBox("Image 1", this);
+        QVBoxLayout *img1Layout = new QVBoxLayout();
+        label1_ = new QLabel(this);
+        label1_->setMinimumSize(640, 480);
+        label1_->setAlignment(Qt::AlignCenter);
+        label1_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        label1_->setText("Load Image 1");
+        img1Layout->addWidget(label1_);
+        
+        // Quality metrics box for Image 1
+        QGroupBox *quality1Group = new QGroupBox("Quality Metrics", this);
+        QVBoxLayout *quality1Layout = new QVBoxLayout();
+        qualityText1_ = new QTextEdit(this);
+        qualityText1_->setReadOnly(true);
+        qualityText1_->setMaximumHeight(150);
+        qualityText1_->setFont(QFont("Courier", 8));
+        qualityText1_->setPlainText("Load image and select visualization mode to see quality metrics.");
+        quality1Layout->addWidget(qualityText1_);
+        quality1Group->setLayout(quality1Layout);
+        img1Layout->addWidget(quality1Group);
+        
+        img1Group->setLayout(img1Layout);
+        
+        // Image 2
+        QGroupBox *img2Group = new QGroupBox("Image 2", this);
+        QVBoxLayout *img2Layout = new QVBoxLayout();
+        label2_ = new QLabel(this);
+        label2_->setMinimumSize(640, 480);
+        label2_->setAlignment(Qt::AlignCenter);
+        label2_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        label2_->setText("Load Image 2");
+        img2Layout->addWidget(label2_);
+        
+        // Quality metrics box for Image 2
+        QGroupBox *quality2Group = new QGroupBox("Quality Metrics", this);
+        QVBoxLayout *quality2Layout = new QVBoxLayout();
+        qualityText2_ = new QTextEdit(this);
+        qualityText2_->setReadOnly(true);
+        qualityText2_->setMaximumHeight(150);
+        qualityText2_->setFont(QFont("Courier", 8));
+        qualityText2_->setPlainText("Load image and select visualization mode to see quality metrics.");
+        quality2Layout->addWidget(qualityText2_);
+        quality2Group->setLayout(quality2Layout);
+        img2Layout->addWidget(quality2Group);
+        
+        img2Group->setLayout(img2Layout);
+        
+        imageLayout->addWidget(img1Group);
+        imageLayout->addWidget(img2Group);
+        imageLayout->setContentsMargins(0, 0, 0, 0);
+        imageWidget->setLayout(imageLayout);
+        mainSplitter->addWidget(imageWidget);
+        
+        // Information panel for extracted codes and steps
+        QGroupBox *infoGroup = new QGroupBox("Extracted Codes & Decoding Steps", this);
+        QVBoxLayout *infoLayout = new QVBoxLayout();
+        infoText_ = new QTextEdit(this);
+        infoText_->setReadOnly(true);
+        infoText_->setMaximumWidth(400);
+        infoText_->setFont(QFont("Courier", 9));
+        infoText_->setPlainText("Select an Advanced visualization mode to see extracted codes and decoding steps here.");
+        infoLayout->addWidget(infoText_);
+        infoGroup->setLayout(infoLayout);
+        mainSplitter->addWidget(infoGroup);
+        
+        // Set splitter sizes (70% for images, 30% for info)
+        mainSplitter->setSizes({700, 300});
+        processingLayout->addWidget(mainSplitter);
+        processingTab->setLayout(processingLayout);
+        tabWidget_->addTab(processingTab, "Processing");
+        
+        // ========== CAPTURE TAB ==========
+        QWidget *captureTab = new QWidget(this);
+        QVBoxLayout *captureLayout = new QVBoxLayout(captureTab);
+        setupCaptureTab(captureLayout);
+        tabWidget_->addTab(captureTab, "Capture");
+        
+        // ========== FISHEYE CORRECTION TAB ==========
+        setupFisheyeTab();
+        
+        // Fisheye correction status indicator (at the top, outside tabs)
+        QGroupBox *fisheyeStatusGroup = new QGroupBox("Fisheye Correction Status", this);
+        QHBoxLayout *fisheyeStatusLayout = new QHBoxLayout();
+        
+        fisheyeStatusIndicator_ = new QLabel("Status: Not Applied", this);
+        fisheyeStatusIndicator_->setStyleSheet(
+            "QLabel { "
+            "background-color: #ffcccc; "
+            "color: #000000; "
+            "padding: 8px; "
+            "border: 2px solid #ff0000; "
+            "border-radius: 5px; "
+            "font-weight: bold; "
+            "font-size: 12pt; "
+            "}");
+        fisheyeStatusLabel_->setAlignment(Qt::AlignCenter);
+        
+        fisheyeStatusLayout->addWidget(fisheyeStatusIndicator_);
+        fisheyeStatusGroup->setLayout(fisheyeStatusLayout);
+        mainLayout->addWidget(fisheyeStatusGroup);
+        
+        mainLayout->addWidget(tabWidget_);
+
+        setWindowTitle("AprilTag Detection Debugging Tool");
+        resize(1400, 700);
+    }
+
+    Mat preprocessImage(const Mat &img, int method) {
+        Mat result;
+        
+        switch (method) {
+            case 0: // Original
+                result = img.clone();
+                break;
+            case 1: // Histogram Equalization
+                equalizeHist(img, result);
+                break;
+            case 2: // CLAHE clip=2.0
+                {
+                    Ptr<CLAHE> clahe = createCLAHE(2.0, Size(8, 8));
+                    clahe->apply(img, result);
+                }
+                break;
+            case 3: // CLAHE clip=3.0
+                {
+                    Ptr<CLAHE> clahe = createCLAHE(3.0, Size(8, 8));
+                    clahe->apply(img, result);
+                }
+                break;
+            case 4: // CLAHE clip=4.0
+                {
+                    Ptr<CLAHE> clahe = createCLAHE(4.0, Size(8, 8));
+                    clahe->apply(img, result);
+                }
+                break;
+            case 5: // Gamma 1.2
+                {
+                    double gamma = 1.2;
+                    double inv_gamma = 1.0 / gamma;
+                    Mat table(1, 256, CV_8U);
+                    uchar *p = table.ptr();
+                    for (int i = 0; i < 256; i++) {
+                        p[i] = saturate_cast<uchar>(pow(i / 255.0, inv_gamma) * 255.0);
+                    }
+                    LUT(img, table, result);
+                }
+                break;
+            case 6: // Gamma 1.5
+                {
+                    double gamma = 1.5;
+                    double inv_gamma = 1.0 / gamma;
+                    Mat table(1, 256, CV_8U);
+                    uchar *p = table.ptr();
+                    for (int i = 0; i < 256; i++) {
+                        p[i] = saturate_cast<uchar>(pow(i / 255.0, inv_gamma) * 255.0);
+                    }
+                    LUT(img, table, result);
+                }
+                break;
+            case 7: // Gamma 2.0
+                {
+                    double gamma = 2.0;
+                    double inv_gamma = 1.0 / gamma;
+                    Mat table(1, 256, CV_8U);
+                    uchar *p = table.ptr();
+                    for (int i = 0; i < 256; i++) {
+                        p[i] = saturate_cast<uchar>(pow(i / 255.0, inv_gamma) * 255.0);
+                    }
+                    LUT(img, table, result);
+                }
+                break;
+            case 8: // Contrast Enhancement
+                img.convertTo(result, -1, 2.0, 50);
+                break;
+            default:
+                result = img.clone();
+        }
+        
+        return result;
+    }
+
+    Mat applyEdgeDetection(const Mat &img, int method) {
+        Mat result;
+        
+        switch (method) {
+            case 0: // None
+                result = img.clone();
+                break;
+            case 1: // Canny (50, 150)
+                Canny(img, result, 50, 150);
+                break;
+            case 2: // Canny (75, 200)
+                Canny(img, result, 75, 200);
+                break;
+            case 3: // Canny (100, 200)
+                Canny(img, result, 100, 200);
+                break;
+            case 4: // Sobel
+                {
+                    Mat sobel_x, sobel_y, sobel_combined;
+                    Sobel(img, sobel_x, CV_16S, 1, 0, 3);
+                    Sobel(img, sobel_y, CV_16S, 0, 1, 3);
+                    convertScaleAbs(sobel_x, sobel_x);
+                    convertScaleAbs(sobel_y, sobel_y);
+                    addWeighted(sobel_x, 0.5, sobel_y, 0.5, 0, result);
+                }
+                break;
+            case 5: // Laplacian
+                {
+                    Mat laplacian;
+                    Laplacian(img, laplacian, CV_16S, 3);
+                    convertScaleAbs(laplacian, result);
+                }
+                break;
+            case 6: // Adaptive Threshold
+                adaptiveThreshold(img, result, 255, ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                THRESH_BINARY, 11, 2);
+                break;
+            default:
+                result = img.clone();
+        }
+        
+        return result;
+    }
+
+    Mat drawDetections(const Mat &img, int method) {
+        Mat result = img.clone();
+        
+        if (method == 0) { // Original
+            Mat color_result;
+            if (result.channels() == 1) {
+                cvtColor(result, color_result, COLOR_GRAY2BGR);
+            } else {
+                color_result = result.clone();
+            }
+            return color_result;
+        }
+        
+        // Convert to image_u8_t for detection
+        if (!result.isContinuous()) {
+            result = result.clone();
+        }
+        
+        image_u8_t im = {
+            .width = result.cols,
+            .height = result.rows,
+            .stride = result.cols,
+            .buf = result.data
+        };
+        
+        zarray_t* detections = apriltag_detector_detect(td_, &im);
+        
+        // Convert to color for drawing
+        Mat color_result;
+        cvtColor(result, color_result, COLOR_GRAY2BGR);
+        
+        if (method == 1) { // With Detection
+            // Draw all contours
+            vector<vector<Point>> contours;
+            vector<Vec4i> hierarchy;
+            findContours(result, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+            
+            // Draw AprilTag detections
+            for (int i = 0; i < zarray_size(detections); i++) {
+                apriltag_detection_t* det;
+                zarray_get(detections, i, &det);
+                
+                // Draw tag outline
+                line(color_result, Point(det->p[0][0], det->p[0][1]),
+                     Point(det->p[1][0], det->p[1][1]), Scalar(0, 255, 0), 2);
+                line(color_result, Point(det->p[1][0], det->p[1][1]),
+                     Point(det->p[2][0], det->p[2][1]), Scalar(0, 255, 0), 2);
+                line(color_result, Point(det->p[2][0], det->p[2][1]),
+                     Point(det->p[3][0], det->p[3][1]), Scalar(0, 255, 0), 2);
+                line(color_result, Point(det->p[3][0], det->p[3][1]),
+                     Point(det->p[0][0], det->p[0][1]), Scalar(0, 255, 0), 2);
+                
+                // Draw center and ID
+                circle(color_result, Point(det->c[0], det->c[1]), 5, Scalar(0, 0, 255), -1);
+                putText(color_result, to_string(det->id), 
+                       Point(det->c[0] + 10, det->c[1]),
+                       FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 255), 2);
+            }
+            
+            // Draw contours
+            for (size_t i = 0; i < contours.size(); i++) {
+                drawContours(color_result, contours, i, Scalar(255, 0, 0), 1);
+            }
+        } else if (method == 2) { // Contours Only
+            vector<vector<Point>> contours;
+            vector<Vec4i> hierarchy;
+            findContours(result, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+            for (size_t i = 0; i < contours.size(); i++) {
+                drawContours(color_result, contours, i, Scalar(255, 0, 0), 2);
+            }
+        } else if (method == 3) { // Quadrilaterals Only
+            vector<vector<Point>> contours;
+            vector<Vec4i> hierarchy;
+            findContours(result, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+            
+            for (size_t i = 0; i < contours.size(); i++) {
+                vector<Point> approx;
+                approxPolyDP(contours[i], approx, arcLength(contours[i], true) * 0.02, true);
+                
+                if (approx.size() == 4 && isContourConvex(approx)) {
+                    // Check if it's tag-sized
+                    double area = contourArea(approx);
+                    if (area > 100 && area < 50000) {
+                        drawContours(color_result, vector<vector<Point>>{approx}, 0, Scalar(0, 255, 0), 2);
+                    }
+                }
+            }
+        } else if (method == 4) { // Convex Quads Only
+            vector<vector<Point>> contours;
+            vector<Vec4i> hierarchy;
+            findContours(result, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+            
+            for (size_t i = 0; i < contours.size(); i++) {
+                vector<Point> approx;
+                approxPolyDP(contours[i], approx, arcLength(contours[i], true) * 0.02, true);
+                
+                if (approx.size() == 4 && isContourConvex(approx)) {
+                    drawContours(color_result, vector<vector<Point>>{approx}, 0, Scalar(255, 255, 0), 2);
+                }
+            }
+        } else if (method == 5) { // Tag-Sized Quads
+            vector<vector<Point>> contours;
+            vector<Vec4i> hierarchy;
+            findContours(result, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+            
+            for (size_t i = 0; i < contours.size(); i++) {
+                double area = contourArea(contours[i]);
+                if (area > 100 && area < 50000) {
+                    vector<Point> approx;
+                    approxPolyDP(contours[i], approx, arcLength(contours[i], true) * 0.02, true);
+                    
+                    if (approx.size() == 4 && isContourConvex(approx)) {
+                        drawContours(color_result, vector<vector<Point>>{approx}, 0, Scalar(0, 255, 255), 2);
+                    }
+                }
+            }
+        }
+        
+        // Clean up detections
+        for (int i = 0; i < zarray_size(detections); i++) {
+            apriltag_detection_t* det;
+            zarray_get(detections, i, &det);
+            apriltag_detection_destroy(det);
+        }
+        zarray_destroy(detections);
+        
+        return color_result;
+    }
+    
+    // Helper function to refine corners
+    void refineCorners(const Mat& gray, vector<Point2f>& corners, int winSize = 5, int maxIter = 30) {
+        if (corners.size() != 4) return;
+        TermCriteria criteria(TermCriteria::EPS + TermCriteria::COUNT, maxIter, 0.001);
+        cornerSubPix(gray, corners, Size(winSize, winSize), Size(-1, -1), criteria);
+    }
+    
+    // Extract quadrilaterals from edge-detected image
+    vector<vector<Point2f>> extractQuadrilaterals(const Mat& edges, const Mat& original) {
+        vector<vector<Point2f>> quads;
+        
+        vector<vector<Point>> contours;
+        vector<Vec4i> hierarchy;
+        findContours(edges, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+        
+        double tag_min_area = 500;
+        double tag_max_area = 50000;
+        
+        for (size_t i = 0; i < contours.size(); i++) {
+            double area = contourArea(contours[i]);
+            if (area >= tag_min_area && area <= tag_max_area) {
+                vector<Point> approx;
+                double epsilon = 0.02 * arcLength(contours[i], true);
+                approxPolyDP(contours[i], approx, epsilon, true);
+                if (approx.size() == 4 && isContourConvex(approx)) {
+                    vector<Point2f> quad;
+                    for (int j = 0; j < 4; j++) {
+                        quad.push_back(Point2f(approx[j].x, approx[j].y));
+                    }
+                    quads.push_back(quad);
+                }
+            }
+        }
+        
+        return quads;
+    }
+    
+    // Extract 6x6 pattern from warped tag image
+    vector<vector<int>> extractPattern(const Mat& warped, int tagSize = 36, int borderSize = 4) {
+        int dataSize = tagSize - 2 * borderSize;
+        int cellSize = dataSize / 6;
+        
+        vector<vector<int>> pattern(6, vector<int>(6));
+        
+        for (int row = 0; row < 6; row++) {
+            for (int col = 0; col < 6; col++) {
+                int x_center = borderSize + col * cellSize + cellSize / 2;
+                int y_center = borderSize + row * cellSize + cellSize / 2;
+                
+                x_center = min(max(0, x_center), tagSize - 1);
+                y_center = min(max(0, y_center), tagSize - 1);
+                
+                pattern[row][col] = (int)warped.at<uchar>(y_center, x_center);
+            }
+        }
+        
+        return pattern;
+    }
+    
+    Mat drawAdvancedVisualization(const Mat &img, int method, int image_index = 1) {
+        Mat result = img.clone();
+        Mat color_result;
+        cvtColor(result, color_result, COLOR_GRAY2BGR);
+        
+        switch (method) {
+            case 1: { // Corner Refinement
+                // Need edge-detected image for quad extraction
+                Mat edges_for_quads;
+                if (image_index == 1 && !image1_.empty()) {
+                    Mat img1 = image1_.clone();
+                    bool use_mirror = mirrorCheckbox1_ ? mirrorCheckbox1_->isChecked() : false;
+                    if (use_mirror) flip(img1, img1, 1);
+                    Mat processed1 = preprocessImage(img1, preprocessCombo_->currentIndex());
+                    edges_for_quads = applyEdgeDetection(processed1, edgeCombo_->currentIndex());
+                } else if (image_index == 2 && !image2_.empty()) {
+                    Mat img2 = image2_.clone();
+                    bool use_mirror = mirrorCheckbox2_ ? mirrorCheckbox2_->isChecked() : false;
+                    if (use_mirror) flip(img2, img2, 1);
+                    Mat processed2 = preprocessImage(img2, preprocessCombo_->currentIndex());
+                    edges_for_quads = applyEdgeDetection(processed2, edgeCombo_->currentIndex());
+                } else {
+                    edges_for_quads = result.clone();
+                }
+                
+                vector<vector<Point2f>> quads = extractQuadrilaterals(edges_for_quads, result);
+                
+                if (quads.empty()) {
+                    putText(color_result, "No quadrilaterals found", Point(10, 30),
+                           FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 0, 255), 2);
+                    if (infoText_) {
+                        infoText_->setPlainText("No quadrilaterals found for corner refinement.");
+                    }
+                    QTextEdit* target_text = (image_index == 1) ? qualityText1_ : qualityText2_;
+                    if (target_text) {
+                        target_text->setPlainText("CORNER REFINEMENT\nNo quads found.\nCheck edge detection.");
+                    }
+                    return color_result;
+                }
+                
+                // Refine corners
+                vector<vector<Point2f>> refined_quads;
+                for (size_t i = 0; i < quads.size(); i++) {
+                    vector<Point2f> refined = quads[i];
+                    refineCorners(result, refined);
+                    refined_quads.push_back(refined);
+                    
+                    // Draw original quad (green, thin)
+                    for (int j = 0; j < 4; j++) {
+                        int next = (j + 1) % 4;
+                        line(color_result, quads[i][j], quads[i][next], Scalar(0, 255, 0), 1);
+                        circle(color_result, quads[i][j], 3, Scalar(0, 255, 0), -1);
+                        // Draw corner number
+                        putText(color_result, to_string(j), quads[i][j] + Point2f(5, -5),
+                               FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 1);
+                    }
+                    
+                    // Draw refined quad (red, thick)
+                    for (int j = 0; j < 4; j++) {
+                        int next = (j + 1) % 4;
+                        line(color_result, refined_quads[i][j], refined_quads[i][next], Scalar(0, 0, 255), 2);
+                        circle(color_result, refined_quads[i][j], 5, Scalar(0, 0, 255), -1);
+                    }
+                    
+                    // Draw movement vectors (yellow lines) and collect metrics
+                    vector<double> corner_movements;
+                    for (int j = 0; j < 4; j++) {
+                        line(color_result, quads[i][j], refined_quads[i][j], Scalar(0, 255, 255), 1);
+                        double dx = refined_quads[i][j].x - quads[i][j].x;
+                        double dy = refined_quads[i][j].y - quads[i][j].y;
+                        double dist = sqrt(dx*dx + dy*dy);
+                        corner_movements.push_back(dist);
+                        if (dist > 0.5) {  // Only show if moved significantly
+                            stringstream ss;
+                            ss << fixed << setprecision(1) << dist;
+                            Point2f mid = (quads[i][j] + refined_quads[i][j]) * 0.5;
+                            putText(color_result, ss.str(), mid, FONT_HERSHEY_SIMPLEX, 0.4, Scalar(0, 255, 255), 1);
+                        }
+                    }
+                    
+                    // Draw quad number
+                    Point2f center = (refined_quads[i][0] + refined_quads[i][1] + 
+                                     refined_quads[i][2] + refined_quads[i][3]) / 4;
+                    putText(color_result, "Quad " + to_string(i), center + Point2f(10, -10),
+                           FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 0), 2);
+                    
+                    // Store corner movements for info panel
+                    if (i == 0) {  // Store first quad's movements for display
+                        double avg_movement = 0;
+                        double max_movement = 0;
+                        for (double d : corner_movements) {
+                            avg_movement += d;
+                            if (d > max_movement) max_movement = d;
+                        }
+                        avg_movement /= 4.0;
+                        updateCornerRefinementInfo(avg_movement, max_movement, image_index);
+                    }
+                }
+                
+                // Add legend
+                putText(color_result, "Green: Original corners", Point(10, 30),
+                       FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+                putText(color_result, "Red: Refined corners", Point(10, 60),
+                       FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
+                putText(color_result, "Yellow: Movement vectors", Point(10, 90),
+                       FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 255), 2);
+            }
+            break;
+            
+            case 2: { // Warped Tags
+                // Need edge-detected image for quad extraction
+                Mat edges_for_quads;
+                Mat original_for_warp;
+                if (image_index == 1 && !image1_.empty()) {
+                    Mat img1 = image1_.clone();
+                    bool use_mirror = mirrorCheckbox1_ ? mirrorCheckbox1_->isChecked() : false;
+                    if (use_mirror) flip(img1, img1, 1);
+                    Mat processed1 = preprocessImage(img1, preprocessCombo_->currentIndex());
+                    edges_for_quads = applyEdgeDetection(processed1, edgeCombo_->currentIndex());
+                    original_for_warp = processed1.clone();
+                } else if (image_index == 2 && !image2_.empty()) {
+                    Mat img2 = image2_.clone();
+                    bool use_mirror = mirrorCheckbox2_ ? mirrorCheckbox2_->isChecked() : false;
+                    if (use_mirror) flip(img2, img2, 1);
+                    Mat processed2 = preprocessImage(img2, preprocessCombo_->currentIndex());
+                    edges_for_quads = applyEdgeDetection(processed2, edgeCombo_->currentIndex());
+                    original_for_warp = processed2.clone();
+                } else {
+                    edges_for_quads = result.clone();
+                    original_for_warp = result.clone();
+                }
+                
+                vector<vector<Point2f>> quads = extractQuadrilaterals(edges_for_quads, original_for_warp);
+                
+                if (quads.empty()) {
+                    putText(color_result, "No quadrilaterals found", Point(10, 30),
+                           FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 0, 255), 2);
+                    // Update quad combo to empty (block signals to prevent recursion)
+                    QComboBox* target_quad_combo = (image_index == 1) ? quadCombo1_ : quadCombo2_;
+                    if (target_quad_combo) {
+                        target_quad_combo->blockSignals(true);
+                        target_quad_combo->clear();
+                        target_quad_combo->blockSignals(false);
+                    }
+                    QTextEdit* target_text = (image_index == 1) ? qualityText1_ : qualityText2_;
+                    if (target_text) {
+                        target_text->setPlainText("WARPED TAGS\nNo quads found.\nCheck edge detection.");
+                    }
+                    return color_result;
+                }
+                
+                // Update quad combo box with available quads (block signals to prevent recursion)
+                QComboBox* target_quad_combo = (image_index == 1) ? quadCombo1_ : quadCombo2_;
+                if (target_quad_combo) {
+                    int current_selection = target_quad_combo->currentIndex();
+                    target_quad_combo->blockSignals(true);  // Prevent signal emission during update
+                    target_quad_combo->clear();
+                    for (size_t i = 0; i < quads.size(); i++) {
+                        target_quad_combo->addItem(QString("Quad %1").arg(i));
+                    }
+                    // Restore selection if valid
+                    if (current_selection >= 0 && current_selection < (int)quads.size()) {
+                        target_quad_combo->setCurrentIndex(current_selection);
+                    } else if (quads.size() > 0) {
+                        target_quad_combo->setCurrentIndex(0);
+                    }
+                    target_quad_combo->blockSignals(false);  // Re-enable signals
+                }
+                
+                // Get selected quad index
+                int selected_quad = target_quad_combo ? target_quad_combo->currentIndex() : 0;
+                if (selected_quad < 0 || selected_quad >= (int)quads.size()) {
+                    selected_quad = 0;
+                }
+                
+                // Refine and warp selected quad
+                int tagSize = 36;
+                int scale = 15;  // Scale factor for better visibility
+                int displaySize = tagSize * scale;
+                int padding = 40;
+                
+                Mat composite = Mat::ones(displaySize + padding * 2, displaySize + padding * 2, CV_8UC1) * 128;
+                
+                vector<Point2f> refined = quads[selected_quad];
+                refineCorners(original_for_warp, refined);
+                
+                vector<Point2f> dstQuad;
+                dstQuad.push_back(Point2f(0, 0));
+                dstQuad.push_back(Point2f(tagSize - 1, 0));
+                dstQuad.push_back(Point2f(tagSize - 1, tagSize - 1));
+                dstQuad.push_back(Point2f(0, tagSize - 1));
+                
+                Mat H = getPerspectiveTransform(refined, dstQuad);
+                Mat warped;
+                warpPerspective(original_for_warp, warped, H, Size(tagSize, tagSize));
+                
+                // Scale up
+                Mat warped_large;
+                cv::resize(warped, warped_large, Size(displaySize, displaySize), 0, 0, INTER_NEAREST);
+                
+                // Copy to composite (centered)
+                warped_large.copyTo(composite(Rect(padding, padding, displaySize, displaySize)));
+                
+                // Scale to fit display
+                cv::resize(composite, color_result, Size(result.cols, result.rows), 0, 0, INTER_LINEAR);
+                cvtColor(color_result, color_result, COLOR_GRAY2BGR);
+                
+                // Add labels
+                stringstream label;
+                label << "Warped Tag - Quad " << selected_quad << " (36x36, scaled 15x)";
+                putText(color_result, label.str(), Point(10, 30),
+                       FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), 2);
+                putText(color_result, "Total Quads: " + to_string(quads.size()), Point(10, 60),
+                       FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+            }
+            break;
+            
+            case 3: { // Pattern Extraction
+                // Need edge-detected image for quad extraction
+                Mat edges_for_quads;
+                Mat original_for_warp;
+                if (image_index == 1 && !image1_.empty()) {
+                    Mat img1 = image1_.clone();
+                    bool use_mirror = mirrorCheckbox1_ ? mirrorCheckbox1_->isChecked() : false;
+                    if (use_mirror) flip(img1, img1, 1);
+                    Mat processed1 = preprocessImage(img1, preprocessCombo_->currentIndex());
+                    edges_for_quads = applyEdgeDetection(processed1, edgeCombo_->currentIndex());
+                    original_for_warp = processed1.clone();
+                } else if (image_index == 2 && !image2_.empty()) {
+                    Mat img2 = image2_.clone();
+                    bool use_mirror = mirrorCheckbox2_ ? mirrorCheckbox2_->isChecked() : false;
+                    if (use_mirror) flip(img2, img2, 1);
+                    Mat processed2 = preprocessImage(img2, preprocessCombo_->currentIndex());
+                    edges_for_quads = applyEdgeDetection(processed2, edgeCombo_->currentIndex());
+                    original_for_warp = processed2.clone();
+                } else {
+                    edges_for_quads = result.clone();
+                    original_for_warp = result.clone();
+                }
+                
+                vector<vector<Point2f>> quads = extractQuadrilaterals(edges_for_quads, original_for_warp);
+                
+                if (quads.empty()) {
+                    putText(color_result, "No quadrilaterals found", Point(10, 30),
+                           FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 0, 255), 2);
+                    // Update quad combo to empty (block signals to prevent recursion)
+                    QComboBox* target_quad_combo = (image_index == 1) ? quadCombo1_ : quadCombo2_;
+                    if (target_quad_combo) {
+                        target_quad_combo->blockSignals(true);
+                        target_quad_combo->clear();
+                        target_quad_combo->blockSignals(false);
+                    }
+                    QTextEdit* target_text = (image_index == 1) ? qualityText1_ : qualityText2_;
+                    if (target_text) {
+                        target_text->setPlainText("PATTERN EXTRACTION\nNo quads found.\nCheck edge detection.");
+                    }
+                    return color_result;
+                }
+                
+                // Update quad combo box with available quads (block signals to prevent recursion)
+                QComboBox* target_quad_combo = (image_index == 1) ? quadCombo1_ : quadCombo2_;
+                if (target_quad_combo) {
+                    int current_selection = target_quad_combo->currentIndex();
+                    target_quad_combo->blockSignals(true);  // Prevent signal emission during update
+                    target_quad_combo->clear();
+                    for (size_t i = 0; i < quads.size(); i++) {
+                        target_quad_combo->addItem(QString("Quad %1").arg(i));
+                    }
+                    // Restore selection if valid
+                    if (current_selection >= 0 && current_selection < (int)quads.size()) {
+                        target_quad_combo->setCurrentIndex(current_selection);
+                    } else if (quads.size() > 0) {
+                        target_quad_combo->setCurrentIndex(0);
+                    }
+                    target_quad_combo->blockSignals(false);  // Re-enable signals
+                }
+                
+                // Get selected quad index
+                int selected_quad = target_quad_combo ? target_quad_combo->currentIndex() : 0;
+                if (selected_quad < 0 || selected_quad >= (int)quads.size()) {
+                    selected_quad = 0;
+                }
+                
+                // Process selected quad
+                vector<Point2f> refined = quads[selected_quad];
+                refineCorners(original_for_warp, refined);
+                
+                int tagSize = 36;
+                vector<Point2f> dstQuad;
+                dstQuad.push_back(Point2f(0, 0));
+                dstQuad.push_back(Point2f(tagSize - 1, 0));
+                dstQuad.push_back(Point2f(tagSize - 1, tagSize - 1));
+                dstQuad.push_back(Point2f(0, tagSize - 1));
+                
+                Mat H = getPerspectiveTransform(refined, dstQuad);
+                Mat warped;
+                warpPerspective(original_for_warp, warped, H, Size(tagSize, tagSize));
+                
+                // Extract pattern
+                vector<vector<int>> pattern = extractPattern(warped, tagSize);
+                
+                // Extract 36-bit code and update info panel
+                updatePatternExtractionInfo(pattern, warped, tagSize, selected_quad, image_index);
+                
+                // Visualize pattern with detailed information
+                int cell_size = 100;
+                int padding = 60;
+                int grid_size = 6 * cell_size;
+                int header_height = 80;
+                Mat pattern_vis = Mat::ones(grid_size + padding * 2 + header_height, 
+                                           grid_size + padding * 2, CV_8UC3) * 240;
+                
+                // Calculate statistics
+                int black_count = 0;
+                int white_count = 0;
+                int total = 0;
+                for (int row = 0; row < 6; row++) {
+                    for (int col = 0; col < 6; col++) {
+                        if (pattern[row][col] < 128) black_count++;
+                        else white_count++;
+                        total += pattern[row][col];
+                    }
+                }
+                
+                // Header with statistics
+                stringstream header;
+                header << "6x6 Pattern - Mean: " << (total / 36) << "  Black: " << black_count << "  White: " << white_count;
+                putText(pattern_vis, header.str(), Point(padding, 40),
+                       FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 0, 0), 2);
+                
+                // Draw grid with pattern
+                for (int row = 0; row < 6; row++) {
+                    for (int col = 0; col < 6; col++) {
+                        int val = pattern[row][col];
+                        bool is_black = val < 128;
+                        Scalar color = is_black ? Scalar(0, 0, 0) : Scalar(255, 255, 255);
+                        int y_pos = header_height + padding + row * cell_size;
+                        int x_pos = padding + col * cell_size;
+                        Rect cell(x_pos, y_pos, cell_size, cell_size);
+                        rectangle(pattern_vis, cell, color, -1);
+                        rectangle(pattern_vis, cell, Scalar(128, 128, 128), 2);
+                        
+                        // Draw pixel value
+                        stringstream ss;
+                        ss << val;
+                        putText(pattern_vis, ss.str(), Point(x_pos + 10, y_pos + 25),
+                               FONT_HERSHEY_SIMPLEX, 0.6, is_black ? Scalar(255, 255, 255) : Scalar(0, 0, 0), 2);
+                        
+                        // Draw bit value (0 or 1)
+                        string bit_str = is_black ? "1" : "0";
+                        putText(pattern_vis, bit_str, Point(x_pos + 10, y_pos + 50),
+                               FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
+                        
+                        // Draw coordinates
+                        stringstream coord;
+                        coord << "(" << row << "," << col << ")";
+                        putText(pattern_vis, coord.str(), Point(x_pos + 5, y_pos + cell_size - 10),
+                               FONT_HERSHEY_SIMPLEX, 0.4, Scalar(128, 0, 128), 1);
+                    }
+                }
+                
+                // Draw border indication (first/last row and column should be black in real tags)
+                // Highlight border cells
+                for (int i = 0; i < 6; i++) {
+                    // Top row
+                    Rect cell(padding + i * cell_size, header_height + padding, cell_size, cell_size);
+                    rectangle(pattern_vis, cell, Scalar(255, 0, 0), 3);
+                    // Bottom row
+                    cell = Rect(padding + i * cell_size, header_height + padding + 5 * cell_size, cell_size, cell_size);
+                    rectangle(pattern_vis, cell, Scalar(255, 0, 0), 3);
+                    // Left column
+                    cell = Rect(padding, header_height + padding + i * cell_size, cell_size, cell_size);
+                    rectangle(pattern_vis, cell, Scalar(255, 0, 0), 3);
+                    // Right column
+                    cell = Rect(padding + 5 * cell_size, header_height + padding + i * cell_size, cell_size, cell_size);
+                    rectangle(pattern_vis, cell, Scalar(255, 0, 0), 3);
+                }
+                
+                // Scale to fit display
+                cv::resize(pattern_vis, color_result, Size(result.cols, result.rows), 0, 0, INTER_LINEAR);
+            }
+            break;
+            
+            case 4: { // Hamming Decode - Enhanced visualization
+                // Need original processed image for detection (not edge-detected)
+                Mat original_for_detection;
+                if (image_index == 1 && !image1_.empty()) {
+                    Mat img1 = image1_.clone();
+                    bool use_mirror = mirrorCheckbox1_ ? mirrorCheckbox1_->isChecked() : false;
+                    if (use_mirror) flip(img1, img1, 1);
+                    original_for_detection = preprocessImage(img1, preprocessCombo_->currentIndex());
+                } else if (image_index == 2 && !image2_.empty()) {
+                    Mat img2 = image2_.clone();
+                    bool use_mirror = mirrorCheckbox2_ ? mirrorCheckbox2_->isChecked() : false;
+                    if (use_mirror) flip(img2, img2, 1);
+                    original_for_detection = preprocessImage(img2, preprocessCombo_->currentIndex());
+                } else {
+                    original_for_detection = result.clone();
+                }
+                
+                // Draw detected tags with detailed information
+                if (!original_for_detection.isContinuous()) {
+                    original_for_detection = original_for_detection.clone();
+                }
+                
+                image_u8_t im = {
+                    .width = original_for_detection.cols,
+                    .height = original_for_detection.rows,
+                    .stride = original_for_detection.cols,
+                    .buf = original_for_detection.data
+                };
+                
+                zarray_t* detections = apriltag_detector_detect(td_, &im);
+                
+                // Convert original_for_detection to color for drawing
+                cvtColor(original_for_detection, color_result, COLOR_GRAY2BGR);
+                
+                // Update quad combo box with detected tags (block signals to prevent recursion)
+                QComboBox* target_quad_combo = (image_index == 1) ? quadCombo1_ : quadCombo2_;
+                if (target_quad_combo) {
+                    int current_selection = target_quad_combo->currentIndex();
+                    target_quad_combo->blockSignals(true);  // Prevent signal emission during update
+                    target_quad_combo->clear();
+                    for (int i = 0; i < zarray_size(detections); i++) {
+                        apriltag_detection_t* det;
+                        zarray_get(detections, i, &det);
+                        target_quad_combo->addItem(QString("Tag %1 (ID:%2)").arg(i).arg(det->id));
+                    }
+                    // Restore selection if valid
+                    if (current_selection >= 0 && current_selection < zarray_size(detections)) {
+                        target_quad_combo->setCurrentIndex(current_selection);
+                    } else if (zarray_size(detections) > 0) {
+                        target_quad_combo->setCurrentIndex(0);
+                    }
+                    target_quad_combo->blockSignals(false);  // Re-enable signals
+                }
+                
+                // Get selected tag index
+                int selected_tag = target_quad_combo ? target_quad_combo->currentIndex() : 0;
+                if (selected_tag < 0 || selected_tag >= zarray_size(detections)) {
+                    selected_tag = 0;
+                }
+                
+                // Update info panel with decoding information
+                updateHammingDecodeInfo(detections, selected_tag, image_index);
+                
+                // Draw background info box
+                int num_dets = zarray_size(detections);
+                rectangle(color_result, Point(10, 10), Point(400, 60 + num_dets * 30), Scalar(0, 0, 0), -1);
+                rectangle(color_result, Point(10, 10), Point(400, 60 + num_dets * 30), Scalar(255, 255, 255), 2);
+                putText(color_result, "Detected Tags: " + to_string(num_dets), Point(20, 40),
+                       FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), 2);
+                
+                // Draw detections with detailed info
+                for (int i = 0; i < zarray_size(detections); i++) {
+                    apriltag_detection_t* det;
+                    zarray_get(detections, i, &det);
+                    
+                    // Choose color based on decision margin (green = high confidence)
+                    Scalar tag_color = (det->decision_margin > 60) ? Scalar(0, 255, 0) : 
+                                      (det->decision_margin > 30) ? Scalar(0, 255, 255) : Scalar(0, 165, 255);
+                    
+                    // Draw tag outline (thick)
+                    line(color_result, Point(det->p[0][0], det->p[0][1]),
+                         Point(det->p[1][0], det->p[1][1]), tag_color, 3);
+                    line(color_result, Point(det->p[1][0], det->p[1][1]),
+                         Point(det->p[2][0], det->p[2][1]), tag_color, 3);
+                    line(color_result, Point(det->p[2][0], det->p[2][1]),
+                         Point(det->p[3][0], det->p[3][1]), tag_color, 3);
+                    line(color_result, Point(det->p[3][0], det->p[3][1]),
+                         Point(det->p[0][0], det->p[0][1]), tag_color, 3);
+                    
+                    // Draw corners with numbers
+                    for (int j = 0; j < 4; j++) {
+                        circle(color_result, Point(det->p[j][0], det->p[j][1]), 8, tag_color, -1);
+                        circle(color_result, Point(det->p[j][0], det->p[j][1]), 8, Scalar(255, 255, 255), 1);
+                        putText(color_result, to_string(j), Point(det->p[j][0] - 5, det->p[j][1] + 5),
+                               FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 2);
+                    }
+                    
+                    // Draw center
+                    circle(color_result, Point(det->c[0], det->c[1]), 10, Scalar(0, 0, 255), -1);
+                    circle(color_result, Point(det->c[0], det->c[1]), 10, Scalar(255, 255, 255), 2);
+                    
+                    // Draw detailed label near tag
+                    stringstream label;
+                    label << "ID:" << det->id << " M:" << fixed << setprecision(1) << det->decision_margin;
+                    int baseline = 0;
+                    Size text_size = getTextSize(label.str(), FONT_HERSHEY_SIMPLEX, 0.8, 2, &baseline);
+                    rectangle(color_result, Point(det->c[0] + 15, det->c[1] - text_size.height - 5),
+                             Point(det->c[0] + 15 + text_size.width, det->c[1] + 5), Scalar(0, 0, 0), -1);
+                    putText(color_result, label.str(), Point(det->c[0] + 15, det->c[1]),
+                           FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255, 255, 0), 2);
+                    
+                    // Draw in info box
+                    stringstream info;
+                    info << "Tag " << i << ": ID=" << det->id << " Margin=" << fixed << setprecision(1) << det->decision_margin;
+                    putText(color_result, info.str(), Point(20, 70 + i * 30),
+                           FONT_HERSHEY_SIMPLEX, 0.6, tag_color, 2);
+                }
+                
+                // Clean up
+                for (int i = 0; i < zarray_size(detections); i++) {
+                    apriltag_detection_t* det;
+                    zarray_get(detections, i, &det);
+                    apriltag_detection_destroy(det);
+                }
+                zarray_destroy(detections);
+            }
+            break;
+            
+            default:
+                cvtColor(result, color_result, COLOR_GRAY2BGR);
+        }
+        
+        return color_result;
+    }
+    
+    uint64_t extractCodeFromPattern(const vector<vector<int>>& pattern) {
+        uint64_t code = 0;
+        for (int i = 0; i < 36; i++) {
+            // Convert 1-indexed to 0-indexed
+            int x = TAG36H11_BIT_X[i] - 1;
+            int y = TAG36H11_BIT_Y[i] - 1;
+            
+            // Extract bit (0 = white/bright, 1 = black/dark)
+            int val = pattern[y][x];
+            int bit = (val < 128) ? 1 : 0;
+            
+            code |= ((uint64_t)bit << i);
+        }
+        return code;
+    }
+    
+    void updatePatternExtractionInfo(const vector<vector<int>>& pattern, const Mat& warped, int tagSize, int quad_index = 0, int image_index = 1) {
+        if (!infoText_) return;
+        
+        stringstream ss;
+        ss << "=== PATTERN EXTRACTION & QUALITY METRICS ===\n";
+        ss << "Quad Number: " << quad_index << "\n\n";
+        
+        // Pattern statistics
+        int black_count = 0;
+        int white_count = 0;
+        int total = 0;
+        int black_sum = 0;
+        int white_sum = 0;
+        for (int row = 0; row < 6; row++) {
+            for (int col = 0; col < 6; col++) {
+                int val = pattern[row][col];
+                total += val;
+                if (val < 128) {
+                    black_count++;
+                    black_sum += val;
+                } else {
+                    white_count++;
+                    white_sum += val;
+                }
+            }
+        }
+        int mean_pixel = (total / 36);
+        int black_mean = black_count > 0 ? (black_sum / black_count) : 0;
+        int white_mean = white_count > 0 ? (white_sum / white_count) : 255;
+        int contrast = white_mean - black_mean;
+        
+        ss << "=== QUALITY METRICS ===\n\n";
+        
+        // Border Black Ratio (most important for detection quality)
+        int border_black = 0;
+        int border_total = 0;
+        // Top 2 rows (border)
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 6; col++) {
+                border_total++;
+                if (pattern[row][col] < 128) border_black++;
+            }
+        }
+        // Bottom 2 rows (border)
+        for (int row = 4; row < 6; row++) {
+            for (int col = 0; col < 6; col++) {
+                border_total++;
+                if (pattern[row][col] < 128) border_black++;
+            }
+        }
+        // Left/right borders (middle rows)
+        for (int row = 2; row < 4; row++) {
+            border_total += 2;
+            if (pattern[row][0] < 128) border_black++;
+            if (pattern[row][5] < 128) border_black++;
+        }
+        double border_ratio = border_total > 0 ? ((double)border_black / border_total) : 0.0;
+        
+        ss << "1. BORDER BLACK RATIO: " << fixed << setprecision(1) << (border_ratio * 100) << "%\n";
+        if (border_ratio >= 0.90) {
+            ss << "   ✓ EXCELLENT (should be ~100%)\n";
+        } else if (border_ratio >= 0.80) {
+            ss << "   ⚠ ACCEPTABLE (border has some issues)\n";
+        } else {
+            ss << "   ✗ POOR (broken border - detection issues!)\n";
+        }
+        ss << "   (" << border_black << "/" << border_total << " border cells)\n\n";
+        
+        ss << "2. PATTERN CONTRAST: " << contrast << "\n";
+        if (contrast >= 100) {
+            ss << "   ✓ EXCELLENT (clear distinction)\n";
+        } else if (contrast >= 60) {
+            ss << "   ⚠ GOOD (adequate contrast)\n";
+        } else {
+            ss << "   ✗ POOR (low contrast - may cause issues)\n";
+        }
+        ss << "   Black mean: " << black_mean << ", White mean: " << white_mean << "\n\n";
+        
+        ss << "3. PATTERN STATISTICS:\n";
+        ss << "   Mean pixel value: " << mean_pixel << "\n";
+        ss << "   Black pixels: " << black_count << " (mean: " << black_mean << ")\n";
+        ss << "   White pixels: " << white_count << " (mean: " << white_mean << ")\n\n";
+        
+        // Display 6x6 pattern
+        ss << "6x6 Pattern (0=white, 1=black):\n";
+        ss << "    0 1 2 3 4 5\n";
+        ss << "  ┌─────────────┐\n";
+        for (int row = 0; row < 6; row++) {
+            ss << row << " │";
+            for (int col = 0; col < 6; col++) {
+                int val = pattern[row][col];
+                ss << ((val < 128) ? "1" : "0") << " ";
+            }
+            ss << "│\n";
+        }
+        ss << "  └─────────────┘\n\n";
+        
+        // Display pixel values
+        ss << "Pixel Values:\n";
+        for (int row = 0; row < 6; row++) {
+            for (int col = 0; col < 6; col++) {
+                ss << setw(4) << pattern[row][col];
+            }
+            ss << "\n";
+        }
+        ss << "\n";
+        
+        // Calculate warped tag quality metrics
+        Scalar mean_val, stddev_val;
+        meanStdDev(warped, mean_val, stddev_val);
+        double warped_contrast = stddev_val[0];  // Standard deviation indicates contrast
+        
+        ss << "4. WARPED TAG QUALITY:\n";
+        ss << "   Contrast (std dev): " << fixed << setprecision(2) << warped_contrast << "\n";
+        if (warped_contrast >= 40) {
+            ss << "   ✓ EXCELLENT (sharp, clear image)\n";
+        } else if (warped_contrast >= 25) {
+            ss << "   ⚠ GOOD (adequate sharpness)\n";
+        } else {
+            ss << "   ✗ POOR (blurry or low contrast)\n";
+        }
+        ss << "   Mean brightness: " << fixed << setprecision(1) << mean_val[0] << "\n\n";
+        
+        // Extract 36-bit code
+        uint64_t code = extractCodeFromPattern(pattern);
+        ss << "=== EXTRACTED CODE ===\n";
+        ss << "Decimal: " << code << "\n";
+        ss << "Hex: 0x" << hex << setfill('0') << setw(9) << code << dec << "\n";
+        ss << "Binary: ";
+        for (int i = 35; i >= 0; i--) {
+            ss << ((code >> i) & 1);
+            if (i % 9 == 0 && i > 0) ss << " ";
+        }
+        ss << "\n\n";
+        
+        // Show bit extraction order (abbreviated)
+        ss << "=== BIT EXTRACTION (first 12 bits) ===\n";
+        ss << "Bit  Pos    Value  Pixel\n";
+        for (int i = 0; i < min(12, 36); i++) {
+            int x = TAG36H11_BIT_X[i] - 1;
+            int y = TAG36H11_BIT_Y[i] - 1;
+            int val = pattern[y][x];
+            int bit = (val < 128) ? 1 : 0;
+            ss << setw(2) << i << "  (" << TAG36H11_BIT_X[i] << "," << TAG36H11_BIT_Y[i] << ")   " << bit;
+            ss << "     " << val << "\n";
+        }
+        if (36 > 12) {
+            ss << "... (" << (36 - 12) << " more bits)\n";
+        }
+        
+        infoText_->setPlainText(QString::fromStdString(ss.str()));
+        
+        // Also update quality metrics box for pattern extraction
+        QTextEdit* target_text = (image_index == 1) ? qualityText1_ : qualityText2_;
+        if (target_text) {
+            stringstream q_ss;
+            q_ss << "PATTERN EXTRACTION QUALITY\n";
+            q_ss << "Border ratio: " << fixed << setprecision(1) << (border_ratio * 100) << "%\n";
+            if (border_ratio >= 0.90) {
+                q_ss << "Status: ✓ EXCELLENT\n";
+            } else if (border_ratio >= 0.80) {
+                q_ss << "Status: ⚠ ACCEPTABLE\n";
+            } else {
+                q_ss << "Status: ✗ POOR\n";
+            }
+            q_ss << "Contrast: " << contrast << "\n";
+            if (contrast >= 100) {
+                q_ss << "Status: ✓ EXCELLENT\n";
+            } else if (contrast >= 60) {
+                q_ss << "Status: ⚠ GOOD\n";
+            } else {
+                q_ss << "Status: ✗ POOR\n";
+            }
+            q_ss << "Warped contrast: " << fixed << setprecision(1) << warped_contrast << "\n";
+            if (warped_contrast >= 40) {
+                q_ss << "Status: ✓ EXCELLENT\n";
+            } else if (warped_contrast >= 25) {
+                q_ss << "Status: ⚠ GOOD\n";
+            } else {
+                q_ss << "Status: ✗ POOR\n";
+            }
+            target_text->setPlainText(QString::fromStdString(q_ss.str()));
+        }
+    }
+    
+    void updateCornerRefinementInfo(double avg_movement, double max_movement, int image_index = 1) {
+        if (!infoText_) return;
+        
+        stringstream ss;
+        ss << "=== CORNER REFINEMENT & QUALITY ===\n\n";
+        
+        ss << "=== QUALITY METRICS ===\n\n";
+        ss << "1. CORNER REFINEMENT ACCURACY:\n";
+        ss << "   Average movement: " << fixed << setprecision(2) << avg_movement << " pixels\n";
+        ss << "   Maximum movement: " << fixed << setprecision(2) << max_movement << " pixels\n";
+        if (avg_movement < 1.0 && max_movement < 2.0) {
+            ss << "   ✓ EXCELLENT (very stable corners)\n";
+        } else if (avg_movement < 2.0 && max_movement < 5.0) {
+            ss << "   ⚠ GOOD (acceptable stability)\n";
+        } else {
+            ss << "   ✗ POOR (unstable corners - may indicate blur/poor lighting)\n";
+        }
+        ss << "\n";
+        
+        ss << "Process:\n";
+        ss << "1. Detect quadrilaterals from contours\n";
+        ss << "2. Apply cornerSubPix() for sub-pixel refinement\n";
+        ss << "3. Visualize original vs refined positions\n\n";
+        ss << "Interpretation:\n";
+        ss << "• Small movements (< 1-2 px) = stable, accurate corners\n";
+        ss << "• Large movements (> 5 px) = unstable, may indicate:\n";
+        ss << "  - Image blur\n";
+        ss << "  - Poor lighting/contrast\n";
+        ss << "  - Low resolution tag\n";
+        ss << "  - Motion blur\n";
+        
+        infoText_->setPlainText(QString::fromStdString(ss.str()));
+        
+        // Also update quality metrics box
+        QTextEdit* target_text = (image_index == 1) ? qualityText1_ : qualityText2_;
+        if (target_text) {
+            stringstream q_ss;
+            q_ss << "CORNER REFINEMENT QUALITY\n";
+            q_ss << "Avg movement: " << fixed << setprecision(2) << avg_movement << " px\n";
+            q_ss << "Max movement: " << fixed << setprecision(2) << max_movement << " px\n";
+            if (avg_movement < 1.0 && max_movement < 2.0) {
+                q_ss << "Status: ✓ EXCELLENT\n";
+            } else if (avg_movement < 2.0 && max_movement < 5.0) {
+                q_ss << "Status: ⚠ GOOD\n";
+            } else {
+                q_ss << "Status: ✗ POOR\n";
+            }
+            target_text->setPlainText(QString::fromStdString(q_ss.str()));
+        }
+    }
+    
+    void updateHammingDecodeInfo(zarray_t* detections, int selected_tag = 0, int image_index = 1) {
+        if (!infoText_) return;
+        
+        stringstream ss;
+        ss << "=== HAMMING CODE DECODING & QUALITY ===\n\n";
+        ss << "Detected Tags: " << zarray_size(detections) << "\n";
+        ss << "Selected Tag: " << selected_tag << "\n\n";
+        
+        if (zarray_size(detections) == 0) {
+            ss << "No tags detected.\n\n";
+            ss << "Possible reasons:\n";
+            ss << "  • Pattern doesn't match any valid codeword\n";
+            ss << "  • Too many bit errors (> 5 for Tag36h11)\n";
+            ss << "  • Hamming distance exceeds correction limit\n";
+            ss << "  • Broken border (border black ratio < 80%)\n";
+            ss << "  • Low contrast pattern\n";
+            infoText_->setPlainText(QString::fromStdString(ss.str()));
+            return;
+        }
+        
+        // Show selected tag in detail with quality metrics
+        if (selected_tag >= 0 && selected_tag < zarray_size(detections)) {
+            apriltag_detection_t* det;
+            zarray_get(detections, selected_tag, &det);
+            
+            ss << "=== SELECTED TAG " << selected_tag << " ===\n\n";
+            
+            ss << "=== QUALITY METRICS ===\n\n";
+            
+            ss << "1. DECISION MARGIN: " << fixed << setprecision(2) << det->decision_margin << "\n";
+            if (det->decision_margin > 60) {
+                ss << "   ✓ EXCELLENT (high confidence, very reliable)\n";
+            } else if (det->decision_margin > 30) {
+                ss << "   ⚠ GOOD (medium confidence, reliable)\n";
+            } else {
+                ss << "   ✗ POOR (low confidence, may be unreliable)\n";
+            }
+            ss << "   Range: 0-255 (higher = better)\n";
+            ss << "   Measures: Average difference between bit intensity\n";
+            ss << "             and decision threshold\n\n";
+            
+            ss << "2. HAMMING DISTANCE: " << static_cast<int>(det->hamming) << " errors\n";
+            if (det->hamming == 0) {
+                ss << "   ✓ PERFECT (no errors)\n";
+            } else if (det->hamming <= 5) {
+                ss << "   ✓ GOOD (correctable errors for Tag36h11)\n";
+            } else {
+                ss << "   ✗ POOR (uncorrectable - exceeds 5 error limit)\n";
+            }
+            ss << "   Tag36h11 can correct up to 5 bit errors\n\n";
+            
+            ss << "=== TAG INFORMATION ===\n";
+            ss << "ID: " << det->id << "\n";
+            ss << "Center: (" << fixed << setprecision(2) << det->c[0] << ", " << det->c[1] << ")\n";
+            ss << "Corners:\n";
+            for (int j = 0; j < 4; j++) {
+                ss << "  " << j << ": (" << fixed << setprecision(2) 
+                   << det->p[j][0] << ", " << det->p[j][1] << ")\n";
+            }
+            ss << "\n";
+        }
+        
+        // Show summary of all tags
+        if (zarray_size(detections) > 1) {
+            ss << "=== ALL TAGS ===\n";
+            for (int i = 0; i < zarray_size(detections); i++) {
+                apriltag_detection_t* det;
+                zarray_get(detections, i, &det);
+                ss << "Tag " << i << ": ID=" << det->id 
+                   << ", Margin=" << fixed << setprecision(1) << det->decision_margin;
+                if (i == selected_tag) ss << " [SELECTED]";
+                ss << "\n";
+            }
+            ss << "\n";
+        }
+        
+        ss << "=== DECODING PROCESS ===\n";
+        ss << "1. Extract 6x6 pattern from warped tag\n";
+        ss << "2. Sample 36 bits using Tag36h11 bit positions\n";
+        ss << "3. Try all 4 rotations (0°, 90°, 180°, 270°)\n";
+        ss << "4. Calculate Hamming distance to valid codewords\n";
+        ss << "5. Correct up to 5 bit errors (Tag36h11 capability)\n";
+        ss << "6. Return tag ID if within error correction limit\n\n";
+        
+        ss << "=== QUALITY ASSESSMENT ===\n";
+        ss << "Best overall quality indicator: Decision Margin\n";
+        ss << "• > 60: Excellent - very reliable detection\n";
+        ss << "• 30-60: Good - reliable for most applications\n";
+        ss << "• < 30: Poor - may have false positives/negatives\n";
+        
+        infoText_->setPlainText(QString::fromStdString(ss.str()));
+    }
+    
+    void updateQualityMetrics(const Mat& img, int advancedMode, int image_index) {
+        QTextEdit* target_text = (image_index == 1) ? qualityText1_ : qualityText2_;
+        if (!target_text) return;
+        
+        if (advancedMode == 0) {
+            // Basic detection metrics
+            image_u8_t im = {
+                .width = img.cols,
+                .height = img.rows,
+                .stride = img.cols,
+                .buf = const_cast<uint8_t*>(img.data)
+            };
+            
+            zarray_t* detections = apriltag_detector_detect(td_, &im);
+            int num_dets = zarray_size(detections);
+            
+            stringstream ss;
+            ss << "BASIC DETECTION\n";
+            ss << "Tags detected: " << num_dets << "\n";
+            if (num_dets > 0) {
+                ss << "Status: ✓ TAGS FOUND\n";
+            } else {
+                ss << "Status: ✗ NO TAGS\n";
+            }
+            
+            // Clean up
+            for (int i = 0; i < zarray_size(detections); i++) {
+                apriltag_detection_t* det;
+                zarray_get(detections, i, &det);
+                apriltag_detection_destroy(det);
+            }
+            zarray_destroy(detections);
+            
+            target_text->setPlainText(QString::fromStdString(ss.str()));
+        } else if (advancedMode == 2) {
+            // Warped Tags - show basic quality info
+            stringstream ss;
+            ss << "WARPED TAGS\n";
+            ss << "Check visual quality:\n";
+            ss << "• Square shape (36x36)\n";
+            ss << "• Sharp edges\n";
+            ss << "• Good contrast\n";
+            target_text->setPlainText(QString::fromStdString(ss.str()));
+        }
+    }
+    
+    void updateInfoPanel(int advancedMode) {
+        if (!infoText_) return;
+        
+        if (advancedMode == 0) {
+            infoText_->setPlainText("Select an Advanced visualization mode to see extracted codes, decoding steps, and quality metrics here.");
+        } else if (advancedMode == 1) {
+            // Corner refinement info will be updated when processing happens
+            infoText_->setPlainText("=== CORNER REFINEMENT ===\n\n"
+                                   "Processing... Quality metrics will appear here.\n\n"
+                                   "This stage refines quadrilateral corners using sub-pixel accuracy.\n\n"
+                                   "Green = Original corners\n"
+                                   "Red = Refined corners\n"
+                                   "Yellow lines = Movement vectors");
+        } else if (advancedMode == 2) {
+            stringstream ss;
+            ss << "=== WARPED TAGS & QUALITY ===\n\n";
+            ss << "=== QUALITY METRICS ===\n\n";
+            ss << "1. WARP QUALITY:\n";
+            ss << "   • Check if warped tag is square (36x36)\n";
+            ss << "   • Look for clean, sharp edges\n";
+            ss << "   • Distorted/blurry = poor quality\n\n";
+            ss << "Process:\n";
+            ss << "1. Compute homography matrix from quad to square\n";
+            ss << "2. Warp tag to 36x36 pixel square\n";
+            ss << "3. Normalize orientation for pattern extraction\n\n";
+            ss << "Good quality: Clean, square, sharp warped image\n";
+            ss << "Poor quality: Distorted, blurry, or non-square\n";
+            infoText_->setPlainText(QString::fromStdString(ss.str()));
+        }
+    }
+
+    QPixmap matToPixmap(const Mat &mat) {
+        if (mat.empty()) {
+            return QPixmap();
+        }
+        
+        Mat display;
+        if (mat.channels() == 1) {
+            cvtColor(mat, display, COLOR_GRAY2RGB);
+        } else {
+            cvtColor(mat, display, COLOR_BGR2RGB);
+        }
+        
+        QImage qimg(display.data, display.cols, display.rows, display.step, QImage::Format_RGB888);
+        return QPixmap::fromImage(qimg).scaled(640, 480, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+
+    void processImages() {
+        if (image1_.empty() && image2_.empty()) {
+            return;
+        }
+        
+        // Process Image 1
+        if (!image1_.empty()) {
+            Mat img1 = image1_.clone();
+            
+            // Apply mirror if needed (before preprocessing for better results)
+            bool use_mirror = mirrorCheckbox1_ ? mirrorCheckbox1_->isChecked() : false;
+            if (use_mirror) {
+                flip(img1, img1, 1);
+            }
+            
+            Mat processed1 = preprocessImage(img1, preprocessCombo_->currentIndex());
+            Mat edged1 = applyEdgeDetection(processed1, edgeCombo_->currentIndex());
+            
+            bool use_advanced = advancedCombo_ && advancedCombo_->currentIndex() > 0;
+            Mat final1;
+            if (use_advanced) {
+                int advMode = advancedCombo_->currentIndex();
+                final1 = drawAdvancedVisualization(edged1, advMode, 1);  // Pass image_index = 1
+                updateInfoPanel(advMode);
+                updateQualityMetrics(edged1, advMode, 1);  // Update quality metrics for image 1
+            } else {
+                final1 = drawDetections(edged1, detectionCombo_->currentIndex());
+                if (infoText_) {
+                    infoText_->setPlainText("Select an Advanced visualization mode to see extracted codes and decoding steps here.");
+                }
+                updateQualityMetrics(edged1, 0, 1);  // Update quality metrics for image 1 (basic detection)
+            }
+            label1_->setPixmap(matToPixmap(final1));
+        } else {
+            label1_->setText("Load Image 1");
+        }
+        
+        // Process Image 2
+        if (!image2_.empty()) {
+            Mat img2 = image2_.clone();
+            
+            // Apply mirror if needed
+            bool use_mirror = mirrorCheckbox2_ ? mirrorCheckbox2_->isChecked() : false;
+            if (use_mirror) {
+                flip(img2, img2, 1);
+            }
+            
+            Mat processed2 = preprocessImage(img2, preprocessCombo_->currentIndex());
+            Mat edged2 = applyEdgeDetection(processed2, edgeCombo_->currentIndex());
+            
+            bool use_advanced = advancedCombo_ && advancedCombo_->currentIndex() > 0;
+            Mat final2;
+            if (use_advanced) {
+                int advMode = advancedCombo_->currentIndex();
+                final2 = drawAdvancedVisualization(edged2, advMode, 2);  // Pass image index 2
+                updateQualityMetrics(edged2, advMode, 2);  // Update quality metrics for image 2
+            } else {
+                final2 = drawDetections(edged2, detectionCombo_->currentIndex());
+                updateQualityMetrics(edged2, 0, 2);  // No advanced mode, but still show basic metrics
+            }
+            label2_->setPixmap(matToPixmap(final2));
+        } else {
+            label2_->setText("Load Image 2");
+        }
+    }
+    
+    void setupCaptureTab(QVBoxLayout *layout) {
+        // Camera selection
+        QGroupBox *cameraGroup = new QGroupBox("Camera Selection", this);
+        QHBoxLayout *cameraLayout = new QHBoxLayout();
+        QLabel *cameraLabel = new QLabel("Camera:", this);
+        cameraCombo_ = new QComboBox(this);
+        connect(cameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::openCamera);
+        cameraLayout->addWidget(cameraLabel);
+        cameraLayout->addWidget(cameraCombo_);
+        cameraLayout->addStretch();
+        cameraGroup->setLayout(cameraLayout);
+        layout->addWidget(cameraGroup);
+        
+        // Resolution/FPS selection
+        QGroupBox *modeGroup = new QGroupBox("Resolution & FPS", this);
+        QHBoxLayout *modeLayout = new QHBoxLayout();
+        QLabel *modeLabel = new QLabel("Mode:", this);
+        modeCombo_ = new QComboBox(this);
+        modeCombo_->setEnabled(false);  // Enabled when camera opens
+        connect(modeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::onModeChanged);
+        modeLayout->addWidget(modeLabel);
+        modeLayout->addWidget(modeCombo_);
+        modeLayout->addStretch();
+        modeGroup->setLayout(modeLayout);
+        layout->addWidget(modeGroup);
+        
+        // Camera settings
+        QGroupBox *settingsGroup = new QGroupBox("Camera Settings", this);
+        QFormLayout *settingsLayout = new QFormLayout();
+        
+        // Exposure
+        exposureSlider_ = new QSlider(Qt::Horizontal, this);
+        exposureSlider_->setRange(0, 100);
+        exposureSlider_->setValue(50);
+        exposureSpin_ = new QSpinBox(this);
+        exposureSpin_->setRange(0, 100);
+        exposureSpin_->setValue(50);
+        connect(exposureSlider_, &QSlider::valueChanged, exposureSpin_, &QSpinBox::setValue);
+        connect(exposureSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                exposureSlider_, &QSlider::setValue);
+        connect(exposureSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        QHBoxLayout *exposureLayout = new QHBoxLayout();
+        exposureLayout->addWidget(exposureSlider_);
+        exposureLayout->addWidget(exposureSpin_);
+        settingsLayout->addRow("Exposure:", exposureLayout);
+        
+        // Gain
+        gainSlider_ = new QSlider(Qt::Horizontal, this);
+        gainSlider_->setRange(0, 100);
+        gainSlider_->setValue(50);
+        gainSpin_ = new QSpinBox(this);
+        gainSpin_->setRange(0, 100);
+        gainSpin_->setValue(50);
+        connect(gainSlider_, &QSlider::valueChanged, gainSpin_, &QSpinBox::setValue);
+        connect(gainSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                gainSlider_, &QSlider::setValue);
+        connect(gainSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        QHBoxLayout *gainLayout = new QHBoxLayout();
+        gainLayout->addWidget(gainSlider_);
+        gainLayout->addWidget(gainSpin_);
+        settingsLayout->addRow("Gain:", gainLayout);
+        
+        // Brightness
+        brightnessSlider_ = new QSlider(Qt::Horizontal, this);
+        brightnessSlider_->setRange(0, 255);
+        brightnessSlider_->setValue(128);
+        brightnessSpin_ = new QSpinBox(this);
+        brightnessSpin_->setRange(0, 255);
+        brightnessSpin_->setValue(128);
+        connect(brightnessSlider_, &QSlider::valueChanged, brightnessSpin_, &QSpinBox::setValue);
+        connect(brightnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                brightnessSlider_, &QSlider::setValue);
+        connect(brightnessSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        QHBoxLayout *brightnessLayout = new QHBoxLayout();
+        brightnessLayout->addWidget(brightnessSlider_);
+        brightnessLayout->addWidget(brightnessSpin_);
+        settingsLayout->addRow("Brightness:", brightnessLayout);
+        
+        // Contrast (MindVision and V4L2)
+        contrastSlider_ = new QSlider(Qt::Horizontal, this);
+        contrastSlider_->setRange(0, 100);
+        contrastSlider_->setValue(50);
+        contrastSpin_ = new QSpinBox(this);
+        contrastSpin_->setRange(0, 100);
+        contrastSpin_->setValue(50);
+        connect(contrastSlider_, &QSlider::valueChanged, contrastSpin_, &QSpinBox::setValue);
+        connect(contrastSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                contrastSlider_, &QSlider::setValue);
+        connect(contrastSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        QHBoxLayout *contrastLayout = new QHBoxLayout();
+        contrastLayout->addWidget(contrastSlider_);
+        contrastLayout->addWidget(contrastSpin_);
+        settingsLayout->addRow("Contrast:", contrastLayout);
+        
+        // Saturation (MindVision and V4L2)
+        saturationSlider_ = new QSlider(Qt::Horizontal, this);
+        saturationSlider_->setRange(0, 100);
+        saturationSlider_->setValue(50);
+        saturationSpin_ = new QSpinBox(this);
+        saturationSpin_->setRange(0, 100);
+        saturationSpin_->setValue(50);
+        connect(saturationSlider_, &QSlider::valueChanged, saturationSpin_, &QSpinBox::setValue);
+        connect(saturationSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                saturationSlider_, &QSlider::setValue);
+        connect(saturationSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        QHBoxLayout *saturationLayout = new QHBoxLayout();
+        saturationLayout->addWidget(saturationSlider_);
+        saturationLayout->addWidget(saturationSpin_);
+        settingsLayout->addRow("Saturation:", saturationLayout);
+        
+        // Sharpness (MindVision and V4L2)
+        sharpnessSlider_ = new QSlider(Qt::Horizontal, this);
+        sharpnessSlider_->setRange(0, 100);
+        sharpnessSlider_->setValue(50);
+        sharpnessSpin_ = new QSpinBox(this);
+        sharpnessSpin_->setRange(0, 100);
+        sharpnessSpin_->setValue(50);
+        connect(sharpnessSlider_, &QSlider::valueChanged, sharpnessSpin_, &QSpinBox::setValue);
+        connect(sharpnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                sharpnessSlider_, &QSlider::setValue);
+        connect(sharpnessSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        QHBoxLayout *sharpnessLayout = new QHBoxLayout();
+        sharpnessLayout->addWidget(sharpnessSlider_);
+        sharpnessLayout->addWidget(sharpnessSpin_);
+        settingsLayout->addRow("Sharpness:", sharpnessLayout);
+        
+        settingsGroup->setLayout(settingsLayout);
+        layout->addWidget(settingsGroup);
+        
+        // Preview and controls
+        QHBoxLayout *previewLayout = new QHBoxLayout();
+        previewLabel_ = new QLabel(this);
+        previewLabel_->setMinimumSize(640, 480);
+        previewLabel_->setAlignment(Qt::AlignCenter);
+        previewLabel_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        previewLabel_->setText("No camera selected");
+        previewLayout->addWidget(previewLabel_);
+        
+        QVBoxLayout *controlLayout = new QVBoxLayout();
+        loadImageBtn_ = new QPushButton("Load Image", this);
+        connect(loadImageBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage1);
+        controlLayout->addWidget(loadImageBtn_);
+        
+        captureBtn_ = new QPushButton("Capture Frame", this);
+        captureBtn_->setEnabled(false);
+        connect(captureBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::captureFrame);
+        controlLayout->addWidget(captureBtn_);
+        controlLayout->addStretch();
+        
+        previewLayout->addLayout(controlLayout);
+        layout->addLayout(previewLayout);
+        
+        // Initialize camera enumeration
+        enumerateCameras();
+        
+        // Setup preview timer
+        previewTimer_ = new QTimer(this);
+        connect(previewTimer_, &QTimer::timeout, this, &AprilTagDebugGUI::updatePreview);
+        
+        // Calibration preview timer (separate timer for calibration view)
+        calibrationPreviewTimer_ = new QTimer(this);
+        connect(calibrationPreviewTimer_, &QTimer::timeout, this, &AprilTagDebugGUI::updateCalibrationPreview);
+    }
+    
+    void setupFisheyeTab() {
+        // This will be called from setupUI after tabWidget_ is created
+        QWidget *fisheyeTab = new QWidget(this);
+        QVBoxLayout *fisheyeLayout = new QVBoxLayout(fisheyeTab);
+        setupFisheyeTabContent(fisheyeLayout);
+        tabWidget_->addTab(fisheyeTab, "Fisheye Correction");
+    }
+    
+    void setupFisheyeTabContent(QVBoxLayout *layout) {
+        // Calibration file path
+        QGroupBox *calibGroup = new QGroupBox("Calibration File", this);
+        QFormLayout *calibLayout = new QFormLayout();
+        
+        QLabel *calibPathLabel = new QLabel("Path:", this);
+        calibPathEdit_ = new QLineEdit("/home/nav/9202/Hiru/Apriltag/calibration_data/camera_params.yaml", this);
+        QPushButton *browseBtn = new QPushButton("Browse...", this);
+        QPushButton *loadBtn = new QPushButton("Load Calibration", this);
+        connect(browseBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::browseCalibrationFile);
+        connect(loadBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::loadCalibrationFromUI);
+        
+        QHBoxLayout *pathLayout = new QHBoxLayout();
+        pathLayout->addWidget(calibPathEdit_);
+        pathLayout->addWidget(browseBtn);
+        pathLayout->addWidget(loadBtn);
+        calibLayout->addRow(calibPathLabel, pathLayout);
+        calibGroup->setLayout(calibLayout);
+        layout->addWidget(calibGroup);
+        
+        // Status label
+        QLabel *calibStatusLabel = new QLabel("Calibration: Not loaded", this);
+        layout->addWidget(calibStatusLabel);
+        
+        // Store reference to update it
+        fisheyeStatusLabel_ = calibStatusLabel;
+        
+        // Test image selection
+        QGroupBox *testGroup = new QGroupBox("Preview Correction", this);
+        QVBoxLayout *testLayout = new QVBoxLayout();
+        
+        QPushButton *loadTestImageBtn = new QPushButton("Load Test Image", this);
+        connect(loadTestImageBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::loadTestImageForFisheye);
+        testLayout->addWidget(loadTestImageBtn);
+        
+        // Side-by-side preview
+        QHBoxLayout *previewLayout = new QHBoxLayout();
+        fisheyeOriginalLabel_ = new QLabel("Original", this);
+        fisheyeOriginalLabel_->setMinimumSize(320, 240);
+        fisheyeOriginalLabel_->setAlignment(Qt::AlignCenter);
+        fisheyeOriginalLabel_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        fisheyeOriginalLabel_->setText("Load an image to preview");
+        
+        fisheyeCorrectedLabel_ = new QLabel("Corrected", this);
+        fisheyeCorrectedLabel_->setMinimumSize(320, 240);
+        fisheyeCorrectedLabel_->setAlignment(Qt::AlignCenter);
+        fisheyeCorrectedLabel_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        fisheyeCorrectedLabel_->setText("Load an image to preview");
+        
+        previewLayout->addWidget(fisheyeOriginalLabel_);
+        previewLayout->addWidget(fisheyeCorrectedLabel_);
+        testLayout->addLayout(previewLayout);
+        
+        // Selection radio buttons
+        QHBoxLayout *selectionLayout = new QHBoxLayout();
+        selectionLayout->addWidget(new QLabel("Use for captures:", this));
+        fisheyeUseOriginalRadio_ = new QRadioButton("Original (No Correction)", this);
+        fisheyeUseCorrectedRadio_ = new QRadioButton("Corrected (With Fisheye Correction)", this);
+        fisheyeUseCorrectedRadio_->setChecked(true);  // Default to corrected
+        connect(fisheyeUseOriginalRadio_, &QRadioButton::toggled, this, &AprilTagDebugGUI::onFisheyeSelectionChanged);
+        connect(fisheyeUseCorrectedRadio_, &QRadioButton::toggled, this, &AprilTagDebugGUI::onFisheyeSelectionChanged);
+        selectionLayout->addWidget(fisheyeUseOriginalRadio_);
+        selectionLayout->addWidget(fisheyeUseCorrectedRadio_);
+        selectionLayout->addStretch();
+        testLayout->addLayout(selectionLayout);
+        
+        testGroup->setLayout(testLayout);
+        layout->addWidget(testGroup);
+        
+        // Calibration process section
+        QGroupBox *calibProcessGroup = new QGroupBox("Calibration Process (6x6 Checkerboard - Auto Capture)", this);
+        QVBoxLayout *calibProcessLayout = new QVBoxLayout();
+        
+        QLabel *calibInfoLabel = new QLabel(
+            "Show the 6x6 checkerboard to the camera. The system will automatically\n"
+            "capture images when the board is detected and stable. Each grid position\n"
+            "will be highlighted in yellow once captured.", this);
+        calibInfoLabel->setWordWrap(true);
+        calibProcessLayout->addWidget(calibInfoLabel);
+        
+        QHBoxLayout *calibControlLayout = new QHBoxLayout();
+        QPushButton *startCalibBtn = new QPushButton("Start Calibration", this);
+        resetCalibBtn_ = new QPushButton("Reset", this);
+        resetCalibBtn_->setEnabled(false);
+        connect(startCalibBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::startCalibration);
+        connect(resetCalibBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::resetCalibration);
+        calibControlLayout->addWidget(startCalibBtn);
+        calibControlLayout->addWidget(resetCalibBtn_);
+        calibControlLayout->addStretch();
+        calibProcessLayout->addLayout(calibControlLayout);
+        
+        // Calibration preview (show current camera feed with checkerboard detection)
+        calibrationPreviewLabel_ = new QLabel("Start calibration to see preview", this);
+        calibrationPreviewLabel_->setMinimumSize(640, 480);
+        calibrationPreviewLabel_->setAlignment(Qt::AlignCenter);
+        calibrationPreviewLabel_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        calibProcessLayout->addWidget(calibrationPreviewLabel_);
+        
+        // Status and progress
+        calibrationStatusLabel_ = new QLabel("Status: Not started", this);
+        calibrationProgressLabel_ = new QLabel("Captured: 0 images", this);
+        calibProcessLayout->addWidget(calibrationStatusLabel_);
+        calibProcessLayout->addWidget(calibrationProgressLabel_);
+        
+        // Save calibration button
+        saveCalibBtn_ = new QPushButton("Save Calibration", this);
+        saveCalibBtn_->setEnabled(false);
+        connect(saveCalibBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::saveCalibration);
+        calibProcessLayout->addWidget(saveCalibBtn_);
+        
+        calibProcessGroup->setLayout(calibProcessLayout);
+        layout->addWidget(calibProcessGroup);
+        
+        layout->addStretch();
+    }
+    
+    Mat drawGridOverlay(const Mat& img, const Scalar& color = Scalar(0, 255, 0), int gridSpacing = 50) {
+        Mat overlay = img.clone();
+        if (overlay.channels() == 1) {
+            cvtColor(overlay, overlay, COLOR_GRAY2RGB);
+        } else if (overlay.channels() == 3) {
+            overlay = overlay.clone();
+        }
+        
+        // Draw horizontal grid lines
+        for (int y = gridSpacing; y < overlay.rows; y += gridSpacing) {
+            line(overlay, Point(0, y), Point(overlay.cols, y), color, 1);
+        }
+        
+        // Draw vertical grid lines
+        for (int x = gridSpacing; x < overlay.cols; x += gridSpacing) {
+            line(overlay, Point(x, 0), Point(x, overlay.rows), color, 1);
+        }
+        
+        // Draw corner markers
+        int markerSize = 20;
+        // Top-left
+        line(overlay, Point(0, 0), Point(markerSize, 0), color, 2);
+        line(overlay, Point(0, 0), Point(0, markerSize), color, 2);
+        // Top-right
+        line(overlay, Point(overlay.cols - markerSize, 0), Point(overlay.cols, 0), color, 2);
+        line(overlay, Point(overlay.cols, 0), Point(overlay.cols, markerSize), color, 2);
+        // Bottom-left
+        line(overlay, Point(0, overlay.rows - markerSize), Point(0, overlay.rows), color, 2);
+        line(overlay, Point(0, overlay.rows), Point(markerSize, overlay.rows), color, 2);
+        // Bottom-right
+        line(overlay, Point(overlay.cols - markerSize, overlay.rows), Point(overlay.cols, overlay.rows), color, 2);
+        line(overlay, Point(overlay.cols, overlay.rows - markerSize), Point(overlay.cols, overlay.rows), color, 2);
+        
+        // Draw center marker
+        Point center(overlay.cols / 2, overlay.rows / 2);
+        circle(overlay, center, 10, color, 2);
+        line(overlay, Point(center.x - 15, center.y), Point(center.x + 15, center.y), color, 2);
+        line(overlay, Point(center.x, center.y - 15), Point(center.x, center.y + 15), color, 2);
+        
+        return overlay;
+    }
+    
+    void loadTestImageForFisheye() {
+        QString filename = QFileDialog::getOpenFileName(this, "Load Test Image", "", "Images (*.png *.jpg *.jpeg *.bmp)");
+        if (filename.isEmpty()) return;
+        
+        Mat testImage = imread(filename.toStdString(), IMREAD_GRAYSCALE);
+        if (testImage.empty()) {
+            QMessageBox::warning(this, "Error", "Failed to load test image");
+            return;
+        }
+        
+        // Create grid overlay for visualization
+        Mat gridOriginal = drawGridOverlay(testImage, Scalar(0, 255, 0), std::max(30, testImage.cols / 20));
+        
+        // Display original with grid
+        Mat displayOriginal;
+        if (gridOriginal.channels() == 3) {
+            displayOriginal = gridOriginal.clone();
+        } else {
+            cvtColor(gridOriginal, displayOriginal, COLOR_GRAY2RGB);
+        }
+        
+        // Draw same reference lines on original to show distortion
+        int width = displayOriginal.cols;
+        int height = displayOriginal.rows;
+        
+        // Draw center horizontal line (will appear curved due to distortion)
+        line(displayOriginal, Point(0, height / 2), Point(width, height / 2), Scalar(255, 0, 255), 2);
+        
+        // Draw center vertical line (will appear curved due to distortion)
+        line(displayOriginal, Point(width / 2, 0), Point(width / 2, height), Scalar(255, 0, 255), 2);
+        
+        // Draw diagonal lines (will appear curved)
+        line(displayOriginal, Point(0, 0), Point(width, height), Scalar(255, 255, 0), 1);
+        line(displayOriginal, Point(width, 0), Point(0, height), Scalar(255, 255, 0), 1);
+        
+        // Draw corner-to-corner lines (will appear curved)
+        int margin = 50;
+        line(displayOriginal, Point(margin, margin), Point(width - margin, margin), Scalar(0, 255, 255), 1);
+        line(displayOriginal, Point(margin, margin), Point(margin, height - margin), Scalar(0, 255, 255), 1);
+        line(displayOriginal, Point(width - margin, height - margin), Point(width - margin, margin), Scalar(0, 255, 255), 1);
+        line(displayOriginal, Point(width - margin, height - margin), Point(margin, height - margin), Scalar(0, 255, 255), 1);
+        
+        // Add label text
+        putText(displayOriginal, "ORIGINAL (Distorted)", Point(10, 30), 
+                FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 0), 2);
+        
+        QImage qimgOriginal(displayOriginal.data, displayOriginal.cols, displayOriginal.rows, displayOriginal.step, QImage::Format_RGB888);
+        QPixmap pixmapOriginal = QPixmap::fromImage(qimgOriginal.copy()).scaled(320, 240, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        fisheyeOriginalLabel_->setPixmap(pixmapOriginal);
+        
+        // Display corrected (if calibration loaded)
+        if (fisheye_calibration_loaded_ && !fisheye_K_.empty() && !fisheye_D_.empty()) {
+            Mat corrected = undistortFrame(testImage);
+            
+            // Draw grid on corrected image to show how lines are straightened
+            Mat gridCorrected = drawGridOverlay(corrected, Scalar(0, 255, 255), std::max(30, corrected.cols / 20));
+            
+            // Draw additional reference lines to visualize correction
+            Mat displayCorrected;
+            if (gridCorrected.channels() == 3) {
+                displayCorrected = gridCorrected.clone();
+            } else {
+                cvtColor(gridCorrected, displayCorrected, COLOR_GRAY2RGB);
+            }
+            
+            // Draw reference lines on corrected image - these should be perfectly straight
+            int width = displayCorrected.cols;
+            int height = displayCorrected.rows;
+            
+            // Draw center horizontal line (should be perfectly straight after correction)
+            line(displayCorrected, Point(0, height / 2), Point(width, height / 2), Scalar(255, 0, 255), 2);
+            
+            // Draw center vertical line (should be perfectly straight after correction)
+            line(displayCorrected, Point(width / 2, 0), Point(width / 2, height), Scalar(255, 0, 255), 2);
+            
+            // Draw horizontal lines at different heights (should be straight)
+            line(displayCorrected, Point(0, height / 4), Point(width, height / 4), Scalar(255, 0, 255), 1);
+            line(displayCorrected, Point(0, 3 * height / 4), Point(width, 3 * height / 4), Scalar(255, 0, 255), 1);
+            
+            // Draw vertical lines at different positions (should be straight)
+            line(displayCorrected, Point(width / 4, 0), Point(width / 4, height), Scalar(255, 0, 255), 1);
+            line(displayCorrected, Point(3 * width / 4, 0), Point(3 * width / 4, height), Scalar(255, 0, 255), 1);
+            
+            // Draw diagonal lines (should be straight)
+            line(displayCorrected, Point(0, 0), Point(width, height), Scalar(255, 255, 0), 2);
+            line(displayCorrected, Point(width, 0), Point(0, height), Scalar(255, 255, 0), 2);
+            
+            // Draw border rectangle (should have straight edges)
+            int margin = 30;
+            rectangle(displayCorrected, Rect(margin, margin, width - 2*margin, height - 2*margin), Scalar(0, 255, 255), 2);
+            
+            // Add label text
+            putText(displayCorrected, "CORRECTED (Undistorted)", Point(10, 30), 
+                    FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 255), 2);
+            
+            QImage qimgCorrected(displayCorrected.data, displayCorrected.cols, displayCorrected.rows, displayCorrected.step, QImage::Format_RGB888);
+            QPixmap pixmapCorrected = QPixmap::fromImage(qimgCorrected.copy()).scaled(320, 240, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            fisheyeCorrectedLabel_->setPixmap(pixmapCorrected);
+        } else {
+            fisheyeCorrectedLabel_->setText("Calibration not loaded");
+        }
+    }
+    
+    void onFisheyeSelectionChanged() {
+        // Update the enabled state based on selection
+        fisheye_undistort_enabled_ = fisheyeUseCorrectedRadio_->isChecked();
+        
+        // Clear maps if disabled
+        if (!fisheye_undistort_enabled_) {
+            fisheye_map1_ = Mat();
+            fisheye_map2_ = Mat();
+        }
+        
+        // Update status indicator at top
+        updateFisheyeStatusIndicator();
+        
+        qDebug() << "Fisheye correction for captures:" << (fisheye_undistort_enabled_ ? "ENABLED" : "DISABLED");
+    }
+    
+    void updateFisheyeStatusIndicator() {
+        if (!fisheyeStatusIndicator_) return;
+        
+        if (fisheye_undistort_enabled_ && fisheye_calibration_loaded_) {
+            fisheyeStatusIndicator_->setText("✓ Fisheye Correction: APPLIED");
+            fisheyeStatusIndicator_->setStyleSheet(
+                "QLabel { "
+                "background-color: #ccffcc; "
+                "color: #000000; "
+                "padding: 8px; "
+                "border: 2px solid #00aa00; "
+                "border-radius: 5px; "
+                "font-weight: bold; "
+                "font-size: 12pt; "
+                "}");
+        } else if (fisheye_calibration_loaded_) {
+            fisheyeStatusIndicator_->setText("✗ Fisheye Correction: NOT APPLIED (Calibration loaded but disabled)");
+            fisheyeStatusIndicator_->setStyleSheet(
+                "QLabel { "
+                "background-color: #ffffcc; "
+                "color: #000000; "
+                "padding: 8px; "
+                "border: 2px solid #aaaa00; "
+                "border-radius: 5px; "
+                "font-weight: bold; "
+                "font-size: 12pt; "
+                "}");
+        } else {
+            fisheyeStatusIndicator_->setText("✗ Fisheye Correction: NOT APPLIED (No calibration loaded)");
+            fisheyeStatusIndicator_->setStyleSheet(
+                "QLabel { "
+                "background-color: #ffcccc; "
+                "color: #000000; "
+                "padding: 8px; "
+                "border: 2px solid #ff0000; "
+                "border-radius: 5px; "
+                "font-weight: bold; "
+                "font-size: 12pt; "
+                "}");
+        }
+    }
+    
+    void startCalibration() {
+        if (!cameraOpen_) {
+            QMessageBox::warning(this, "Error", "Please open a camera first");
+            return;
+        }
+        
+        calibrationInProgress_ = true;
+        objectPoints_.clear();
+        imagePoints_.clear();
+        calibrationImages_.clear();
+        gridCaptured_.clear();
+        gridCaptured_.resize(36, false);  // 6x6 = 36 grid positions (but stop at 34)
+        stableFrameCount_ = 0;
+        lastStableFrame_ = Mat();
+        
+        resetCalibBtn_->setEnabled(true);
+        saveCalibBtn_->setEnabled(false);
+        calibrationStatusLabel_->setText("Status: Calibration in progress - show checkerboard to camera");
+        calibrationProgressLabel_->setText("Captured: 0/34 grid positions");
+        
+        // Start calibration preview timer
+        calibrationPreviewTimer_->start(33);  // ~30 FPS
+    }
+    
+    int getGridPosition(const vector<Point2f>& corners, const Size& imageSize) {
+        // Calculate center of checkerboard
+        Point2f center(0, 0);
+        for (const auto& pt : corners) {
+            center += pt;
+        }
+        center.x /= corners.size();
+        center.y /= corners.size();
+        
+        // Map center to 6x6 grid position based on actual image position
+        // Normalize to [0, 1] range
+        float normX = center.x / imageSize.width;
+        float normY = center.y / imageSize.height;
+        
+        // Clamp to valid range
+        normX = max(0.0f, min(1.0f, normX));
+        normY = max(0.0f, min(1.0f, normY));
+        
+        // Map to grid coordinates (0-5)
+        int gridX = static_cast<int>(normX * 6);
+        int gridY = static_cast<int>(normY * 6);
+        
+        // Clamp to valid grid range
+        gridX = max(0, min(5, gridX));
+        gridY = max(0, min(5, gridY));
+        
+        return gridY * 6 + gridX;
+    }
+    
+    void captureCalibrationImageAuto(const Mat& frame, const vector<Point2f>& corners) {
+        if (!calibrationInProgress_) return;
+        
+        // Convert to grayscale if needed
+        Mat gray;
+        if (frame.channels() == 3) {
+            cvtColor(frame, gray, COLOR_BGR2GRAY);
+        } else {
+            gray = frame.clone();
+        }
+        
+        // Refine corners
+        vector<Point2f> refinedCorners = corners;
+        cornerSubPix(gray, refinedCorners, Size(11, 11), Size(-1, -1), 
+            TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 30, 0.1));
+        
+        // Create object points (3D points in real world coordinates)
+        vector<Point3f> obj;
+        for (int i = 0; i < checkerboardSize_.height; i++) {
+            for (int j = 0; j < checkerboardSize_.width; j++) {
+                obj.push_back(Point3f(j, i, 0));
+            }
+        }
+        
+        // Get grid position based on actual frame size
+        Size frameSize = frame.size();
+        int gridPos = getGridPosition(refinedCorners, frameSize);
+        
+        // Check if this grid position is already captured
+        if (gridPos >= 0 && gridPos < 36 && !gridCaptured_[gridPos]) {
+            // Store points
+            objectPoints_.push_back(obj);
+            imagePoints_.push_back(refinedCorners);
+            calibrationImages_.push_back(frame.clone());
+            gridCaptured_[gridPos] = true;
+            
+            int capturedCount = 0;
+            for (bool captured : gridCaptured_) {
+                if (captured) capturedCount++;
+            }
+            
+            calibrationProgressLabel_->setText(QString("Captured: %1/34 grid positions").arg(capturedCount));
+            
+            // Enable save button if we have enough images
+            if (imagePoints_.size() >= 3) {
+                saveCalibBtn_->setEnabled(true);
+            }
+            
+            // Stop calibration if 34 tiles captured
+            if (capturedCount >= 34) {
+                calibrationInProgress_ = false;
+                calibrationPreviewTimer_->stop();
+                calibrationStatusLabel_->setText("Status: Calibration complete (34/34 positions captured)");
+                QMessageBox::information(this, "Calibration Complete", 
+                    "Successfully captured 34 grid positions!\n\nClick 'Save Calibration' to compute and save calibration parameters.");
+            }
+        }
+    }
+    
+    void resetCalibration() {
+        calibrationInProgress_ = false;
+        objectPoints_.clear();
+        imagePoints_.clear();
+        calibrationImages_.clear();
+        gridCaptured_.clear();
+        gridCaptured_.resize(36, false);
+        stableFrameCount_ = 0;
+        lastStableFrame_ = Mat();
+        
+        resetCalibBtn_->setEnabled(false);
+        saveCalibBtn_->setEnabled(false);
+        calibrationStatusLabel_->setText("Status: Not started");
+        calibrationProgressLabel_->setText("Captured: 0/34 grid positions");
+        
+        calibrationPreviewTimer_->stop();
+        calibrationPreviewLabel_->setText("Start calibration to see preview");
+    }
+    
+    void updateCalibrationPreview() {
+        if (!calibrationInProgress_ || !cameraOpen_) {
+            calibrationPreviewTimer_->stop();
+            return;
+        }
+        
+        Mat frame;
+        {
+            lock_guard<mutex> lock(frameMutex_);
+            if (currentFrame_.empty()) return;
+            frame = currentFrame_.clone();
+        }
+        
+        if (frame.empty()) return;
+        
+        // Convert to grayscale if needed
+        Mat gray;
+        if (frame.channels() == 3) {
+            cvtColor(frame, gray, COLOR_BGR2GRAY);
+        } else {
+            gray = frame.clone();
+        }
+        
+        // Find checkerboard corners
+        vector<Point2f> corners;
+        bool found = findChessboardCorners(gray, checkerboardSize_, corners, 
+            CALIB_CB_ADAPTIVE_THRESH | CALIB_CB_NORMALIZE_IMAGE | CALIB_CB_FAST_CHECK);
+        
+        Mat display;
+        if (frame.channels() == 1) {
+            cvtColor(frame, display, COLOR_GRAY2BGR);
+        } else {
+            display = frame.clone();
+        }
+        
+        // Draw 6x6 grid overlay
+        int gridRows = 6;
+        int gridCols = 6;
+        int cellWidth = display.cols / gridCols;
+        int cellHeight = display.rows / gridRows;
+        
+        // Draw grid lines
+        for (int i = 0; i <= gridRows; i++) {
+            line(display, Point(0, i * cellHeight), Point(display.cols, i * cellHeight), Scalar(128, 128, 128), 1);
+        }
+        for (int j = 0; j <= gridCols; j++) {
+            line(display, Point(j * cellWidth, 0), Point(j * cellWidth, display.rows), Scalar(128, 128, 128), 1);
+        }
+        
+        // Highlight captured grid positions with yellow border and dot
+        for (int i = 0; i < gridRows; i++) {
+            for (int j = 0; j < gridCols; j++) {
+                int gridPos = i * gridCols + j;
+                if (gridPos < gridCaptured_.size() && gridCaptured_[gridPos]) {
+                    Rect cellRect(j * cellWidth, i * cellHeight, cellWidth, cellHeight);
+                    rectangle(display, cellRect, Scalar(0, 255, 255), 3);  // Yellow border only (thick)
+                    
+                    // Draw small dot in top-left corner
+                    Point dotPos(j * cellWidth + 5, i * cellHeight + 5);
+                    circle(display, dotPos, 4, Scalar(0, 255, 255), -1);  // Yellow filled circle
+                }
+            }
+        }
+        
+        // Draw checkerboard corners if found
+        if (found) {
+            // Refine corners
+            vector<Point2f> refinedCorners = corners;
+            cornerSubPix(gray, refinedCorners, Size(11, 11), Size(-1, -1), 
+                TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 30, 0.1));
+            
+            // Draw checkerboard corners with colored lines (this shows the detected pattern)
+            drawChessboardCorners(display, checkerboardSize_, refinedCorners, found);
+            
+            // Calculate current grid position for visual feedback
+            Size frameSize = display.size();
+            int currentGridPos = getGridPosition(refinedCorners, frameSize);
+            
+            // Highlight the current grid position with a different color (cyan border)
+            if (currentGridPos >= 0 && currentGridPos < 36) {
+                int gridY = currentGridPos / 6;
+                int gridX = currentGridPos % 6;
+                Rect currentCellRect(gridX * cellWidth, gridY * cellHeight, cellWidth, cellHeight);
+                rectangle(display, currentCellRect, Scalar(255, 255, 0), 2);  // Cyan border for current position
+            }
+            
+            // Check stability (compare with last stable frame)
+            bool isStable = false;
+            if (lastStableFrame_.empty()) {
+                isStable = true;
+                stableFrameCount_ = 1;
+            } else {
+                // Simple stability check: compare corner positions
+                double maxDiff = 0;
+                for (size_t i = 0; i < refinedCorners.size() && i < corners.size(); i++) {
+                    double diff = norm(refinedCorners[i] - corners[i]);
+                    maxDiff = max(maxDiff, diff);
+                }
+                if (maxDiff < 5.0) {  // Corners haven't moved much
+                    stableFrameCount_++;
+                    if (stableFrameCount_ >= STABLE_THRESHOLD) {
+                        isStable = true;
+                    }
+                } else {
+                    stableFrameCount_ = 0;
+                }
+            }
+            
+            if (isStable && calibrationInProgress_) {
+                lastStableFrame_ = frame.clone();
+                // Auto-capture
+                captureCalibrationImageAuto(frame, refinedCorners);
+                
+                int capturedCount = 0;
+                for (bool captured : gridCaptured_) {
+                    if (captured) capturedCount++;
+                }
+                
+                if (capturedCount < 34) {
+                    putText(display, "CHECKERBOARD DETECTED - AUTO CAPTURED", Point(10, 30), 
+                        FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
+                } else {
+                    putText(display, "CALIBRATION COMPLETE (34/34)", Point(10, 30), 
+                        FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
+                }
+            } else {
+                putText(display, "CHECKERBOARD DETECTED - Stabilizing...", Point(10, 30), 
+                    FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 255), 2);
+            }
+        } else {
+            stableFrameCount_ = 0;
+            lastStableFrame_ = Mat();
+            putText(display, "Move checkerboard into view", Point(10, 30), 
+                FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 255), 2);
+        }
+        
+        // Convert to RGB for display
+        Mat displayRGB;
+        cvtColor(display, displayRGB, COLOR_BGR2RGB);
+        
+        // Show count
+        int capturedCount = 0;
+        for (bool captured : gridCaptured_) {
+            if (captured) capturedCount++;
+        }
+        putText(displayRGB, QString("Captured: %1/34").arg(capturedCount).toStdString(), 
+            Point(10, displayRGB.rows - 20), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 0), 2);
+        
+        // Show message if calibration is complete
+        if (capturedCount >= 34) {
+            putText(displayRGB, "CALIBRATION COMPLETE - Click Save", Point(10, 60), 
+                FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
+        }
+        
+        QImage qimg(displayRGB.data, displayRGB.cols, displayRGB.rows, displayRGB.step, QImage::Format_RGB888);
+        QPixmap pixmap = QPixmap::fromImage(qimg.copy()).scaled(640, 480, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        calibrationPreviewLabel_->setPixmap(pixmap);
+    }
+    
+    void saveCalibration() {
+        if (imagePoints_.size() < 3) {
+            QMessageBox::warning(this, "Error", "Need at least 3 images for calibration");
+            return;
+        }
+        
+        // Get output filename
+        QString filename = QFileDialog::getSaveFileName(this, "Save Calibration File", 
+            calibPathEdit_->text(), "YAML Files (*.yaml *.yml);;All Files (*)");
+        if (filename.isEmpty()) return;
+        
+        // Perform fisheye calibration
+        Mat K = Mat::eye(3, 3, CV_64F);
+        Mat D;
+        vector<Mat> rvecs, tvecs;
+        
+        Size imageSize = calibrationImages_[0].size();
+        if (calibrationImages_[0].channels() == 1) {
+            imageSize = Size(calibrationImages_[0].cols, calibrationImages_[0].rows);
+        } else {
+            imageSize = Size(calibrationImages_[0].cols, calibrationImages_[0].rows);
+        }
+        
+        int flags = fisheye::CALIB_RECOMPUTE_EXTRINSIC | fisheye::CALIB_CHECK_COND | fisheye::CALIB_FIX_SKEW;
+        double rms = fisheye::calibrate(objectPoints_, imagePoints_, imageSize, K, D, rvecs, tvecs, flags,
+            TermCriteria(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-6));
+        
+        // Save to YAML file
+        FileStorage fs(filename.toStdString(), FileStorage::WRITE);
+        if (fs.isOpened()) {
+            fs << "camera_matrix" << K;
+            fs << "distortion_coefficients" << D;
+            fs << "image_width" << imageSize.width;
+            fs << "image_height" << imageSize.height;
+            fs.release();
+            
+            QMessageBox::information(this, "Success", 
+                QString("Calibration saved successfully!\n\nRMS Error: %1\nCalibration file: %2")
+                .arg(rms, 0, 'f', 4).arg(filename));
+            
+            // Update path and load the new calibration
+            calibPathEdit_->setText(filename);
+            if (loadFisheyeCalibration(filename)) {
+                if (fisheyeStatusLabel_) {
+                    fisheyeStatusLabel_->setText(QString("Calibration: Loaded (Size: %1x%2)")
+                        .arg(fisheye_image_size_.width).arg(fisheye_image_size_.height));
+                }
+            }
+            
+            // Stop calibration process
+            resetCalibration();
+        } else {
+            QMessageBox::warning(this, "Error", "Failed to save calibration file");
+        }
+    }
+    
+    void browseCalibrationFile() {
+        QString filename = QFileDialog::getOpenFileName(this, "Select Calibration File", 
+            calibPathEdit_->text(), "YAML Files (*.yaml *.yml);;All Files (*)");
+        if (!filename.isEmpty()) {
+            calibPathEdit_->setText(filename);
+        }
+    }
+    
+    void loadCalibrationFromUI() {
+        QString path = calibPathEdit_->text();
+        if (loadFisheyeCalibration(path)) {
+            if (fisheyeStatusLabel_) {
+                fisheyeStatusLabel_->setText(QString("Calibration: Loaded (Size: %1x%2)")
+                    .arg(fisheye_image_size_.width).arg(fisheye_image_size_.height));
+            }
+            // Enable radio buttons (if UI is already created)
+            if (fisheyeUseCorrectedRadio_ && fisheyeUseOriginalRadio_) {
+                fisheyeUseCorrectedRadio_->setEnabled(true);
+                fisheyeUseOriginalRadio_->setEnabled(true);
+            }
+        } else {
+            if (fisheyeStatusLabel_) {
+                fisheyeStatusLabel_->setText("Calibration: Failed to load");
+            }
+            // Disable radio buttons (if UI is already created)
+            if (fisheyeUseCorrectedRadio_ && fisheyeUseOriginalRadio_) {
+                fisheyeUseCorrectedRadio_->setEnabled(false);
+                fisheyeUseOriginalRadio_->setEnabled(false);
+            }
+        }
+        
+        // Update top status indicator
+        updateFisheyeStatusIndicator();
+    }
+    
+    bool loadFisheyeCalibration(const QString& calib_path) {
+        QFileInfo file_info(calib_path);
+        if (!file_info.exists()) {
+            qDebug() << "Fisheye calibration file not found:" << calib_path;
+            return false;
+        }
+        
+        string path = calib_path.toStdString();
+        FileStorage fs(path, FileStorage::READ);
+        
+        if (!fs.isOpened()) {
+            qDebug() << "Failed to open fisheye calibration file:" << calib_path;
+            return false;
+        }
+        
+        fs["camera_matrix"] >> fisheye_K_;
+        fs["distortion_coefficients"] >> fisheye_D_;
+        
+        int img_width = 0, img_height = 0;
+        if (fs["image_width"].isInt()) {
+            img_width = static_cast<int>(fs["image_width"]);
+        }
+        if (fs["image_height"].isInt()) {
+            img_height = static_cast<int>(fs["image_height"]);
+        }
+        
+        fs.release();
+        
+        if (fisheye_K_.empty() || fisheye_D_.empty()) {
+            qDebug() << "Failed to read camera matrix or distortion coefficients";
+            return false;
+        }
+        
+        fisheye_image_size_ = Size(img_width, img_height);
+        fisheye_calibration_loaded_ = true;
+        
+        // Enable corrected radio button if calibration loaded (if UI is already created)
+        if (fisheyeUseCorrectedRadio_ && fisheyeUseOriginalRadio_) {
+            fisheyeUseCorrectedRadio_->setEnabled(true);
+            fisheyeUseOriginalRadio_->setEnabled(true);
+            // Set default to corrected if calibration just loaded
+            if (!fisheyeUseOriginalRadio_->isChecked() && !fisheyeUseCorrectedRadio_->isChecked()) {
+                fisheyeUseCorrectedRadio_->setChecked(true);
+                fisheye_undistort_enabled_ = true;
+            }
+        }
+        
+        qDebug() << "Fisheye calibration loaded successfully";
+        qDebug() << "Camera matrix K rows:" << fisheye_K_.rows << "cols:" << fisheye_K_.cols;
+        qDebug() << "Distortion coefficients D rows:" << fisheye_D_.rows << "cols:" << fisheye_D_.cols;
+        qDebug() << "Image size:" << fisheye_image_size_.width << "x" << fisheye_image_size_.height;
+        
+        return true;
+    }
+    
+    void initFisheyeUndistortMaps(const Size& image_size) {
+        if (!fisheye_undistort_enabled_ || fisheye_K_.empty() || fisheye_D_.empty()) {
+            return;
+        }
+        
+        // Check if maps are already initialized for this size
+        if (!fisheye_map1_.empty() && fisheye_map1_.size() == image_size) {
+            return;
+        }
+        
+        // Initialize undistortion maps
+        fisheye::initUndistortRectifyMap(
+            fisheye_K_,
+            fisheye_D_,
+            Mat::eye(3, 3, CV_32F),  // Identity matrix (no rotation)
+            fisheye_K_,  // Use same camera matrix for output
+            image_size,
+            CV_16SC2,  // map1 type
+            fisheye_map1_,
+            fisheye_map2_
+        );
+        
+        qDebug() << "Fisheye undistortion maps initialized for size:" << image_size.width << "x" << image_size.height;
+    }
+    
+    Mat undistortFrame(const Mat& frame) {
+        if (!fisheye_undistort_enabled_ || fisheye_K_.empty() || fisheye_D_.empty()) {
+            return frame;  // Return original frame if undistortion not enabled
+        }
+        
+        // Initialize maps if needed (first frame or size changed)
+        Size frameSize = frame.size();
+        if (fisheye_map1_.empty() || fisheye_map1_.size() != frameSize) {
+            initFisheyeUndistortMaps(frameSize);
+        }
+        
+        if (fisheye_map1_.empty() || fisheye_map2_.empty()) {
+            return frame;  // Return original if maps failed to initialize
+        }
+        
+        Mat undistorted;
+        // Use INTER_CUBIC for better quality (preserves edges better than LINEAR)
+        remap(frame, undistorted, fisheye_map1_, fisheye_map2_, INTER_CUBIC, BORDER_CONSTANT);
+        
+        return undistorted;
+    }
+    
+    void enumerateCameras() {
+        cameraCombo_->clear();
+        cameraList_.clear();
+        isMindVision_.clear();
+        
+        // Enumerate V4L2 cameras
+        for (int i = 0; i < 10; i++) {
+            VideoCapture testCap(i);
+            if (testCap.isOpened()) {
+                cameraList_.push_back("V4L2 Camera " + to_string(i));
+                isMindVision_.push_back(false);
+                cameraCombo_->addItem(QString("V4L2 Camera %1").arg(i));
+                testCap.release();
+            }
+        }
+        
+        // Enumerate MindVision cameras
+#ifdef HAVE_MINDVISION_SDK
+        CameraSdkStatus status = CameraSdkInit(1);
+        if (status == CAMERA_STATUS_SUCCESS) {
+            tSdkCameraDevInfo list[16];
+            INT count = 16;
+            status = CameraEnumerateDevice(list, &count);
+            if (status == CAMERA_STATUS_SUCCESS && count > 0) {
+                for (int i = 0; i < count; i++) {
+                    string name = list[i].acFriendlyName[0] ? list[i].acFriendlyName : list[i].acProductName;
+                    cameraList_.push_back("MindVision: " + name);
+                    isMindVision_.push_back(true);
+                    cameraCombo_->addItem(QString("MindVision: %1").arg(QString::fromStdString(name)));
+                }
+            }
+        }
+#endif
+    }
+    
+    void openCamera() {
+        closeCamera();
+        
+        int index = cameraCombo_->currentIndex();
+        if (index < 0 || index >= (int)cameraList_.size()) {
+            return;
+        }
+        
+        selectedCameraIndex_ = index;
+        useMindVision_ = isMindVision_[index];
+        
+        if (useMindVision_) {
+#ifdef HAVE_MINDVISION_SDK
+            // Open MindVision camera
+            CameraSdkStatus status = CameraSdkInit(1);
+            if (status != CAMERA_STATUS_SUCCESS) {
+                previewLabel_->setText("Failed to initialize MindVision SDK");
+                return;
+            }
+            
+            tSdkCameraDevInfo list[16];
+            INT count = 16;
+            status = CameraEnumerateDevice(list, &count);
+            if (status != CAMERA_STATUS_SUCCESS || count == 0) {
+                previewLabel_->setText("No MindVision cameras found");
+                return;
+            }
+            
+            // Find the correct camera index (skip V4L2 cameras)
+            int mvIndex = 0;
+            for (int i = 0; i < index; i++) {
+                if (isMindVision_[i]) mvIndex++;
+            }
+            
+            status = CameraInit(&list[mvIndex], -1, -1, &mvHandle_);
+            if (status != CAMERA_STATUS_SUCCESS) {
+                previewLabel_->setText("Failed to open MindVision camera");
+                return;
+            }
+            
+            tSdkCameraCapbility cap;
+            CameraGetCapability(mvHandle_, &cap);
+            CameraSetIspOutFormat(mvHandle_, CAMERA_MEDIA_TYPE_MONO8);
+            
+            // Disable auto exposure
+            BOOL ae_state = FALSE;
+            CameraGetAeState(mvHandle_, &ae_state);
+            if (ae_state) {
+                CameraSetAeState(mvHandle_, FALSE);
+            }
+            
+            CameraPlay(mvHandle_);
+            
+            // Initialize MindVision modes
+            mv_modes_.clear();
+            mv_modes_.push_back(MVMode{1280, 1024, FRAME_SPEED_SUPER, "1280x1024 @211 FPS"});
+            mv_modes_.push_back(MVMode{1280, 1024, FRAME_SPEED_HIGH, "1280x1024 @106 FPS"});
+            mv_modes_.push_back(MVMode{480, 640, FRAME_SPEED_SUPER, "480x640 @790 FPS"});
+            
+            // Populate mode combo
+            modeCombo_->blockSignals(true);
+            modeCombo_->clear();
+            for (const auto &m : mv_modes_) {
+                modeCombo_->addItem(QString::fromStdString(m.label));
+            }
+            modeCombo_->setCurrentIndex(0);
+            modeCombo_->setEnabled(true);
+            modeCombo_->blockSignals(false);
+            applyMVMode(0);
+            
+            // Initialize slider values from camera
+            double current_exposure = 0.0;
+            if (CameraGetExposureTime(mvHandle_, &current_exposure) == CAMERA_STATUS_SUCCESS) {
+                double min_exposure = 1000.0;
+                double max_exposure = 100000.0;
+                int slider_value = static_cast<int>(((max_exposure - current_exposure) / (max_exposure - min_exposure)) * 100.0);
+                slider_value = std::max(0, std::min(100, slider_value));
+                exposureSlider_->blockSignals(true);
+                exposureSlider_->setValue(slider_value);
+                exposureSpin_->setValue(slider_value);
+                exposureSlider_->blockSignals(false);
+            }
+            
+            int current_gain_r = 0, current_gain_g = 0, current_gain_b = 0;
+            if (CameraGetGain(mvHandle_, &current_gain_r, &current_gain_g, &current_gain_b) == CAMERA_STATUS_SUCCESS) {
+                gainSlider_->blockSignals(true);
+                gainSlider_->setValue(current_gain_r);
+                gainSpin_->setValue(current_gain_r);
+                gainSlider_->blockSignals(false);
+            }
+            
+            INT current_analog_gain = 0;
+            if (CameraGetAnalogGain(mvHandle_, &current_analog_gain) == CAMERA_STATUS_SUCCESS) {
+                int brightness_value = (current_analog_gain * 255) / 100;
+                brightnessSlider_->blockSignals(true);
+                brightnessSlider_->setValue(brightness_value);
+                brightnessSpin_->setValue(brightness_value);
+                brightnessSlider_->blockSignals(false);
+            }
+            
+            int current_contrast = 0;
+            if (CameraGetContrast(mvHandle_, &current_contrast) == CAMERA_STATUS_SUCCESS) {
+                contrastSlider_->blockSignals(true);
+                contrastSlider_->setValue(current_contrast);
+                contrastSpin_->setValue(current_contrast);
+                contrastSlider_->blockSignals(false);
+            }
+            
+            int current_saturation = 0;
+            if (CameraGetSaturation(mvHandle_, &current_saturation) == CAMERA_STATUS_SUCCESS) {
+                saturationSlider_->blockSignals(true);
+                saturationSlider_->setValue(current_saturation);
+                saturationSpin_->setValue(current_saturation);
+                saturationSlider_->blockSignals(false);
+            }
+            
+            int current_sharpness = 0;
+            if (CameraGetSharpness(mvHandle_, &current_sharpness) == CAMERA_STATUS_SUCCESS) {
+                sharpnessSlider_->blockSignals(true);
+                sharpnessSlider_->setValue(current_sharpness);
+                sharpnessSpin_->setValue(current_sharpness);
+                sharpnessSlider_->blockSignals(false);
+            }
+            
+            cameraOpen_ = true;
+#else
+            previewLabel_->setText("MindVision SDK not available");
+            return;
+#endif
+        } else {
+            // Open V4L2 camera
+            // Find the actual V4L2 index
+            int v4l2Index = 0;
+            for (int i = 0; i < index; i++) {
+                if (!isMindVision_[i]) v4l2Index++;
+            }
+            
+            cameraCap_.open(v4l2Index);
+            if (!cameraCap_.isOpened()) {
+                previewLabel_->setText(QString("Failed to open V4L2 camera %1").arg(v4l2Index));
+                return;
+            }
+            
+            // Initialize V4L2 modes
+            v4l2_modes_.clear();
+            v4l2_modes_.push_back(Mode{640, 480, 30.0, "640x480 @30 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 30.0, "1280x720 @30 FPS"});
+            v4l2_modes_.push_back(Mode{1920, 1080, 30.0, "1920x1080 @30 FPS"});
+            v4l2_modes_.push_back(Mode{640, 480, 60.0, "640x480 @60 FPS"});
+            
+            // Populate mode combo
+            modeCombo_->blockSignals(true);
+            modeCombo_->clear();
+            for (const auto &m : v4l2_modes_) {
+                modeCombo_->addItem(QString::fromStdString(m.label));
+            }
+            modeCombo_->setCurrentIndex(0);
+            modeCombo_->setEnabled(true);
+            modeCombo_->blockSignals(false);
+            applyMode(0);
+            
+            cameraOpen_ = true;
+        }
+        
+        captureBtn_->setEnabled(true);
+        previewTimer_->start(33);  // ~30 FPS
+        
+        // Generate initial capture filename
+        suggestedCaptureFilename_ = generateCaptureFilename().toStdString();
+    }
+    
+    void closeCamera() {
+        if (previewTimer_) {
+            previewTimer_->stop();
+        }
+        
+        if (useMindVision_ && mvHandle_ != 0) {
+#ifdef HAVE_MINDVISION_SDK
+            CameraStop(mvHandle_);
+            CameraUnInit(mvHandle_);
+            mvHandle_ = 0;
+#endif
+        } else if (cameraCap_.isOpened()) {
+            cameraCap_.release();
+        }
+        
+        cameraOpen_ = false;
+        captureBtn_->setEnabled(false);
+        modeCombo_->setEnabled(false);
+        modeCombo_->clear();
+        previewLabel_->setText("Camera closed");
+    }
+    
+    void updateCameraSettings() {
+        if (!cameraOpen_) return;
+        
+        if (useMindVision_ && mvHandle_ != 0) {
+#ifdef HAVE_MINDVISION_SDK
+            // Update MindVision camera settings
+            // Exposure: Map slider (0-100) to exposure time (100000 to 1000 microseconds)
+            double min_exposure = 1000.0;
+            double max_exposure = 100000.0;
+            double exposure = max_exposure - (exposureSlider_->value() / 100.0) * (max_exposure - min_exposure);
+            CameraSetExposureTime(mvHandle_, exposure);
+            
+            // Gain (RGB gains, same value for all channels)
+            int gain = gainSlider_->value();
+            CameraSetGain(mvHandle_, gain, gain, gain);
+            
+            // Brightness: Map slider (0-255) to analog gain (0-100)
+            INT analogGain = (brightnessSlider_->value() * 100) / 255;
+            CameraSetAnalogGain(mvHandle_, analogGain);
+            
+            // Contrast
+            CameraSetContrast(mvHandle_, contrastSlider_->value());
+            
+            // Saturation
+            CameraSetSaturation(mvHandle_, saturationSlider_->value());
+            
+            // Sharpness
+            CameraSetSharpness(mvHandle_, sharpnessSlider_->value());
+#endif
+        } else if (cameraCap_.isOpened()) {
+            // Update V4L2 camera settings
+            cameraCap_.set(CAP_PROP_EXPOSURE, exposureSlider_->value());
+            cameraCap_.set(CAP_PROP_GAIN, gainSlider_->value());
+            cameraCap_.set(CAP_PROP_BRIGHTNESS, brightnessSlider_->value());
+            cameraCap_.set(CAP_PROP_CONTRAST, contrastSlider_->value());
+            cameraCap_.set(CAP_PROP_SATURATION, saturationSlider_->value());
+            cameraCap_.set(CAP_PROP_SHARPNESS, sharpnessSlider_->value());
+        }
+    }
+    
+    void onModeChanged(int mode_index) {
+        if (!cameraOpen_ || mode_index < 0) return;
+        
+        if (useMindVision_ && mvHandle_ != 0) {
+            applyMVMode(mode_index);
+        } else if (cameraCap_.isOpened()) {
+            applyMode(mode_index);
+        }
+    }
+    
+    void applyMode(int mode_index) {
+        if (mode_index < 0 || mode_index >= static_cast<int>(v4l2_modes_.size())) return;
+        if (!cameraCap_.isOpened()) return;
+        
+        const Mode &m = v4l2_modes_[mode_index];
+        cameraCap_.set(CAP_PROP_FRAME_WIDTH, m.width);
+        cameraCap_.set(CAP_PROP_FRAME_HEIGHT, m.height);
+        cameraCap_.set(CAP_PROP_FPS, m.fps);
+    }
+    
+    void applyMVMode(int mode_index) {
+#ifdef HAVE_MINDVISION_SDK
+        if (mode_index < 0 || mode_index >= static_cast<int>(mv_modes_.size())) return;
+        if (mvHandle_ == 0) return;
+        
+        const MVMode &m = mv_modes_[mode_index];
+        CameraSetImageResolutionEx(mvHandle_, 0xff, 0, 0, 0, 0, m.width, m.height, 0, 0);
+        CameraSetFrameSpeed(mvHandle_, m.frame_speed_index);
+#endif
+    }
+    
+    void updatePreview() {
+        if (!cameraOpen_) return;
+        
+        Mat frame;
+        if (useMindVision_ && mvHandle_ != 0) {
+#ifdef HAVE_MINDVISION_SDK
+            BYTE *pbyBuffer = nullptr;
+            tSdkFrameHead sFrameInfo;
+            CameraSdkStatus status = CameraGetImageBuffer(mvHandle_, &sFrameInfo, &pbyBuffer, 100);
+            if (status == CAMERA_STATUS_SUCCESS && pbyBuffer) {
+                int width = sFrameInfo.iWidth;
+                int height = sFrameInfo.iHeight;
+                frame = Mat(height, width, CV_8UC1, pbyBuffer).clone();
+                CameraReleaseImageBuffer(mvHandle_, pbyBuffer);
+            } else {
+                return;
+            }
+#else
+            return;
+#endif
+        } else if (cameraCap_.isOpened()) {
+            cameraCap_ >> frame;
+            if (frame.empty()) return;
+        } else {
+            return;
+        }
+        
+        if (!frame.empty()) {
+            Mat frame_for_display = frame;
+            {
+                lock_guard<mutex> lock(frameMutex_);
+                // Apply fisheye undistortion if enabled (based on user selection)
+                if (fisheye_undistort_enabled_ && fisheye_calibration_loaded_) {
+                    frame_for_display = undistortFrame(frame);
+                }
+                // Store the frame (undistorted if enabled, original otherwise)
+                currentFrame_ = frame_for_display.clone();
+            }
+            
+            Mat display;
+            if (frame_for_display.channels() == 1) {
+                cvtColor(frame_for_display, display, COLOR_GRAY2RGB);
+            } else {
+                cvtColor(frame_for_display, display, COLOR_BGR2RGB);
+            }
+            
+            // Convert to QImage safely (copy data to avoid dangling pointer)
+            QImage qimg;
+            if (display.channels() == 3) {
+                qimg = QImage(display.data, display.cols, display.rows, display.step, QImage::Format_RGB888).copy();
+            } else {
+                qimg = QImage(display.data, display.cols, display.rows, display.step, QImage::Format_Grayscale8).copy();
+            }
+            QPixmap pixmap = QPixmap::fromImage(qimg).scaled(640, 480, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            previewLabel_->setPixmap(pixmap);
+        }
+    }
+    
+    void captureFrame() {
+        if (!cameraOpen_) return;
+        
+        Mat frame;
+        {
+            lock_guard<mutex> lock(frameMutex_);
+            if (currentFrame_.empty()) return;
+            frame = currentFrame_.clone();
+        }
+        
+        if (frame.empty()) return;
+        
+        // Generate suggested filename with camera name and timestamp
+        QString suggestedFilename = generateCaptureFilename();
+        
+        // Show save dialog with suggested filename (user can edit it)
+        QString filename = QFileDialog::getSaveFileName(
+            this, 
+            "Save Captured Frame", 
+            suggestedFilename,
+            "Image Files (*.png *.jpg *.jpeg *.bmp);;PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)");
+        
+        if (!filename.isEmpty()) {
+            // Ensure the directory exists
+            QFileInfo fileInfo(filename);
+            QDir dir = fileInfo.absoluteDir();
+            if (!dir.exists()) {
+                dir.mkpath(".");
+            }
+            
+            // Save frame (preserve original format)
+            bool saved = imwrite(filename.toStdString(), frame);
+            if (!saved) {
+                QMessageBox::warning(this, "Error", QString("Failed to save frame to %1").arg(filename));
+                return;
+            }
+            
+            QMessageBox::information(this, "Capture", QString("Frame saved to %1").arg(filename));
+            
+            // Load it as Image 1 for processing (convert to grayscale for processing)
+            if (frame.channels() == 1) {
+                // Already grayscale
+                image1_ = frame.clone();
+            } else {
+                // Convert to grayscale
+                cvtColor(frame, image1_, COLOR_BGR2GRAY);
+            }
+            image1_path_ = filename.toStdString();
+            
+            // Process the image
+            processImages();
+        }
+    }
+
+    // Tab widget
+    QTabWidget *tabWidget_;
+    
+    // UI elements (Processing tab)
+    QPushButton *loadBtn1_, *loadBtn2_;
+    QComboBox *preprocessCombo_, *edgeCombo_, *detectionCombo_, *advancedCombo_;
+    QComboBox *quadCombo1_, *quadCombo2_;  // Independent quad selection for each image
+    QCheckBox *mirrorCheckbox1_, *mirrorCheckbox2_;  // Independent mirror for each image
+    QLabel *label1_, *label2_;
+    QTextEdit *infoText_;
+    QTextEdit *qualityText1_, *qualityText2_;  // Quality metrics for each image
+    
+    // UI elements (Capture tab)
+    QComboBox *cameraCombo_;
+    QComboBox *modeCombo_;  // Resolution/FPS selection
+    QLabel *previewLabel_;
+    QPushButton *loadImageBtn_;
+    QPushButton *captureBtn_;
+    QTimer *previewTimer_;
+    QTimer *calibrationPreviewTimer_;
+    
+    // UI elements (Fisheye tab)
+    QLineEdit *calibPathEdit_;
+    QLabel *fisheyeStatusLabel_;  // Status label in Fisheye tab
+    QLabel *fisheyeStatusIndicator_;  // Status indicator at top of window
+    QPushButton *loadTestImageBtn_;
+    QLabel *fisheyeOriginalLabel_;
+    QLabel *fisheyeCorrectedLabel_;
+    QRadioButton *fisheyeUseOriginalRadio_;
+    QRadioButton *fisheyeUseCorrectedRadio_;
+    
+    // Calibration process UI
+    QPushButton *resetCalibBtn_;
+    QLabel *calibrationPreviewLabel_;
+    QLabel *calibrationStatusLabel_;
+    QLabel *calibrationProgressLabel_;
+    QPushButton *saveCalibBtn_;
+    
+    // Calibration data
+    bool calibrationInProgress_ = false;
+    vector<vector<Point3f>> objectPoints_;  // 3D points in real world space
+    vector<vector<Point2f>> imagePoints_;   // 2D points in image plane
+    Size checkerboardSize_ = Size(6, 6);     // Inner corners (6x6)
+    vector<Mat> calibrationImages_;
+    vector<bool> gridCaptured_;             // Track which grid positions are captured (6x6 = 36 positions)
+    Mat lastStableFrame_;                    // Last frame with stable checkerboard detection
+    int stableFrameCount_ = 0;               // Count of consecutive stable detections
+    static const int STABLE_THRESHOLD = 10;  // Frames needed for stable detection
+    
+    // Camera settings
+    QSlider *exposureSlider_;
+    QSlider *gainSlider_;
+    QSlider *brightnessSlider_;
+    QSlider *contrastSlider_;
+    QSlider *saturationSlider_;
+    QSlider *sharpnessSlider_;
+    QSpinBox *exposureSpin_;
+    QSpinBox *gainSpin_;
+    QSpinBox *brightnessSpin_;
+    QSpinBox *contrastSpin_;
+    QSpinBox *saturationSpin_;
+    QSpinBox *sharpnessSpin_;
+    
+    // Images
+    Mat image1_, image2_;
+    string image1_path_, image2_path_;
+    
+    // Camera
+    VideoCapture cameraCap_;
+#ifdef HAVE_MINDVISION_SDK
+    CameraHandle mvHandle_;
+#else
+    void* mvHandle_;  // Dummy type if SDK not available
+#endif
+    bool useMindVision_;
+    bool cameraOpen_;
+    int selectedCameraIndex_;
+    vector<string> cameraList_;  // List of camera names
+    vector<bool> isMindVision_;  // Whether each camera is MindVision
+    vector<Mode> v4l2_modes_;    // V4L2 camera modes
+    vector<MVMode> mv_modes_;    // MindVision camera modes
+    Mat currentFrame_;
+    mutex frameMutex_;
+    string suggestedCaptureFilename_;  // Generated filename for capture
+    
+    // Fisheye undistortion
+    Mat fisheye_map1_, fisheye_map2_;
+    Mat fisheye_K_, fisheye_D_;
+    bool fisheye_undistort_enabled_;
+    bool fisheye_calibration_loaded_ = false;
+    Size fisheye_image_size_;
+    
+    // AprilTag detector
+    apriltag_family_t* tf_;
+    apriltag_detector_t* td_;
+    
+    // Helper function to generate capture filename
+    QString generateCaptureFilename() {
+        // Create input directory if it doesn't exist
+        QDir inputDir("input");
+        if (!inputDir.exists()) {
+            inputDir.mkpath(".");
+        }
+        
+        // Get camera name
+        QString cameraName = "UnknownCamera";
+        if (selectedCameraIndex_ >= 0 && selectedCameraIndex_ < static_cast<int>(cameraList_.size())) {
+            QString fullName = QString::fromStdString(cameraList_[selectedCameraIndex_]);
+            // Clean up camera name (remove special characters, spaces)
+            // Replace non-alphanumeric characters with underscore
+            QString cleanName;
+            for (int i = 0; i < fullName.length() && cleanName.length() < 30; i++) {
+                QChar c = fullName[i];
+                if (c.isLetterOrNumber() || c == '_') {
+                    cleanName.append(c);
+                } else {
+                    cleanName.append('_');
+                }
+            }
+            cameraName = cleanName.isEmpty() ? "Camera" : cleanName;
+        }
+        
+        // Generate timestamp: YYYYMMDD_HHMMSS
+        QDateTime now = QDateTime::currentDateTime();
+        QString timestamp = now.toString("yyyyMMdd_HHmmss");
+        
+        // Generate filename: input/CameraName_YYYYMMDD_HHMMSS.png
+        QString filename = QString("input/%1_%2.png").arg(cameraName).arg(timestamp);
+        
+        return filename;
+    }
+};
+
+#include "apriltag_debug_gui.moc"
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    
+    AprilTagDebugGUI window;
+    window.show();
+    
+    return app.exec();
+}
+
