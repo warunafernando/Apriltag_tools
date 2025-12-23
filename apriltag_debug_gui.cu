@@ -9,6 +9,7 @@
 #include "apriltag_algorithm_factory.h"
 #ifdef HAVE_CUDA_APRILTAG
 #include "fast_apriltag_algorithm.h"
+#include "cpu_apriltag_algorithm.h"
 #endif
 
 // CUDA GPU detector - include directly (file will be compiled as CUDA)
@@ -566,6 +567,14 @@ private slots:
         }
     }
     
+    void onAlgorithmCameraChanged(int index) {
+        // Set mirror checkbox to checked by default for MindVision cameras
+        if (algorithmMirrorCheckbox_ && index >= 0 && index < (int)isMindVision_.size()) {
+            bool isMindVision = isMindVision_[index];
+            algorithmMirrorCheckbox_->setChecked(isMindVision);
+        }
+    }
+    
     void startAlgorithm() {
         cerr << "\n\n=== startAlgorithm() CALLED ===" << endl;
         cerr.flush();
@@ -594,12 +603,16 @@ private slots:
         // Open camera
         algorithmUseMindVision_ = isMindVision_[cameraIndex];
         
-        // Set default settings for MindVision camera: fisheye correction enabled
+        // Set default settings for MindVision camera: fisheye correction enabled and mirror enabled
         if (algorithmUseMindVision_ && cameraIndex >= 0) {
             if (fisheye_calibration_loaded_ && fisheyeStatusIndicator_) {
                 fisheye_undistort_enabled_ = true;
                 fisheyeStatusIndicator_->setText("Fisheye Correction: APPLIED");
                 fisheyeStatusIndicator_->setStyleSheet("background-color: #90EE90; padding: 5px; border: 1px solid #006400;");
+            }
+            // Ensure mirror checkbox is checked for MindVision cameras
+            if (algorithmMirrorCheckbox_) {
+                algorithmMirrorCheckbox_->setChecked(true);
             }
         }
         
@@ -732,8 +745,39 @@ private slots:
         // Check which algorithm is selected
         int algorithmIndex = algorithmCombo_->currentIndex();
         
-        // Initialize algorithm class for Fast AprilTag (index 2)
-        if (algorithmIndex == 2) {
+        // Initialize algorithm class for CPU (index 0) or Fast AprilTag (index 2)
+        if (algorithmIndex == 0) {
+            // CPU algorithm
+            AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::CPU;
+            currentAlgorithm_ = AprilTagAlgorithmFactory::create(algoType);
+            if (!currentAlgorithm_) {
+                QMessageBox::warning(this, "Error", "Failed to create CPU algorithm.");
+                algorithmRunning_ = false;
+                return;
+            }
+            
+            // Get frame dimensions from camera
+            int width = 1280, height = 1024;
+            if (algorithmUseMindVision_) {
+#ifdef HAVE_MINDVISION_SDK
+                width = 1280;
+                height = 1024;
+#endif
+            } else if (algorithmCamera_.isOpened()) {
+                width = static_cast<int>(algorithmCamera_.get(CAP_PROP_FRAME_WIDTH));
+                height = static_cast<int>(algorithmCamera_.get(CAP_PROP_FRAME_HEIGHT));
+            }
+            
+            // Initialize immediately (CPU doesn't need delay)
+            if (!currentAlgorithm_->initialize(width, height)) {
+                QMessageBox::warning(this, "Error", QString("Failed to initialize CPU algorithm with dimensions %1x%2").arg(width).arg(height));
+                currentAlgorithm_.reset();
+                algorithmRunning_ = false;
+                return;
+            }
+            qDebug() << "CPU algorithm initialized successfully with dimensions:" << width << "x" << height;
+            useCudaAlgorithm_ = false;  // Don't use old CUDA code
+        } else if (algorithmIndex == 2) {
 #ifdef HAVE_CUDA_APRILTAG
             AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::FAST_APRILTAG;
             currentAlgorithm_ = AprilTagAlgorithmFactory::create(algoType);
@@ -847,18 +891,12 @@ private slots:
         
         algorithmRunning_ = false;
         
-        // Cleanup algorithm class if used
-        if (currentAlgorithm_) {
-            currentAlgorithm_->cleanup();
-            currentAlgorithm_.reset();
-        }
-        
-        // Wake up all threads
+        // Wake up all threads first (don't cleanup algorithm yet - threads might still use it)
         capturedFrameReady_.notify_all();
         processedFrameReady_.notify_all();
         detectedFrameReady_.notify_all();
         
-        // Wait for threads to finish
+        // Wait for threads to finish (they will destroy any pending detections first)
         if (captureThread_ && captureThread_->joinable()) {
             captureThread_->join();
             delete captureThread_;
@@ -878,6 +916,12 @@ private slots:
             displayThread_->join();
             delete displayThread_;
             displayThread_ = nullptr;
+        }
+        
+        // NOW cleanup algorithm class (after all threads have finished and destroyed their detections)
+        if (currentAlgorithm_) {
+            currentAlgorithm_->cleanup();
+            currentAlgorithm_.reset();
         }
         
         // Close camera
@@ -1080,14 +1124,33 @@ private:
                 static int timing_update_counter = 0;
                 if (++timing_update_counter >= 10) {
                     timing_update_counter = 0;
-                    // Try to cast to FastAprilTagAlgorithm to get timing info
-#ifdef HAVE_CUDA_APRILTAG
-                    FastAprilTagAlgorithm* fast_algo = dynamic_cast<FastAprilTagAlgorithm*>(currentAlgorithm_.get());
-                    if (fast_algo) {
-                        std::string timing_report = fast_algo->getTimingReport();
-                        // Add detailed detection thread overhead info
-                        std::ostringstream oss;
+                    std::ostringstream oss;
+                    bool algo_found = false;
+                    double algo_total_ms = 0.0;
+                    
+                    // Try to cast to CpuAprilTagAlgorithm first
+                    CpuAprilTagAlgorithm* cpu_algo = dynamic_cast<CpuAprilTagAlgorithm*>(currentAlgorithm_.get());
+                    if (cpu_algo) {
+                        algo_found = true;
+                        std::string timing_report = cpu_algo->getTimingReport();
                         oss << timing_report;
+                        algo_total_ms = cpu_algo->getLastFrameTiming().total_ms;
+                    }
+#ifdef HAVE_CUDA_APRILTAG
+                    // Try to cast to FastAprilTagAlgorithm
+                    else {
+                        FastAprilTagAlgorithm* fast_algo = dynamic_cast<FastAprilTagAlgorithm*>(currentAlgorithm_.get());
+                        if (fast_algo) {
+                            algo_found = true;
+                            std::string timing_report = fast_algo->getTimingReport();
+                            oss << timing_report;
+                            algo_total_ms = fast_algo->getLastFrameTiming().total_ms;
+                        }
+                    }
+#endif
+                    
+                    if (algo_found) {
+                        // Add detailed detection thread overhead info
                         oss << "\n--- Detection Thread Overhead (Detailed) ---\n";
                         oss << std::fixed << std::setprecision(3);
                         if (overhead_frame_count > 0) {
@@ -1105,11 +1168,14 @@ private:
                             oss << "  Frame Copy (output):   " << std::setw(8) << avg_copy << " ms\n";
                             oss << "  ---------------------------------\n";
                             oss << "  Total Overhead:        " << std::setw(8) << total_overhead << " ms\n";
-                            oss << "  Algorithm Time:        " << std::setw(8) 
-                                << fast_algo->getLastFrameTiming().total_ms << " ms\n";
+                            oss << "  Algorithm Time:        " << std::setw(8) << algo_total_ms << " ms\n";
                             oss << "  Detection Thread Time: " << std::setw(8) << detectionTime_ << " ms\n";
-                            oss << "  Overhead %:            " << std::setw(8) 
-                                << (detectionTime_ > 0 ? (total_overhead / detectionTime_ * 100) : 0) << "%\n";
+                            
+                            double detection_time_ms = detectionTime_;
+                            if (detection_time_ms > 0.0) {
+                                double overhead_percent = 100.0 * total_overhead / detection_time_ms;
+                                oss << "  Overhead %:            " << std::setw(8) << overhead_percent << "%\n";
+                            }
                         }
                         
                         // Update GUI in main thread (thread-safe)
@@ -1124,7 +1190,6 @@ private:
                         overhead_frame_copy_ms = 0.0;
                         overhead_frame_count = 0;
                     }
-#endif
                 }
             }
 #ifdef HAVE_CUDA_APRILTAG
@@ -3443,8 +3508,8 @@ private:
         
         QLabel *cameraLabel = new QLabel("Camera:", this);
         algorithmCameraCombo_ = new QComboBox(this);
-        // Populate from available cameras (same as Capture tab)
-        enumerateCameras();
+        // Populate from already-enumerated cameras (Capture tab enumerates them first)
+        // Use the same cameraList_ that was populated in setupCaptureTab()
         for (size_t i = 0; i < cameraList_.size(); i++) {
             algorithmCameraCombo_->addItem(QString::fromStdString(cameraList_[i]));
         }
@@ -3465,14 +3530,24 @@ private:
         buttonLayout->addWidget(algorithmStartBtn_);
         buttonLayout->addWidget(algorithmStopBtn_);
         
-        // Mirror checkbox
+        // Mirror checkbox (must be created before connecting signals)
         algorithmMirrorCheckbox_ = new QCheckBox("Mirror (Horizontal Flip)", this);
         buttonLayout->addWidget(algorithmMirrorCheckbox_);
+        
+        // Connect camera selection change to set mirror checkbox for MindVision cameras
+        // (after checkbox is created)
+        connect(algorithmCameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, &AprilTagDebugGUI::onAlgorithmCameraChanged);
+        
+        // Set initial mirror checkbox state if a MindVision camera is selected
+        if (algorithmCameraCombo_->count() > 0) {
+            onAlgorithmCameraChanged(algorithmCameraCombo_->currentIndex());
+        }
         
         buttonLayout->addStretch();
         layout->addLayout(buttonLayout);
         
-        // Top row: Video preview (left) + Fast AprilTag Timing Analysis (right, full height)
+        // Top row: Video preview (left) + Algorithm Timing Analysis (right, full height)
         QHBoxLayout *previewAndTimingLayout = new QHBoxLayout();
         
         // Left side: Video preview with Quality Metrics and Pose Estimation below
@@ -3489,7 +3564,7 @@ private:
         displayGroup->setLayout(displayLayout);
         leftSideLayout->addWidget(displayGroup);
         
-        // Quality Metrics and Pose Estimation boxes below video
+        // Quality Metrics and Pose Estimation boxes below video (same style as Algorithm Timing Analysis)
         QHBoxLayout *metricsLayout = new QHBoxLayout();
         
         // Quality Metrics box
@@ -3497,9 +3572,9 @@ private:
         QVBoxLayout *qualityLayout = new QVBoxLayout();
         algorithmQualityText_ = new QTextEdit(this);
         algorithmQualityText_->setReadOnly(true);
-        algorithmQualityText_->setMaximumHeight(200);
+        algorithmQualityText_->setFont(QFont("Courier", 9));  // Monospace font for alignment (same as timing analysis)
         algorithmQualityText_->setPlainText("No detections");
-        qualityLayout->addWidget(algorithmQualityText_);
+        qualityLayout->addWidget(algorithmQualityText_, 1);  // Expand to fill space (same as timing analysis)
         qualityGroup->setLayout(qualityLayout);
         metricsLayout->addWidget(qualityGroup);
         
@@ -3508,17 +3583,17 @@ private:
         QVBoxLayout *poseLayout = new QVBoxLayout();
         algorithmPoseText_ = new QTextEdit(this);
         algorithmPoseText_->setReadOnly(true);
-        algorithmPoseText_->setMaximumHeight(200);
+        algorithmPoseText_->setFont(QFont("Courier", 9));  // Monospace font for alignment (same as timing analysis)
         algorithmPoseText_->setPlainText("No pose data");
-        poseLayout->addWidget(algorithmPoseText_);
+        poseLayout->addWidget(algorithmPoseText_, 1);  // Expand to fill space (same as timing analysis)
         poseGroup->setLayout(poseLayout);
         metricsLayout->addWidget(poseGroup);
         
         leftSideLayout->addLayout(metricsLayout);
         previewAndTimingLayout->addLayout(leftSideLayout, 2);  // Takes 2 parts of space
         
-        // Right side: Fast AprilTag Timing Analysis (full height, goes all the way down)
-        QGroupBox *detailedTimingGroup = new QGroupBox("Fast AprilTag Timing Analysis", this);
+        // Right side: Algorithm Timing Analysis (full height, goes all the way down)
+        QGroupBox *detailedTimingGroup = new QGroupBox("Algorithm Timing Analysis", this);
         QVBoxLayout *detailedTimingLayout = new QVBoxLayout();
         
         // FPS counters at the top
@@ -3531,15 +3606,17 @@ private:
         algorithmDetailedTimingText_->setReadOnly(true);
         algorithmDetailedTimingText_->setFont(QFont("Courier", 9));  // Monospace font for alignment
         algorithmDetailedTimingText_->setPlainText(
-            "Timing analysis will appear here when Fast AprilTag algorithm is running.\n\n"
-            "This shows detailed breakdown of each detection stage:\n"
-            "- DetectGpuOnly\n"
-            "- FitQuads\n"
-            "- Mirror operations\n"
-            "- CopyGrayHostTo\n"
-            "- DecodeTags\n"
-            "- ScaleCoords\n"
-            "- FilterDuplicates\n\n"
+            "Timing analysis will appear here when an algorithm is running.\n\n"
+            "Supported algorithms:\n"
+            "- CPU AprilTag: Shows grayscale conversion, mirror, and detection timing\n"
+            "- Fast AprilTag: Shows detailed GPU/CPU breakdown including:\n"
+            "  - DetectGpuOnly\n"
+            "  - FitQuads\n"
+            "  - Mirror operations\n"
+            "  - CopyGrayHostTo\n"
+            "  - DecodeTags\n"
+            "  - ScaleCoords\n"
+            "  - FilterDuplicates\n\n"
             "Updated every 10 frames."
         );
         detailedTimingLayout->addWidget(algorithmDetailedTimingText_, 1);  // Expand to fill space

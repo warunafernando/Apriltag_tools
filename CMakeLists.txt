@@ -96,6 +96,7 @@ if(APRILTAG_CUDA_LIBRARY AND CUDA_FOUND)
     add_executable(apriltag_debug_gui 
         apriltag_debug_gui.cu
         apriltag_algorithm_factory.cu
+        cpu_apriltag_algorithm.cpp
         fast_apriltag_algorithm.cu
     )
     set_source_files_properties(apriltag_algorithm_factory.cu PROPERTIES
@@ -108,6 +109,7 @@ else()
     add_executable(apriltag_debug_gui 
         apriltag_debug_gui.cu
         apriltag_algorithm_factory.cu
+        cpu_apriltag_algorithm.cpp
     )
 endif()
 
