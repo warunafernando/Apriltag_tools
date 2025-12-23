@@ -5,15 +5,33 @@
 #include <opencv2/opencv.hpp>
 #include <apriltag/apriltag.h>
 #include <apriltag/tag36h11.h>
+#include "apriltag_algorithm.h"
+#include "apriltag_algorithm_factory.h"
+#ifdef HAVE_CUDA_APRILTAG
+#include "fast_apriltag_algorithm.h"
+#endif
 
 // CUDA GPU detector - include directly (file will be compiled as CUDA)
 #ifdef HAVE_CUDA_APRILTAG
 #include "../src/apriltags_cuda/src/apriltag_gpu.h"
+// Forward declare DecodeTagsFromQuads (defined in apriltag_detect.cu)
+namespace frc971::apriltag {
+void DecodeTagsFromQuads(const std::vector<QuadCorners> &quad_corners,
+                         const uint8_t *gray_buf, int width, int height,
+                         apriltag_detector_t *td,
+                         const CameraMatrix &camera_matrix,
+                         const DistCoeffs &distortion_coefficients,
+                         zarray_t *detections,
+                         zarray_t *poly0,
+                         zarray_t *poly1);
+}
 namespace apriltag_gpu = frc971::apriltag;
+#include "g2d.h"  // For g2d_polygon_create_zeros and g2d_polygon_destroy
 #endif
 #include <apriltag/common/image_u8.h>
 #include <apriltag/common/zarray.h>
 #include <apriltag/common/workerpool.h>
+#include <apriltag/common/g2d.h>
 
 #include <QApplication>
 #include <QWidget>
@@ -32,6 +50,18 @@ namespace apriltag_gpu = frc971::apriltag;
 #include <QGraphicsScene>
 #include <QGraphicsPixmapItem>
 #include <QDebug>
+#include <iostream>
+#include <cerrno>
+#include <cstring>
+#include <cstdio>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cstdio>
+#include <unistd.h>
+#include <fcntl.h>
+
+using std::cerr;
+using std::endl;
 #include <QSlider>
 #include <QSpinBox>
 #include <QCheckBox>
@@ -98,18 +128,145 @@ static const int TAG36H11_BIT_Y[36] = {
 class AprilTagDebugGUI : public QWidget {
     Q_OBJECT
 
+private:
+    // All member variables declared early (nvcc requirement)
+    // AprilTag detectors
+    apriltag_family_t* tf_;
+    apriltag_detector_t* td_;
+#ifdef HAVE_CUDA_APRILTAG
+    apriltag_gpu::GpuDetector* gpuDetector_;
+    apriltag_detector_t* td_gpu_;
+    apriltag_detector_t* td_for_gpu_;
+    apriltag_family_t* tf_gpu_;
+    bool useCudaAlgorithm_;
+    bool useFastVideoAlgorithm_;
+    apriltag_gpu::CameraMatrix gpu_cam_;
+    apriltag_gpu::DistCoeffs gpu_dist_;
+#endif
+    
+    // Images
+    Mat image1_, image2_;
+    string image1_path_, image2_path_;
+    
+    // Camera
+    VideoCapture cameraCap_;
+#ifdef HAVE_MINDVISION_SDK
+    CameraHandle mvHandle_;
+#else
+    void* mvHandle_;
+#endif
+    bool useMindVision_;
+    bool cameraOpen_;
+    int selectedCameraIndex_;
+    vector<string> cameraList_;
+    vector<bool> isMindVision_;
+    vector<Mode> v4l2_modes_;
+    vector<MVMode> mv_modes_;
+    Mat currentFrame_;
+    mutex frameMutex_;
+    string suggestedCaptureFilename_;
+    QTimer *previewTimer_;
+    QTimer *calibrationPreviewTimer_;
+    
+    // Algorithm processing
+    bool algorithmRunning_;
+    VideoCapture algorithmCamera_;
+    bool algorithmUseMindVision_;
+    std::unique_ptr<AprilTagAlgorithm> currentAlgorithm_;  // For Fast AprilTag and future algorithms
+#ifdef HAVE_MINDVISION_SDK
+    CameraHandle algorithmMvHandle_;
+#else
+    void* algorithmMvHandle_;
+#endif
+    std::thread *captureThread_;
+    std::thread *processThread_;
+    std::thread *detectionThread_;
+    std::thread *displayThread_;
+    Mat capturedFrame_;
+    Mat processedFrame_;
+    Mat detectedFrame_;
+    std::mutex capturedFrameMutex_;
+    std::mutex processedFrameMutex_;
+    std::mutex detectedFrameMutex_;
+    std::condition_variable capturedFrameReady_;
+    std::condition_variable processedFrameReady_;
+    std::condition_variable detectedFrameReady_;
+    
+    // Timing statistics
+    double captureTime_;
+    double processTime_;
+    double detectionTime_;
+    double displayTime_;
+    double totalTime_;
+    int frameCount_;
+    double captureFPS_;
+    double detectionFPS_;
+    double displayFPS_;
+    int captureFrameCount_;
+    int detectionFrameCount_;
+    int displayFrameCount_;
+    chrono::high_resolution_clock::time_point captureFPSStart_;
+    chrono::high_resolution_clock::time_point detectionFPSStart_;
+    chrono::high_resolution_clock::time_point displayFPSStart_;
+    
+    // Latest detection data
+    struct DetectionData {
+        int id;
+        double decision_margin;
+        int hamming;
+        Point2f corners[4];
+        Point2f center;
+    };
+    vector<DetectionData> latestDetections_;
+    Mat latestDetectedFrame_;
+    mutex latestDetectionsMutex_;
+    
+    // CUDA debug info
+    struct CudaDebugInfo {
+        int num_quads = 0;
+        int num_detections_before_scale = 0;
+        int num_detections_after_scale = 0;
+        bool detector_initialized = false;
+    };
+    CudaDebugInfo cudaDebugInfo_;
+    mutex cudaDebugInfoMutex_;
+    
+    // Fisheye undistortion
+    Mat fisheye_map1_, fisheye_map2_;
+    Mat fisheye_K_, fisheye_D_;
+    bool fisheye_undistort_enabled_;
+    bool fisheye_calibration_loaded_;
+    Size fisheye_image_size_;
+    QLabel *fisheyeStatusIndicator_;
+    
+    // UI elements
+    QComboBox *algorithmCombo_;
+    QComboBox *algorithmCameraCombo_;
+    QPushButton *algorithmStartBtn_;
+    QPushButton *algorithmStopBtn_;
+    QCheckBox *algorithmMirrorCheckbox_;
+    QLabel *algorithmDisplayLabel_;
+    QTextEdit *algorithmTimingText_;
+    QLabel *algorithmFPSLabel_;
+    QTextEdit *algorithmQualityText_;
+    QTextEdit *algorithmPoseText_;
+    QTextEdit *algorithmDetailedTimingText_;  // For Fast AprilTag detailed timing analysis
+
 public:
     AprilTagDebugGUI(QWidget *parent = nullptr) : QWidget(parent),
-        useMindVision_(false),
-        cameraOpen_(false),
-        selectedCameraIndex_(-1),
+        tf_(nullptr),
+        td_(nullptr),
         previewTimer_(nullptr),
-        fisheye_undistort_enabled_(false) {
-#ifdef HAVE_MINDVISION_SDK
-        mvHandle_ = 0;
-#else
-        mvHandle_ = nullptr;
+        calibrationPreviewTimer_(nullptr)
+#ifdef HAVE_CUDA_APRILTAG
+        , gpuDetector_(nullptr)
+        , td_gpu_(nullptr)
+        , td_for_gpu_(nullptr)
+        , tf_gpu_(nullptr)
+        , useCudaAlgorithm_(false)
+        , useFastVideoAlgorithm_(false)
 #endif
+    {
         setupUI();
         
         // Load fisheye calibration on startup
@@ -126,13 +283,6 @@ public:
         td_->decode_sharpening = 0.25;
         td_->nthreads = 4;
         td_->wp = workerpool_create(4);
-        
-#ifdef HAVE_CUDA_APRILTAG
-        gpuDetector_ = nullptr;
-        td_gpu_ = nullptr;
-        tf_gpu_ = nullptr;
-        useCudaAlgorithm_ = false;
-#endif
     }
 
     ~AprilTagDebugGUI() {
@@ -141,15 +291,19 @@ public:
         tag36h11_destroy(tf_);
         
 #ifdef HAVE_CUDA_APRILTAG
-        if (gpuDetector_) {
+        if (gpuDetector_ != nullptr) {
             delete gpuDetector_;
             gpuDetector_ = nullptr;
         }
-        if (td_gpu_) {
+        if (td_for_gpu_ != nullptr) {
+            apriltag_detector_destroy(td_for_gpu_);
+            td_for_gpu_ = nullptr;
+        }
+        if (td_gpu_ != nullptr) {
             apriltag_detector_destroy(td_gpu_);
             td_gpu_ = nullptr;
         }
-        if (tf_gpu_) {
+        if (tf_gpu_ != nullptr) {
             tag36h11_destroy(tf_gpu_);
             tf_gpu_ = nullptr;
         }
@@ -157,6 +311,210 @@ public:
     }
 
 private slots:
+    // Initialize Fast AprilTag algorithm after camera stabilizes (called after 2 second delay)
+    void initializeFastAprilTagDetector() {
+#ifdef HAVE_CUDA_APRILTAG
+        if (!currentAlgorithm_ || !algorithmRunning_) {
+            return;  // Algorithm not created or algorithm stopped
+        }
+        
+        // Check if already initialized (processFrame will check this)
+        // We'll initialize here with actual frame dimensions
+        
+        qDebug() << "Starting delayed Fast AprilTag algorithm initialization (2 seconds after camera start)...";
+        
+        // Get frame dimensions from camera (now it should be stable)
+        int width = 1280, height = 1024;
+        Mat testFrame;
+        bool dimensionsFound = false;
+        
+        if (algorithmUseMindVision_) {
+#ifdef HAVE_MINDVISION_SDK
+            tSdkFrameHead frameHead;
+            BYTE *pbyBuffer;
+            if (CameraGetImageBuffer(algorithmMvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
+                width = frameHead.iWidth;
+                height = frameHead.iHeight;
+                dimensionsFound = true;
+                CameraReleaseImageBuffer(algorithmMvHandle_, pbyBuffer);
+                qDebug() << "MindVision camera dimensions:" << width << "x" << height;
+            }
+#endif
+        } else if (algorithmCamera_.isOpened()) {
+            algorithmCamera_ >> testFrame;
+            if (!testFrame.empty()) {
+                width = testFrame.cols;
+                height = testFrame.rows;
+                dimensionsFound = true;
+                qDebug() << "V4L2 camera dimensions:" << width << "x" << height;
+            }
+        }
+        
+        // Validate dimensions
+        if (width <= 0 || height <= 0 || width > 10000 || height > 10000) {
+            qDebug() << "Error: Invalid frame dimensions:" << width << "x" << height;
+            return;
+        }
+        
+        // Ensure dimensions are even (required for quad_decimate = 2.0)
+        if (width % 2 != 0) width = (width / 2) * 2;
+        if (height % 2 != 0) height = (height / 2) * 2;
+        
+        if (!currentAlgorithm_->initialize(width, height)) {
+            qDebug() << "Error: Failed to initialize Fast AprilTag algorithm with dimensions:" << width << "x" << height;
+            currentAlgorithm_.reset();
+        } else {
+            qDebug() << "Fast AprilTag algorithm initialized successfully with dimensions:" << width << "x" << height;
+        }
+#endif
+    }
+    
+    // Initialize CUDA detector after camera stabilizes (called after 2 second delay)
+    void initializeCudaDetector() {
+#ifdef HAVE_CUDA_APRILTAG
+        if (!useCudaAlgorithm_ || gpuDetector_ != nullptr || !algorithmRunning_) {
+            return;  // Already initialized, not using CUDA, or algorithm stopped
+        }
+        
+        qDebug() << "Starting delayed CUDA detector initialization (2 seconds after camera start)...";
+        
+        // Get frame dimensions from video or camera (now it should be stable)
+        int width = 1280, height = 1024;
+        Mat testFrame;
+        bool dimensionsFound = false;
+        
+        if (algorithmUseMindVision_) {
+#ifdef HAVE_MINDVISION_SDK
+            tSdkFrameHead frameHead;
+            BYTE *pbyBuffer;
+            if (CameraGetImageBuffer(algorithmMvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
+                width = frameHead.iWidth;
+                height = frameHead.iHeight;
+                dimensionsFound = true;
+                CameraReleaseImageBuffer(algorithmMvHandle_, pbyBuffer);
+                qDebug() << "MindVision camera dimensions:" << width << "x" << height;
+            }
+#endif
+        } else if (algorithmCamera_.isOpened()) {
+            algorithmCamera_ >> testFrame;
+            if (!testFrame.empty()) {
+                width = testFrame.cols;
+                height = testFrame.rows;
+                dimensionsFound = true;
+                qDebug() << "V4L2 camera dimensions:" << width << "x" << height;
+            }
+        }
+        
+        // Get camera parameters from fisheye calibration
+        double fx = 905.495617, fy = 609.916016, cx = 907.909470, cy = 352.682645;
+        double k1 = 0.0, k2 = 0.0, p1 = 0.0, p2 = 0.0, k3 = 0.0;
+        
+        if (fisheye_calibration_loaded_ && !fisheye_K_.empty() && !fisheye_D_.empty()) {
+            fx = fisheye_K_.at<double>(0, 0);
+            fy = fisheye_K_.at<double>(1, 1);
+            cx = fisheye_K_.at<double>(0, 2);
+            cy = fisheye_K_.at<double>(1, 2);
+            
+            if (fisheye_D_.rows >= 4) {
+                k1 = fisheye_D_.at<double>(0);
+                k2 = fisheye_D_.at<double>(1);
+                p1 = fisheye_D_.at<double>(2);
+                p2 = fisheye_D_.at<double>(3);
+            }
+            if (fisheye_D_.rows >= 5) {
+                k3 = fisheye_D_.at<double>(4);
+            }
+        }
+        
+        // Validate dimensions - must be even numbers for CUDA decimation
+        if (width <= 0 || height <= 0 || width > 10000 || height > 10000) {
+            qDebug() << "Error: Invalid frame dimensions:" << width << "x" << height;
+            return;
+        }
+        
+        // Ensure dimensions are even (required for quad_decimate = 2.0)
+        if (width % 2 != 0) width = (width / 2) * 2;
+        if (height % 2 != 0) height = (height / 2) * 2;
+        
+        qDebug() << "Initializing CUDA detector with dimensions:" << width << "x" << height;
+        
+        // Initialize GPU detector (same pattern as video_visualize_fixed)
+        tf_gpu_ = tag36h11_create();
+        if (!tf_gpu_) {
+            qDebug() << "Error: Failed to create tag family";
+            return;
+        }
+        
+        // Create detector for GpuDetector (same as 'td' in video_visualize_fixed)
+        apriltag_detector_t *td_for_gpu = apriltag_detector_create();
+        if (!td_for_gpu) {
+            tag36h11_destroy(tf_gpu_);
+            tf_gpu_ = nullptr;
+            qDebug() << "Error: Failed to create tag detector";
+            return;
+        }
+        
+        apriltag_detector_add_family(td_for_gpu, tf_gpu_);
+        td_for_gpu->quad_decimate = 2.0;  // CUDA requires 2.0
+        td_for_gpu->quad_sigma = 0.0;  // Match video_visualize_fixed
+        td_for_gpu->refine_edges = 1;  // Match video_visualize_fixed (true)
+        td_for_gpu->debug = false;  // Match video_visualize_fixed
+        td_for_gpu->nthreads = std::max(1, 1);  // Match video_visualize_fixed default (1)
+        td_for_gpu->wp = workerpool_create(td_for_gpu->nthreads);
+        
+        // Create SEPARATE detector for CPU decode (exactly like td_cpu in video_visualize_fixed)
+        td_gpu_ = apriltag_detector_create();
+        if (!td_gpu_) {
+            apriltag_detector_destroy(td_for_gpu);
+            tag36h11_destroy(tf_gpu_);
+            tf_gpu_ = nullptr;
+            qDebug() << "Error: Failed to create CPU decode detector";
+            return;
+        }
+        apriltag_detector_add_family(td_gpu_, tf_gpu_);
+        // Copy settings from GPU detector (same as video_visualize_fixed does)
+        td_gpu_->quad_decimate = td_for_gpu->quad_decimate;
+        td_gpu_->quad_sigma = td_for_gpu->quad_sigma;
+        td_gpu_->refine_edges = td_for_gpu->refine_edges;
+        td_gpu_->debug = td_for_gpu->debug;
+        td_gpu_->nthreads = td_for_gpu->nthreads;
+        td_gpu_->wp = workerpool_create(td_gpu_->nthreads);
+        
+        gpu_cam_ = apriltag_gpu::CameraMatrix{fx, fy, cx, cy};
+        gpu_dist_ = apriltag_gpu::DistCoeffs{k1, k2, p1, p2, k3};
+        
+        try {
+            // Pass td_for_gpu to GpuDetector, use td_gpu_ for decode (same pattern as video_visualize_fixed)
+            gpuDetector_ = new apriltag_gpu::GpuDetector(width, height, td_for_gpu, gpu_cam_, gpu_dist_);
+            // Store td_for_gpu so we can clean it up later (GpuDetector doesn't take ownership)
+            td_for_gpu_ = td_for_gpu;
+            qDebug() << "✓ CUDA detector initialized successfully!";
+        } catch (const std::exception& e) {
+            qDebug() << "Exception creating GpuDetector:" << e.what();
+            apriltag_detector_destroy(td_for_gpu);
+            if (td_gpu_) {
+                apriltag_detector_destroy(td_gpu_);
+                td_gpu_ = nullptr;
+            }
+            if (tf_gpu_) {
+                tag36h11_destroy(tf_gpu_);
+                tf_gpu_ = nullptr;
+            }
+        } catch (...) {
+            qDebug() << "Unknown exception creating GpuDetector";
+            apriltag_detector_destroy(td_for_gpu);
+            if (td_gpu_) {
+                apriltag_detector_destroy(td_gpu_);
+                td_gpu_ = nullptr;
+            }
+            if (tf_gpu_) {
+                tag36h11_destroy(tf_gpu_);
+                tf_gpu_ = nullptr;
+            }
+        }
+#endif
+    }
+    
     void loadImage1() {
         QString filename = QFileDialog::getOpenFileName(this, "Load Image 1", "", "Images (*.png *.jpg *.jpeg *.bmp)");
         if (!filename.isEmpty()) {
@@ -188,10 +546,9 @@ private slots:
     }
 
 private slots:
-    void setPixmapFromThread(QPixmap *pixmap) {
-        if (pixmap && algorithmDisplayLabel_) {
-            algorithmDisplayLabel_->setPixmap(*pixmap);
-            delete pixmap;
+    void setPixmapFromThread(const QPixmap &pixmap) {
+        if (!pixmap.isNull() && algorithmDisplayLabel_) {
+            algorithmDisplayLabel_->setPixmap(pixmap);
         }
     }
     
@@ -203,9 +560,25 @@ private slots:
         updateAlgorithmQualityAndPose();
     }
     
+    void updateDetailedTimingSlot(const QString &timingText) {
+        if (algorithmDetailedTimingText_) {
+            algorithmDetailedTimingText_->setPlainText(timingText);
+        }
+    }
+    
     void startAlgorithm() {
-        if (algorithmRunning_) return;
+        cerr << "\n\n=== startAlgorithm() CALLED ===" << endl;
+        cerr.flush();
         
+        // If already running, stop first (clean restart)
+        if (algorithmRunning_) {
+            cerr << "Algorithm already running, stopping first..." << endl;
+            stopAlgorithm();
+            // Give threads a moment to clean up
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        // Require camera selection
         int cameraIndex = algorithmCameraCombo_->currentIndex();
         if (cameraIndex < 0 || cameraIndex >= (int)cameraList_.size()) {
             QMessageBox::warning(this, "Error", "Please select a camera");
@@ -221,15 +594,12 @@ private slots:
         // Open camera
         algorithmUseMindVision_ = isMindVision_[cameraIndex];
         
-        // Set default settings for MindVision camera: fisheye correction and mirror enabled
-        if (algorithmUseMindVision_) {
+        // Set default settings for MindVision camera: fisheye correction enabled
+        if (algorithmUseMindVision_ && cameraIndex >= 0) {
             if (fisheye_calibration_loaded_ && fisheyeStatusIndicator_) {
                 fisheye_undistort_enabled_ = true;
                 fisheyeStatusIndicator_->setText("Fisheye Correction: APPLIED");
                 fisheyeStatusIndicator_->setStyleSheet("background-color: #90EE90; padding: 5px; border: 1px solid #006400;");
-            }
-            if (algorithmMirrorCheckbox_) {
-                algorithmMirrorCheckbox_->setChecked(true);
             }
         }
         
@@ -238,7 +608,8 @@ private slots:
         if (algorithmUseMindVision_) {
 #ifdef HAVE_MINDVISION_SDK
             // Check if camera is already open in Capture tab - if so, close it first
-            if (cameraOpen_ && useMindVision_ && mvHandle_ != 0) {
+            // Only close if previewTimer_ exists (it might not exist during GUI initialization)
+            if (cameraOpen_ && useMindVision_ && mvHandle_ != 0 && previewTimer_) {
                 QMessageBox::information(this, "Info", "Closing camera in Capture tab to use in Algorithms tab");
                 closeCamera();
             }
@@ -306,28 +677,54 @@ private slots:
             // Load and apply saved camera settings
             loadCameraSettingsForAlgorithm();
 #endif
-        } else {
+        } else if (cameraIndex >= 0) {
             // Open V4L2 camera - extract device number from camera name
             // Camera name format: "V4L2 Camera X" where X is the device number
             string cameraName = cameraList_[cameraIndex];
             size_t pos = cameraName.find_last_of(" ");
             if (pos != string::npos) {
                 string deviceNumStr = cameraName.substr(pos + 1);
-                int deviceNum = stoi(deviceNumStr);
-                algorithmCamera_.open(deviceNum);
-                if (algorithmCamera_.isOpened()) {
-                algorithmCamera_.set(CAP_PROP_FRAME_WIDTH, 1280);
-                algorithmCamera_.set(CAP_PROP_FRAME_HEIGHT, 1024);
-                cameraOpened = true;
-                
-                // Load and apply saved camera settings
-                loadCameraSettingsForAlgorithm();
+                try {
+                    int deviceNum = stoi(deviceNumStr);
+                    algorithmCamera_.open(deviceNum);
+                    if (!algorithmCamera_.isOpened()) {
+                        // Try opening with CAP_V4L2 explicitly
+                        algorithmCamera_.open(deviceNum, CAP_V4L2);
+                    }
+                    if (algorithmCamera_.isOpened()) {
+                        algorithmCamera_.set(CAP_PROP_FRAME_WIDTH, 1280);
+                        algorithmCamera_.set(CAP_PROP_FRAME_HEIGHT, 1024);
+                        cameraOpened = true;
+                        
+                        // Load and apply saved camera settings
+                        loadCameraSettingsForAlgorithm();
+                    } else {
+                        qDebug() << "Failed to open V4L2 camera" << deviceNum << "- camera may be in use or not available";
+                    }
+                } catch (const std::exception& e) {
+                    qDebug() << "Error parsing camera device number:" << e.what();
+                    cameraOpened = false;
+                }
+            } else {
+                qDebug() << "Invalid camera name format:" << cameraName.c_str();
+                cameraOpened = false;
             }
-        }
         }
         
         if (!cameraOpened) {
-            QMessageBox::warning(this, "Error", "Failed to open camera");
+            QString errorMsg = "Failed to open camera";
+            if (algorithmUseMindVision_) {
+                errorMsg += "\n\nPossible causes:\n";
+                errorMsg += "- Camera is already in use (close Capture tab or other applications)\n";
+                errorMsg += "- Camera is not connected\n";
+                errorMsg += "- Camera driver issue";
+            } else {
+                errorMsg += "\n\nPossible causes:\n";
+                errorMsg += "- Camera is already in use\n";
+                errorMsg += "- Camera device not found\n";
+                errorMsg += "- Insufficient permissions (try: sudo chmod 666 /dev/video*)";
+            }
+            QMessageBox::warning(this, "Error", errorMsg);
             algorithmRunning_ = false;
             return;
         }
@@ -335,87 +732,126 @@ private slots:
         // Check which algorithm is selected
         int algorithmIndex = algorithmCombo_->currentIndex();
         
-        // Check which algorithm is selected and initialize accordingly
-        
+        // Initialize algorithm class for Fast AprilTag (index 2)
+        if (algorithmIndex == 2) {
 #ifdef HAVE_CUDA_APRILTAG
-        useCudaAlgorithm_ = (algorithmIndex == 1);  // Index 1 = CUDA GPU
-        
-        // Initialize CUDA detector if CUDA algorithm is selected
-        if (useCudaAlgorithm_) {
-            // Get frame dimensions from camera (capture a test frame or use defaults)
-            int width = 1280, height = 1024;
-            Mat testFrame;
-            if (algorithmUseMindVision_) {
-#ifdef HAVE_MINDVISION_SDK
-                tSdkFrameHead frameHead;
-                BYTE *pbyBuffer;
-                if (CameraGetImageBuffer(algorithmMvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
-                    width = frameHead.iWidth;
-                    height = frameHead.iHeight;
-                    CameraReleaseImageBuffer(algorithmMvHandle_, pbyBuffer);
-                }
-#endif
-            } else if (algorithmCamera_.isOpened()) {
-                algorithmCamera_ >> testFrame;
-                if (!testFrame.empty()) {
-                    width = testFrame.cols;
-                    height = testFrame.rows;
-                }
-            }
-            
-            // Get camera parameters from fisheye calibration
-            double fx = 905.495617, fy = 609.916016, cx = 907.909470, cy = 352.682645;
-            double k1 = 0.0, k2 = 0.0, p1 = 0.0, p2 = 0.0, k3 = 0.0;
-            
-            if (fisheye_calibration_loaded_ && !fisheye_K_.empty() && !fisheye_D_.empty()) {
-                fx = fisheye_K_.at<double>(0, 0);
-                fy = fisheye_K_.at<double>(1, 1);
-                cx = fisheye_K_.at<double>(0, 2);
-                cy = fisheye_K_.at<double>(1, 2);
-                
-                if (fisheye_D_.rows >= 4) {
-                    k1 = fisheye_D_.at<double>(0);
-                    k2 = fisheye_D_.at<double>(1);
-                    p1 = fisheye_D_.at<double>(2);
-                    p2 = fisheye_D_.at<double>(3);
-                }
-                if (fisheye_D_.rows >= 5) {
-                    k3 = fisheye_D_.at<double>(4);
-                }
-            }
-            
-            // Create GPU detector using wrapper
-            gpuDetectorHandle_ = gpu_detector_create(width, height, fx, fy, cx, cy, k1, k2, p1, p2, k3);
-            if (!gpuDetectorHandle_) {
-                QMessageBox::warning(this, "Error", "Failed to create CUDA GPU detector");
+            AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::FAST_APRILTAG;
+            currentAlgorithm_ = AprilTagAlgorithmFactory::create(algoType);
+            if (!currentAlgorithm_) {
+                QMessageBox::warning(this, "Error", "Failed to create Fast AprilTag algorithm. CUDA support required.");
                 algorithmRunning_ = false;
                 return;
             }
-        } else {
-            gpuDetectorHandle_ = nullptr;
-        }
+            
+            // Get frame dimensions from camera
+            int width = 1280, height = 1024;  // Default, will be updated when camera opens
+            // Try to get dimensions from camera
+            if (algorithmUseMindVision_) {
+#ifdef HAVE_MINDVISION_SDK
+                // Dimensions will be set when camera opens
+                width = 1280;
+                height = 1024;
+#endif
+            } else if (algorithmCamera_.isOpened()) {
+                width = static_cast<int>(algorithmCamera_.get(CAP_PROP_FRAME_WIDTH));
+                height = static_cast<int>(algorithmCamera_.get(CAP_PROP_FRAME_HEIGHT));
+            }
+            
+            // Delay initialization until camera stabilizes (like regular CUDA algorithm)
+            // Store dimensions for later initialization
+            // Will be initialized in initializeFastAprilTagDetector() slot after 2 seconds
+            qDebug() << "Fast AprilTag algorithm will initialize after 2 seconds with dimensions:" << width << "x" << height;
+            useCudaAlgorithm_ = false;  // Don't use old CUDA code
 #else
-        if (algorithmIndex == 1) {
-            QMessageBox::warning(this, "Error", "CUDA AprilTag library not available. Please compile with CUDA support.");
+            QMessageBox::warning(this, "Error", "Fast AprilTag requires CUDA support. Please compile with CUDA.");
             algorithmRunning_ = false;
             return;
-        }
 #endif
+        } else {
+            // CPU or CUDA GPU - use existing code
+            currentAlgorithm_.reset();
+            
+#ifdef HAVE_CUDA_APRILTAG
+            useCudaAlgorithm_ = (algorithmIndex == 1);  // Index 1 = CUDA-based
+            useFastVideoAlgorithm_ = false;  // Not used without video support
+            
+            // For CUDA algorithm, delay detector initialization until camera stabilizes
+            // Detector will be initialized after 2 seconds via initializeCudaDetector() slot
+            if (useCudaAlgorithm_) {
+                // Regular CUDA with camera - delay initialization
+                // Variables will be initialized in initializeCudaDetector()
+                qDebug() << "CUDA algorithm selected - detector will initialize after 2 seconds";
+            }
+#else
+            if (algorithmIndex == 1) {
+                QMessageBox::warning(this, "Error", "CUDA AprilTag library not available. Please compile with CUDA support.");
+                algorithmRunning_ = false;
+                return;
+            }
+#endif
+        }
         
-        // Start threads
-        captureThread_ = new std::thread(&AprilTagDebugGUI::captureThreadFunction, this);
-        processThread_ = new std::thread(&AprilTagDebugGUI::processThreadFunction, this);
-        detectionThread_ = new std::thread(&AprilTagDebugGUI::detectionThreadFunction, this);
-        displayThread_ = new std::thread(&AprilTagDebugGUI::displayThreadFunction, this);
+        // Start threads with error handling
+        cerr << "=== Starting threads ===" << endl;
+        try {
+            cerr << "Creating capture thread..." << endl;
+            captureThread_ = new std::thread(&AprilTagDebugGUI::captureThreadFunction, this);
+            cerr << "Capture thread created successfully" << endl;
+            
+            cerr << "Creating process thread..." << endl;
+            processThread_ = new std::thread(&AprilTagDebugGUI::processThreadFunction, this);
+            cerr << "Process thread created successfully" << endl;
+            
+            cerr << "Creating detection thread..." << endl;
+            detectionThread_ = new std::thread(&AprilTagDebugGUI::detectionThreadFunction, this);
+            cerr << "Detection thread created successfully" << endl;
+            
+            cerr << "Creating display thread..." << endl;
+            displayThread_ = new std::thread(&AprilTagDebugGUI::displayThreadFunction, this);
+            cerr << "Display thread created successfully" << endl;
+            
+            cerr << "All threads started successfully!" << endl;
+        } catch (const std::exception& e) {
+            cerr << "ERROR: Exception starting threads: " << e.what() << endl;
+            QMessageBox::critical(this, "Thread Error", 
+                QString("Failed to start threads:\n%1").arg(e.what()));
+            // Cleanup if threads failed
+            stopAlgorithm();
+            return;
+        } catch (...) {
+            cerr << "ERROR: Unknown exception starting threads" << endl;
+            QMessageBox::critical(this, "Thread Error", "Unknown error starting threads");
+            stopAlgorithm();
+            return;
+        }
         
         algorithmStartBtn_->setEnabled(false);
         algorithmStopBtn_->setEnabled(true);
+        
+        // Schedule delayed initialization after 2 seconds for CUDA-based algorithms
+#ifdef HAVE_CUDA_APRILTAG
+        if (useCudaAlgorithm_ && algorithmIndex != 2) {
+            // Regular CUDA - delay for camera stabilization
+            QTimer::singleShot(2000, this, &AprilTagDebugGUI::initializeCudaDetector);
+            qDebug() << "Scheduled CUDA detector initialization in 2 seconds";
+        } else if (algorithmIndex == 2 && currentAlgorithm_) {
+            // Fast AprilTag - delay for camera stabilization
+            QTimer::singleShot(2000, this, &AprilTagDebugGUI::initializeFastAprilTagDetector);
+            qDebug() << "Scheduled Fast AprilTag detector initialization in 2 seconds";
+        }
+#endif
     }
     
     void stopAlgorithm() {
         if (!algorithmRunning_) return;
         
         algorithmRunning_ = false;
+        
+        // Cleanup algorithm class if used
+        if (currentAlgorithm_) {
+            currentAlgorithm_->cleanup();
+            currentAlgorithm_.reset();
+        }
         
         // Wake up all threads
         capturedFrameReady_.notify_all();
@@ -471,6 +907,10 @@ private slots:
             delete gpuDetector_;
             gpuDetector_ = nullptr;
         }
+        if (td_for_gpu_) {
+            apriltag_detector_destroy(td_for_gpu_);
+            td_for_gpu_ = nullptr;
+        }
         if (td_gpu_) {
             apriltag_detector_destroy(td_gpu_);
             td_gpu_ = nullptr;
@@ -490,6 +930,9 @@ private slots:
 private:
     // Thread functions for algorithm processing pipeline
     void captureThreadFunction() {
+        cerr << "=== Capture thread STARTED ===" << endl;
+        cerr.flush();
+        
         while (algorithmRunning_) {
             auto start = chrono::high_resolution_clock::now();
             Mat frame;
@@ -525,14 +968,10 @@ private:
             }
             
             if (!frame.empty() && algorithmRunning_) {
-                // Apply mirror transformation if enabled
-                Mat frameToProcess = frame.clone();
-                if (algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked()) {
-                    flip(frameToProcess, frameToProcess, 1);  // 1 = horizontal flip
-                }
-                
+                // Don't apply mirroring here - it's done algorithm-specific in detection thread
+                // (CUDA: after GPU detection on gray_host/quads, CPU: before detection on gray frame)
                 std::unique_lock<std::mutex> lock(capturedFrameMutex_);
-                capturedFrame_ = frameToProcess.clone();
+                capturedFrame_ = frame.clone();
                 lock.unlock();
                 capturedFrameReady_.notify_one();
             }
@@ -577,49 +1016,294 @@ private:
     
     void detectionThreadFunction() {
         detectionFPSStart_ = chrono::high_resolution_clock::now();
+        
+        // Overhead timing accumulators (for Fast AprilTag only)
+        static double overhead_frame_clone_ms = 0.0;
+        static double overhead_grayscale_convert_ms = 0.0;
+        static double overhead_store_data_ms = 0.0;
+        static double overhead_draw_ms = 0.0;
+        static double overhead_frame_copy_ms = 0.0;
+        static int overhead_frame_count = 0;
+        
         while (algorithmRunning_) {
             std::unique_lock<std::mutex> lock(processedFrameMutex_);
             processedFrameReady_.wait(lock, [this] { return !processedFrame_.empty() || !algorithmRunning_; });
             
             if (!algorithmRunning_) break;
             
+            // Measure frame cloning time
+            auto clone_start = chrono::high_resolution_clock::now();
             Mat frame = processedFrame_.clone();
             processedFrame_ = Mat();  // Clear
             lock.unlock();
+            auto clone_end = chrono::high_resolution_clock::now();
             
             if (frame.empty()) continue;
             
             auto start = chrono::high_resolution_clock::now();
             
-            // Convert to grayscale if needed
+            // Measure grayscale conversion time
+            auto convert_start = chrono::high_resolution_clock::now();
             Mat gray;
-            if (frame.channels() == 3) {
-                cvtColor(frame, gray, COLOR_BGR2GRAY);
+            if (frame.type() != CV_8UC1) {
+                if (frame.channels() == 2) {
+                    cvtColor(frame, gray, COLOR_YUV2GRAY_YUY2);
+                } else if (frame.channels() == 3) {
+                    cvtColor(frame, gray, COLOR_BGR2GRAY);
+                } else {
+                    gray = frame.clone();
+                }
             } else {
+                // Already grayscale - must be contiguous for Fast AprilTag
+                // Always clone to ensure we have our own copy with guaranteed lifetime
                 gray = frame.clone();
             }
+            auto convert_end = chrono::high_resolution_clock::now();
             
             zarray_t *detections = nullptr;
             
-            
+            // Use algorithm class if available (Fast AprilTag)
+            if (currentAlgorithm_) {
+                bool mirror = algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked();
+                detections = currentAlgorithm_->processFrame(gray, mirror);
+                
+                // Accumulate overhead timing for Fast AprilTag
+                overhead_frame_clone_ms += chrono::duration<double, milli>(clone_end - clone_start).count();
+                overhead_grayscale_convert_ms += chrono::duration<double, milli>(convert_end - convert_start).count();
+                overhead_frame_count++;
+                
+                if (!detections) {
+                    detections = zarray_create(sizeof(apriltag_detection_t*));
+                }
+                
+                // Update detailed timing analysis in GUI periodically (every 10 frames for smooth updates)
+                static int timing_update_counter = 0;
+                if (++timing_update_counter >= 10) {
+                    timing_update_counter = 0;
+                    // Try to cast to FastAprilTagAlgorithm to get timing info
 #ifdef HAVE_CUDA_APRILTAG
-            // Use CUDA GPU detector if selected (same pattern as video_visualize_fixed.cu)
-            if (useCudaAlgorithm_ && gpuDetector_) {
-                gpuDetector_->Detect(gray.data);
-                detections = const_cast<zarray_t*>(gpuDetector_->Detections());
-                // Note: Don't destroy detections from GPU detector, it manages them
+                    FastAprilTagAlgorithm* fast_algo = dynamic_cast<FastAprilTagAlgorithm*>(currentAlgorithm_.get());
+                    if (fast_algo) {
+                        std::string timing_report = fast_algo->getTimingReport();
+                        // Add detailed detection thread overhead info
+                        std::ostringstream oss;
+                        oss << timing_report;
+                        oss << "\n--- Detection Thread Overhead (Detailed) ---\n";
+                        oss << std::fixed << std::setprecision(3);
+                        if (overhead_frame_count > 0) {
+                            double avg_clone = overhead_frame_clone_ms / overhead_frame_count;
+                            double avg_convert = overhead_grayscale_convert_ms / overhead_frame_count;
+                            double avg_store = overhead_store_data_ms / overhead_frame_count;
+                            double avg_draw = overhead_draw_ms / overhead_frame_count;
+                            double avg_copy = overhead_frame_copy_ms / overhead_frame_count;
+                            double total_overhead = avg_clone + avg_convert + avg_store + avg_draw + avg_copy;
+                            
+                            oss << "  Frame Clone:           " << std::setw(8) << avg_clone << " ms\n";
+                            oss << "  Grayscale Convert:     " << std::setw(8) << avg_convert << " ms\n";
+                            oss << "  Store Detection Data:  " << std::setw(8) << avg_store << " ms\n";
+                            oss << "  Draw Detections:       " << std::setw(8) << avg_draw << " ms\n";
+                            oss << "  Frame Copy (output):   " << std::setw(8) << avg_copy << " ms\n";
+                            oss << "  ---------------------------------\n";
+                            oss << "  Total Overhead:        " << std::setw(8) << total_overhead << " ms\n";
+                            oss << "  Algorithm Time:        " << std::setw(8) 
+                                << fast_algo->getLastFrameTiming().total_ms << " ms\n";
+                            oss << "  Detection Thread Time: " << std::setw(8) << detectionTime_ << " ms\n";
+                            oss << "  Overhead %:            " << std::setw(8) 
+                                << (detectionTime_ > 0 ? (total_overhead / detectionTime_ * 100) : 0) << "%\n";
+                        }
+                        
+                        // Update GUI in main thread (thread-safe)
+                        QMetaObject::invokeMethod(this, "updateDetailedTimingSlot", Qt::QueuedConnection, 
+                                                Q_ARG(QString, QString::fromStdString(oss.str())));
+                        
+                        // Reset counters
+                        overhead_frame_clone_ms = 0.0;
+                        overhead_grayscale_convert_ms = 0.0;
+                        overhead_store_data_ms = 0.0;
+                        overhead_draw_ms = 0.0;
+                        overhead_frame_copy_ms = 0.0;
+                        overhead_frame_count = 0;
+                    }
+#endif
+                }
+            }
+#ifdef HAVE_CUDA_APRILTAG
+            // Use CUDA GPU detector if selected (existing code, index 1)
+            else if (useCudaAlgorithm_) {
+                // Check if GPU detector is initialized (it takes 2 seconds to initialize)
+                if (!gpuDetector_) {
+                    // Detector not yet initialized, create empty detections array and skip
+                    {
+                        std::unique_lock<std::mutex> lock(cudaDebugInfoMutex_);
+                        cudaDebugInfo_.detector_initialized = false;
+                        cudaDebugInfo_.num_quads = 0;
+                        cudaDebugInfo_.num_detections_before_scale = 0;
+                        cudaDebugInfo_.num_detections_after_scale = 0;
+                    }
+                    detections = zarray_create(sizeof(apriltag_detection_t *));
+                    // Continue to display thread with empty detections
+                } else {
+                    // GPU detector is initialized, proceed with CUDA detection
+                    try {
+                        // Validate frame dimensions match detector
+                        int detector_width = gpuDetector_->Width();
+                        int detector_height = gpuDetector_->Height();
+                        
+                        if (gray.cols != detector_width || gray.rows != detector_height) {
+                            cerr << "Error: Frame size mismatch: " << gray.cols << "x" << gray.rows 
+                                 << " expected " << detector_width << "x" << detector_height << endl;
+                            detections = zarray_create(sizeof(apriltag_detection_t *));
+                        } else if (gray.data == nullptr || gray.empty()) {
+                            cerr << "Error: Invalid frame data for CUDA detection" << endl;
+                            detections = zarray_create(sizeof(apriltag_detection_t *));
+                        } else {
+                            // EXACT COPY from video_visualize_fixed.cu - no changes
+                            // Check frame validity
+                            if (gray.cols != gpuDetector_->Width() || gray.rows != gpuDetector_->Height()) {
+                                qDebug() << "CUDA ERROR: Frame size mismatch:" << gray.cols << "x" << gray.rows 
+                                         << "expected" << gpuDetector_->Width() << "x" << gpuDetector_->Height();
+                                detections = zarray_create(sizeof(apriltag_detection_t *));
+                            } else if (!gray.isContinuous()) {
+                                qDebug() << "CUDA ERROR: Frame is not contiguous";
+                                detections = zarray_create(sizeof(apriltag_detection_t *));
+                            } else {
+                                // Always use original frame for detection (mirroring will be applied to coordinates after detection)
+                                // Stage 1: GPU-only detection on this frame.
+                                gpuDetector_->DetectGpuOnly(gray.data);
+                                
+                                // Check if mirroring is enabled
+                                bool use_mirror = algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked();
+                                qDebug() << "CUDA: use_mirror =" << use_mirror << "frame size:" << gray.cols << "x" << gray.rows;
+                            
+                                // EXACT COPY from video_visualize_fixed.cu - Build decode job
+                                // FitQuads returns quads in full resolution (after AdjustPixelCenters)
+                                // CopyGrayHostTo returns full resolution gray image
+                                // So we use both in full resolution, then scale detection results afterward
+                                auto quads_fullres = gpuDetector_->FitQuads();
+                                
+                                // Mirror gray image on GPU if requested (faster than CPU)
+                                if (use_mirror) {
+                                    gpuDetector_->MirrorGrayImageOnGpu();
+                                    // Also mirror quad coordinates (on CPU, they're small)
+                                    int gray_width = gpuDetector_->Width();  // Full resolution width
+                                    for (auto& quad : quads_fullres) {
+                                        // Mirror x coordinates for all 4 corners
+                                        for (int i = 0; i < 4; i++) {
+                                            quad.corners[i][0] = gray_width - 1 - quad.corners[i][0];
+                                        }
+                                        // Swap corners to maintain correct orientation: 0<->1, 2<->3
+                                        float temp[2];
+                                        temp[0] = quad.corners[0][0]; temp[1] = quad.corners[0][1];
+                                        quad.corners[0][0] = quad.corners[1][0]; quad.corners[0][1] = quad.corners[1][1];
+                                        quad.corners[1][0] = temp[0]; quad.corners[1][1] = temp[1];
+                                        
+                                        temp[0] = quad.corners[2][0]; temp[1] = quad.corners[2][1];
+                                        quad.corners[2][0] = quad.corners[3][0]; quad.corners[2][1] = quad.corners[3][1];
+                                        quad.corners[3][0] = temp[0]; quad.corners[3][1] = temp[1];
+                                    }
+                                }
+                                
+                                // Copy full-resolution gray image from GPU
+                                vector<uint8_t> gray_host(gpuDetector_->Width() * gpuDetector_->Height());
+                                gpuDetector_->CopyGrayHostTo(gray_host);
+                                
+                                int num_quads = quads_fullres.size();
+                                {
+                                    std::unique_lock<std::mutex> lock(cudaDebugInfoMutex_);
+                                    cudaDebugInfo_.num_quads = num_quads;
+                                    cudaDebugInfo_.detector_initialized = true;
+                                }
+                                
+                                // Use full-resolution quads
+                                std::vector<apriltag_gpu::QuadCorners> quads = quads_fullres;
+                                
+                                // Create temporary arrays for decode
+                                zarray_t *poly0 = g2d_polygon_create_zeros(4);
+                                zarray_t *poly1 = g2d_polygon_create_zeros(4);
+                                zarray_t *temp_detections = zarray_create(sizeof(apriltag_detection_t *));
+                                
+                                // Decode tags (EXACT COPY from video_visualize_fixed.cu)
+                                frc971::apriltag::DecodeTagsFromQuads(
+                                    quads, gray_host.data(), gpuDetector_->Width(), gpuDetector_->Height(),
+                                    td_gpu_, gpu_cam_, gpu_dist_, temp_detections, poly0, poly1);
+                                
+                                detections = temp_detections;
+                                // Clean up poly arrays, keep detections
+                                // Note: g2d_polygon_destroy is from g2d.h (external C library)
+                                // These are temporary arrays, cleanup handled by library
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        qDebug() << "Exception in CUDA detection:" << e.what();
+                        detections = zarray_create(sizeof(apriltag_detection_t *));
+                    } catch (...) {
+                        qDebug() << "Unknown exception in CUDA detection";
+                        detections = zarray_create(sizeof(apriltag_detection_t *));
+                    }
+                }
             } else
 #endif
             {
-                // CPU detection
+                // CPU detection - apply mirroring if enabled (before detection)
+                bool use_mirror_cpu = algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked();
+                Mat gray_for_detection;
+                if (use_mirror_cpu) {
+                    flip(gray, gray_for_detection, 1);  // 1 = horizontal flip
+                } else {
+                    gray_for_detection = gray;
+                }
+                
+                // Debug: Save CPU frames for comparison (first CPU frame only)
+                {
+                    static int cpu_debug_counter = 0;
+                    if (cpu_debug_counter < 1) {
+                        cpu_debug_counter++;
+                        // Save original gray frame
+                        imwrite("/tmp/debug_cpu_original_gray.png", gray);
+                        // Save mirrored gray (if mirroring was applied)
+                        if (use_mirror_cpu) {
+                            imwrite("/tmp/debug_cpu_mirrored_gray.png", gray_for_detection);
+                        } else {
+                            imwrite("/tmp/debug_cpu_mirrored_gray.png", gray_for_detection);  // Same as original if no mirror
+                        }
+                        // Save the exact image used for detection
+                        imwrite("/tmp/debug_cpu_detector_gray.png", gray_for_detection);
+                        qDebug() << "Saved CPU debug frames to /tmp/debug_cpu_*.png";
+                    }
+                }
+                
                 image_u8_t im = {
-                    .width = gray.cols,
-                    .height = gray.rows,
-                    .stride = gray.cols,
-                    .buf = gray.data
+                    .width = gray_for_detection.cols,
+                    .height = gray_for_detection.rows,
+                    .stride = gray_for_detection.cols,
+                    .buf = gray_for_detection.data
                 };
                 
                 detections = apriltag_detector_detect(td_, &im);
+                
+                // Debug: Draw CPU detections/quads if available (first CPU frame only)
+                if (detections && zarray_size(detections) > 0) {
+                    static int cpu_det_debug_counter = 0;
+                    if (cpu_det_debug_counter < 1) {
+                        cpu_det_debug_counter++;
+                        Mat detections_vis = gray_for_detection.clone();
+                        cvtColor(detections_vis, detections_vis, COLOR_GRAY2BGR);
+                        for (int i = 0; i < zarray_size(detections); i++) {
+                            apriltag_detection_t *det;
+                            zarray_get(detections, i, &det);
+                            for (int j = 0; j < 4; j++) {
+                                int x1 = static_cast<int>(det->p[j][0]);
+                                int y1 = static_cast<int>(det->p[j][1]);
+                                int x2 = static_cast<int>(det->p[(j+1)%4][0]);
+                                int y2 = static_cast<int>(det->p[(j+1)%4][1]);
+                                line(detections_vis, Point(x1, y1), Point(x2, y2), Scalar(0, 255, 0), 2);
+                            }
+                            putText(detections_vis, to_string(det->id), Point(static_cast<int>(det->c[0]), static_cast<int>(det->c[1])),
+                                    FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 2);
+                        }
+                        imwrite("/tmp/debug_cpu_detections.png", detections_vis);
+                    }
+                }
             }
             detectionFrameCount_++;
             
@@ -634,69 +1318,140 @@ private:
             }
             
             // Store detections for quality/pose analysis (store only needed data)
+            // Do this BEFORE destroying detections
             {
                 std::unique_lock<std::mutex> lock(latestDetectionsMutex_);
                 latestDetections_.clear();
                 
                 // Extract and store detection data
-                for (int i = 0; i < zarray_size(detections); i++) {
-                    apriltag_detection_t *det;
-                    zarray_get(detections, i, &det);
-                    
-                    DetectionData det_data;
-                    det_data.id = det->id;
-                    det_data.decision_margin = det->decision_margin;
-                    det_data.hamming = det->hamming;
-                    det_data.corners[0] = Point2f(det->p[0][0], det->p[0][1]);
-                    det_data.corners[1] = Point2f(det->p[1][0], det->p[1][1]);
-                    det_data.corners[2] = Point2f(det->p[2][0], det->p[2][1]);
-                    det_data.corners[3] = Point2f(det->p[3][0], det->p[3][1]);
-                    det_data.center = Point2f(det->c[0], det->c[1]);
-                    
-                    latestDetections_.push_back(det_data);
+                if (detections) {  // Safety check
+                    for (int i = 0; i < zarray_size(detections); i++) {
+                        apriltag_detection_t *det;
+                        zarray_get(detections, i, &det);
+                        
+                        if (!det) continue;  // Safety check
+                        
+                        DetectionData det_data;
+                        det_data.id = det->id;
+                        det_data.decision_margin = det->decision_margin;
+                        det_data.hamming = det->hamming;
+                        det_data.corners[0] = Point2f(det->p[0][0], det->p[0][1]);
+                        det_data.corners[1] = Point2f(det->p[1][0], det->p[1][1]);
+                        det_data.corners[2] = Point2f(det->p[2][0], det->p[2][1]);
+                        det_data.corners[3] = Point2f(det->p[3][0], det->p[3][1]);
+                        det_data.center = Point2f(det->c[0], det->c[1]);
+                        
+                        latestDetections_.push_back(det_data);
+                    }
                 }
             }
             
             // Draw detections on frame
-            Mat detected = frame.clone();
-            if (frame.channels() == 1) {
-                cvtColor(frame, detected, COLOR_GRAY2BGR);
+            // Apply mirror to display frame if mirroring was used (so coordinates match)
+            auto draw_start = chrono::high_resolution_clock::now();
+            Mat detected;
+            bool use_mirror_display = (algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked());
+            if (use_mirror_display) {
+                Mat temp_frame = frame.clone();
+                if (temp_frame.channels() == 1) {
+                    cvtColor(temp_frame, detected, COLOR_GRAY2BGR);
+                } else {
+                    detected = temp_frame.clone();
+                }
+                flip(detected, detected, 1);  // Mirror display to match coordinates
+            } else {
+                detected = frame.clone();
+                if (frame.channels() == 1) {
+                    cvtColor(frame, detected, COLOR_GRAY2BGR);
+                }
             }
             
-            for (int i = 0; i < zarray_size(detections); i++) {
-                apriltag_detection_t *det;
-                zarray_get(detections, i, &det);
-                
-                // Draw quad
-                line(detected, Point(det->p[0][0], det->p[0][1]), Point(det->p[1][0], det->p[1][1]), Scalar(0, 255, 0), 2);
-                line(detected, Point(det->p[1][0], det->p[1][1]), Point(det->p[2][0], det->p[2][1]), Scalar(0, 255, 0), 2);
-                line(detected, Point(det->p[2][0], det->p[2][1]), Point(det->p[3][0], det->p[3][1]), Scalar(0, 255, 0), 2);
-                line(detected, Point(det->p[3][0], det->p[3][1]), Point(det->p[0][0], det->p[0][1]), Scalar(0, 255, 0), 2);
-                
-                // Draw ID
-                putText(detected, to_string(det->id), Point(det->c[0], det->c[1]), 
-                       FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 255, 0), 2);
-                
-                apriltag_detection_destroy(det);
+            int num_detections_drawn = 0;
+            if (detections) {  // Safety check
+                for (int i = 0; i < zarray_size(detections); i++) {
+                    apriltag_detection_t *det;
+                    zarray_get(detections, i, &det);
+                    
+                    if (!det) continue;  // Safety check
+                    
+                    // Validate coordinates are within frame bounds
+                    bool valid = true;
+                    for (int j = 0; j < 4; j++) {
+                        if (det->p[j][0] < 0 || det->p[j][0] >= detected.cols ||
+                            det->p[j][1] < 0 || det->p[j][1] >= detected.rows) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (det->c[0] < 0 || det->c[0] >= detected.cols ||
+                        det->c[1] < 0 || det->c[1] >= detected.rows) {
+                        valid = false;
+                    }
+                    
+                    if (valid) {
+                        // Draw quad
+                        line(detected, Point((int)det->p[0][0], (int)det->p[0][1]), 
+                             Point((int)det->p[1][0], (int)det->p[1][1]), Scalar(0, 255, 0), 2);
+                        line(detected, Point((int)det->p[1][0], (int)det->p[1][1]), 
+                             Point((int)det->p[2][0], (int)det->p[2][1]), Scalar(0, 255, 0), 2);
+                        line(detected, Point((int)det->p[2][0], (int)det->p[2][1]), 
+                             Point((int)det->p[3][0], (int)det->p[3][1]), Scalar(0, 255, 0), 2);
+                        line(detected, Point((int)det->p[3][0], (int)det->p[3][1]), 
+                             Point((int)det->p[0][0], (int)det->p[0][1]), Scalar(0, 255, 0), 2);
+                        
+                        // Draw ID
+                        putText(detected, to_string(det->id), Point((int)det->c[0], (int)det->c[1]), 
+                               FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 255, 0), 2);
+                        num_detections_drawn++;
+                    } else {
+                        // Log invalid coordinates for debugging
+                        qDebug() << "CUDA: Detection" << i << "has invalid coordinates - frame:" 
+                                 << detected.cols << "x" << detected.rows
+                                 << "corners:" << det->p[0][0] << "," << det->p[0][1] << "...";
+                    }
+                    
+                    // Only destroy detections for Fast AprilTag (it owns them)
+                    // For CUDA algorithm, GPU detector manages detections
+                    if (currentAlgorithm_) {
+                        apriltag_detection_destroy(det);
+                    }
+                }
+            }
+            auto draw_end = chrono::high_resolution_clock::now();
+            
+            // Accumulate overhead timing for Fast AprilTag
+            if (currentAlgorithm_) {
+                overhead_draw_ms += chrono::duration<double, milli>(draw_end - draw_start).count();
             }
             
-            
+            // Update debug info with number of drawn detections
 #ifdef HAVE_CUDA_APRILTAG
-            // Only destroy if using CPU detector (GPU detector manages its own detections)
-            if (!useCudaAlgorithm_ || !gpuDetector_)
+            if (useCudaAlgorithm_) {
+                std::unique_lock<std::mutex> lock(cudaDebugInfoMutex_);
+                cudaDebugInfo_.num_detections_after_scale = num_detections_drawn;
+            }
 #endif
-            {
+            
+            // Destroy detections array
+            // For Fast AprilTag: destroy the array (detections already destroyed above)
+            // For CUDA algorithm: don't destroy (GPU detector manages them)
+            if (detections) {
+#ifdef HAVE_CUDA_APRILTAG
+                if (!useCudaAlgorithm_ || !gpuDetector_) {
+                    zarray_destroy(detections);
+                }
+#else
                 zarray_destroy(detections);
+#endif
             }
             
+            // Measure frame copying time
+            auto copy_start = chrono::high_resolution_clock::now();
             // Store latest frame for pose/quality display
             {
                 std::unique_lock<std::mutex> lock(latestDetectionsMutex_);
                 latestDetectedFrame_ = detected.clone();
             }
-            
-            auto end = chrono::high_resolution_clock::now();
-            detectionTime_ = chrono::duration<double, milli>(end - start).count();
             
             if (algorithmRunning_) {
                 std::unique_lock<std::mutex> lock2(detectedFrameMutex_);
@@ -704,11 +1459,21 @@ private:
                 lock2.unlock();
                 detectedFrameReady_.notify_one();
             }
+            auto copy_end = chrono::high_resolution_clock::now();
+            
+            // Accumulate overhead timing for Fast AprilTag
+            if (currentAlgorithm_) {
+                overhead_frame_copy_ms += chrono::duration<double, milli>(copy_end - copy_start).count();
+            }
+            
+            auto end = chrono::high_resolution_clock::now();
+            detectionTime_ = chrono::duration<double, milli>(end - start).count();
         }
     }
     
     void displayThreadFunction() {
         displayFPSStart_ = chrono::high_resolution_clock::now();
+        int display_count = 0;
         while (algorithmRunning_) {
             std::unique_lock<std::mutex> lock(detectedFrameMutex_);
             detectedFrameReady_.wait(lock, [this] { return !detectedFrame_.empty() || !algorithmRunning_; });
@@ -719,7 +1484,19 @@ private:
             detectedFrame_ = Mat();  // Clear
             lock.unlock();
             
-            if (frame.empty()) continue;
+            if (frame.empty()) {
+                // Debug: Uncomment to debug empty frames
+                // if (display_count % 100 == 0) {
+                //     qDebug() << "Display thread: Received empty frame";
+                // }
+                continue;
+            }
+            
+            display_count++;
+            // Debug: Uncomment to debug frame display
+            // if (display_count % 30 == 0) {
+            //     qDebug() << "Display thread: Displaying frame" << display_count << "size:" << frame.cols << "x" << frame.rows;
+            // }
             
             auto start = chrono::high_resolution_clock::now();
             
@@ -736,9 +1513,8 @@ private:
                 algorithmDisplayLabel_->width(), algorithmDisplayLabel_->height(),
                 Qt::KeepAspectRatio, Qt::SmoothTransformation);
             
-            // Update UI in main thread - QLabel::setPixmap is thread-safe when called from different thread
-            // We'll use a signal-slot connection or direct call (Qt handles it)
-            algorithmDisplayLabel_->setPixmap(pixmap);
+            // Update UI in main thread using slot (thread-safe)
+            QMetaObject::invokeMethod(this, "setPixmapFromThread", Qt::QueuedConnection, Q_ARG(QPixmap, pixmap));
             
             // Update timing statistics
             auto end = chrono::high_resolution_clock::now();
@@ -766,32 +1542,13 @@ private:
     }
     
     void updateAlgorithmTiming(double fps) {
-        if (!algorithmTimingText_ || !algorithmFPSLabel_) return;
+        if (!algorithmFPSLabel_) return;
         
         // Display all three FPS values in the label: Capture, Detection, Display
         algorithmFPSLabel_->setText(QString("FPS: Capture: %1, Detection: %2, Display: %3")
             .arg(captureFPS_, 0, 'f', 1)
             .arg(detectionFPS_, 0, 'f', 1)
             .arg(displayFPS_, 0, 'f', 1));
-        
-        QString timingText = QString(
-            "Capture: %1 ms (%2 FPS)\n"
-            "Processing: %3 ms\n"
-            "Detection: %4 ms (%5 FPS)\n"
-            "Display: %6 ms (%7 FPS)\n"
-            "Total: %8 ms\n"
-            "Frames processed: %9"
-        ).arg(captureTime_, 0, 'f', 2)
-         .arg(captureFPS_, 0, 'f', 1)
-         .arg(processTime_, 0, 'f', 2)
-         .arg(detectionTime_, 0, 'f', 2)
-         .arg(detectionFPS_, 0, 'f', 1)
-         .arg(displayTime_, 0, 'f', 2)
-         .arg(displayFPS_, 0, 'f', 1)
-         .arg(totalTime_, 0, 'f', 2)
-         .arg(frameCount_);
-        
-        algorithmTimingText_->setPlainText(timingText);
     }
     
     void updateAlgorithmQualityAndPose() {
@@ -800,10 +1557,25 @@ private:
         // Update quality metrics
         if (algorithmQualityText_) {
             QString qualityText;
+            
+            // Add CUDA debug info if using CUDA algorithm
+#ifdef HAVE_CUDA_APRILTAG
+            if (useCudaAlgorithm_) {
+                std::unique_lock<std::mutex> debugLock(cudaDebugInfoMutex_);
+                qualityText += "=== CUDA DEBUG INFO ===\n";
+                qualityText += QString("Detector Initialized: %1\n").arg(cudaDebugInfo_.detector_initialized ? "Yes" : "No");
+                qualityText += QString("Quads Found: %1\n").arg(cudaDebugInfo_.num_quads);
+                qualityText += QString("Detections (before scale): %1\n").arg(cudaDebugInfo_.num_detections_before_scale);
+                qualityText += QString("Detections (after scale): %1\n").arg(cudaDebugInfo_.num_detections_after_scale);
+                qualityText += "\n";
+                debugLock.unlock();
+            }
+#endif
+            
             if (latestDetections_.empty()) {
-                qualityText = "No detections";
+                qualityText += "No detections";
             } else {
-                qualityText = QString("Tags detected: %1\n\n").arg(latestDetections_.size());
+                qualityText += QString("Tags detected: %1\n\n").arg(latestDetections_.size());
                 for (size_t i = 0; i < latestDetections_.size() && i < 5; i++) {  // Show max 5 tags
                     const DetectionData& det = latestDetections_[i];
                     qualityText += QString("Tag ID: %1\n").arg(det.id);
@@ -2627,12 +3399,14 @@ private:
         previewLayout->addLayout(controlLayout);
         layout->addLayout(previewLayout);
         
-        // Initialize camera enumeration
-        enumerateCameras();
-        
-        // Setup preview timer
+        // Setup preview timer FIRST (before enumerateCameras, which might trigger signals)
         previewTimer_ = new QTimer(this);
         connect(previewTimer_, &QTimer::timeout, this, &AprilTagDebugGUI::updatePreview);
+        
+        // Initialize camera enumeration (this may trigger signals, so previewTimer_ must exist)
+        cameraCombo_->blockSignals(true);  // Block signals during enumeration
+        enumerateCameras();
+        cameraCombo_->blockSignals(false);  // Re-enable signals
         
         // Calibration preview timer (separate timer for calibration view)
         calibrationPreviewTimer_ = new QTimer(this);
@@ -2656,6 +3430,7 @@ private:
         algorithmCombo_ = new QComboBox(this);
         algorithmCombo_->addItem("OpenCV CPU (AprilTag)");
         algorithmCombo_->addItem("CUDA GPU (AprilTag)");
+        algorithmCombo_->addItem("Fast AprilTag");
         algorithmLayout->addWidget(algorithmLabel);
         algorithmLayout->addWidget(algorithmCombo_);
         algorithmLayout->addStretch();
@@ -2697,48 +3472,32 @@ private:
         buttonLayout->addStretch();
         layout->addLayout(buttonLayout);
         
-        // Display area
+        // Top row: Video preview (left) + Fast AprilTag Timing Analysis (right, full height)
+        QHBoxLayout *previewAndTimingLayout = new QHBoxLayout();
+        
+        // Left side: Video preview with Quality Metrics and Pose Estimation below
+        QVBoxLayout *leftSideLayout = new QVBoxLayout();
+        
+        // Video preview
         QGroupBox *displayGroup = new QGroupBox("Live Preview", this);
         QVBoxLayout *displayLayout = new QVBoxLayout();
         algorithmDisplayLabel_ = new QLabel("No video", this);
-        algorithmDisplayLabel_->setMinimumSize(640, 480);
+        algorithmDisplayLabel_->setMinimumSize(480, 360);  // Reduced from 640x480
         algorithmDisplayLabel_->setAlignment(Qt::AlignCenter);
         algorithmDisplayLabel_->setStyleSheet("border: 1px solid gray; background-color: black; color: white;");
         displayLayout->addWidget(algorithmDisplayLabel_);
         displayGroup->setLayout(displayLayout);
-        layout->addWidget(displayGroup);
+        leftSideLayout->addWidget(displayGroup);
         
-        // Three boxes below image: Timing, Quality Metrics, Pose
+        // Quality Metrics and Pose Estimation boxes below video
         QHBoxLayout *metricsLayout = new QHBoxLayout();
-        
-        // Timing box
-        QGroupBox *timingGroup = new QGroupBox("Timing Metrics", this);
-        QVBoxLayout *timingLayout = new QVBoxLayout();
-        algorithmFPSLabel_ = new QLabel("FPS: Capture: 0.0, Detection: 0.0, Display: 0.0", this);
-        algorithmFPSLabel_->setStyleSheet("font-size: 14pt; font-weight: bold; color: #0066cc;");
-        timingLayout->addWidget(algorithmFPSLabel_);
-        
-        algorithmTimingText_ = new QTextEdit(this);
-        algorithmTimingText_->setReadOnly(true);
-        algorithmTimingText_->setMaximumHeight(180);
-        algorithmTimingText_->setPlainText(
-            "Capture: 0.0 ms (0.0 FPS)\n"
-            "Processing: 0.0 ms\n"
-            "Detection: 0.0 ms (0.0 FPS)\n"
-            "Display: 0.0 ms (0.0 FPS)\n"
-            "Total: 0.0 ms\n"
-            "Frames processed: 0"
-        );
-        timingLayout->addWidget(algorithmTimingText_);
-        timingGroup->setLayout(timingLayout);
-        metricsLayout->addWidget(timingGroup);
         
         // Quality Metrics box
         QGroupBox *qualityGroup = new QGroupBox("Quality Metrics", this);
         QVBoxLayout *qualityLayout = new QVBoxLayout();
         algorithmQualityText_ = new QTextEdit(this);
         algorithmQualityText_->setReadOnly(true);
-        algorithmQualityText_->setMaximumHeight(180);
+        algorithmQualityText_->setMaximumHeight(200);
         algorithmQualityText_->setPlainText("No detections");
         qualityLayout->addWidget(algorithmQualityText_);
         qualityGroup->setLayout(qualityLayout);
@@ -2749,13 +3508,45 @@ private:
         QVBoxLayout *poseLayout = new QVBoxLayout();
         algorithmPoseText_ = new QTextEdit(this);
         algorithmPoseText_->setReadOnly(true);
-        algorithmPoseText_->setMaximumHeight(180);
+        algorithmPoseText_->setMaximumHeight(200);
         algorithmPoseText_->setPlainText("No pose data");
         poseLayout->addWidget(algorithmPoseText_);
         poseGroup->setLayout(poseLayout);
         metricsLayout->addWidget(poseGroup);
         
-        layout->addLayout(metricsLayout);
+        leftSideLayout->addLayout(metricsLayout);
+        previewAndTimingLayout->addLayout(leftSideLayout, 2);  // Takes 2 parts of space
+        
+        // Right side: Fast AprilTag Timing Analysis (full height, goes all the way down)
+        QGroupBox *detailedTimingGroup = new QGroupBox("Fast AprilTag Timing Analysis", this);
+        QVBoxLayout *detailedTimingLayout = new QVBoxLayout();
+        
+        // FPS counters at the top
+        algorithmFPSLabel_ = new QLabel("FPS: Capture: 0.0, Detection: 0.0, Display: 0.0", this);
+        algorithmFPSLabel_->setStyleSheet("font-size: 14pt; font-weight: bold; color: #0066cc;");
+        detailedTimingLayout->addWidget(algorithmFPSLabel_);
+        
+        // Detailed timing text (expands to fill available space)
+        algorithmDetailedTimingText_ = new QTextEdit(this);
+        algorithmDetailedTimingText_->setReadOnly(true);
+        algorithmDetailedTimingText_->setFont(QFont("Courier", 9));  // Monospace font for alignment
+        algorithmDetailedTimingText_->setPlainText(
+            "Timing analysis will appear here when Fast AprilTag algorithm is running.\n\n"
+            "This shows detailed breakdown of each detection stage:\n"
+            "- DetectGpuOnly\n"
+            "- FitQuads\n"
+            "- Mirror operations\n"
+            "- CopyGrayHostTo\n"
+            "- DecodeTags\n"
+            "- ScaleCoords\n"
+            "- FilterDuplicates\n\n"
+            "Updated every 10 frames."
+        );
+        detailedTimingLayout->addWidget(algorithmDetailedTimingText_, 1);  // Expand to fill space
+        detailedTimingGroup->setLayout(detailedTimingLayout);
+        previewAndTimingLayout->addWidget(detailedTimingGroup, 1);  // Takes 1 part of space
+        
+        layout->addLayout(previewAndTimingLayout);
     }
     
     void setupFisheyeTabContent(QVBoxLayout *layout) {
@@ -3566,6 +4357,14 @@ private:
         isMindVision_.clear();
         
         // Enumerate V4L2 cameras
+        // Temporarily redirect stderr to suppress OpenCV warnings during enumeration
+        fflush(stderr);
+        int saved_stderr = dup(STDERR_FILENO);
+        FILE *null_file = fopen("/dev/null", "w");
+        if (null_file) {
+            dup2(fileno(null_file), STDERR_FILENO);
+        }
+        
         for (int i = 0; i < 10; i++) {
             VideoCapture testCap(i);
             if (testCap.isOpened()) {
@@ -3574,6 +4373,14 @@ private:
                 cameraCombo_->addItem(QString("V4L2 Camera %1").arg(i));
                 testCap.release();
             }
+        }
+        
+        // Restore stderr
+        if (null_file) {
+            fflush(stderr);
+            dup2(saved_stderr, STDERR_FILENO);
+            ::close(saved_stderr);
+            fclose(null_file);
         }
         
         // Enumerate MindVision cameras
@@ -3596,7 +4403,10 @@ private:
     }
     
     void openCamera() {
-        closeCamera();
+        // Only close camera if it's already open (previewTimer_ might not exist yet during initialization)
+        if (cameraOpen_ && previewTimer_ != nullptr) {
+            closeCamera();
+        }
         
         int index = cameraCombo_->currentIndex();
         if (index < 0 || index >= (int)cameraList_.size()) {
@@ -3771,7 +4581,8 @@ private:
     }
     
     void closeCamera() {
-        if (previewTimer_) {
+        // Safety check: previewTimer_ might not be initialized yet during GUI startup
+        if (previewTimer_ != nullptr) {
             previewTimer_->stop();
         }
         
@@ -3995,30 +4806,19 @@ private:
     QPushButton *loadImageBtn_;
     QPushButton *captureBtn_;
     QPushButton *saveSettingsBtn_;
-    QTimer *previewTimer_;
-    QTimer *calibrationPreviewTimer_;
+    // previewTimer_ and calibrationPreviewTimer_ already declared at line 159-160
     
     // UI elements (Fisheye tab)
     QLineEdit *calibPathEdit_;
     QLabel *fisheyeStatusLabel_;  // Status label in Fisheye tab
-    QLabel *fisheyeStatusIndicator_;  // Status indicator at top of window
+    // fisheyeStatusIndicator_ already declared at line 231
     QPushButton *loadTestImageBtn_;
     QLabel *fisheyeOriginalLabel_;
     QLabel *fisheyeCorrectedLabel_;
     QRadioButton *fisheyeUseOriginalRadio_;
     QRadioButton *fisheyeUseCorrectedRadio_;
     
-    // UI elements (Algorithms tab)
-    QComboBox *algorithmCombo_;
-    QComboBox *algorithmCameraCombo_;
-    QPushButton *algorithmStartBtn_;
-    QPushButton *algorithmStopBtn_;
-    QCheckBox *algorithmMirrorCheckbox_;
-    QLabel *algorithmDisplayLabel_;
-    QTextEdit *algorithmTimingText_;
-    QLabel *algorithmFPSLabel_;
-    QTextEdit *algorithmQualityText_;
-    QTextEdit *algorithmPoseText_;
+    // UI elements (Algorithms tab) - duplicates removed, already declared at line 233-246
     
     // Calibration process UI
     QPushButton *resetCalibBtn_;
@@ -4052,103 +4852,7 @@ private:
     QSpinBox *saturationSpin_;
     QSpinBox *sharpnessSpin_;
     
-    // Images
-    Mat image1_, image2_;
-    string image1_path_, image2_path_;
-    
-    // Camera
-    VideoCapture cameraCap_;
-#ifdef HAVE_MINDVISION_SDK
-    CameraHandle mvHandle_;
-#else
-    void* mvHandle_;  // Dummy type if SDK not available
-#endif
-    bool useMindVision_;
-    bool cameraOpen_;
-    int selectedCameraIndex_;
-    vector<string> cameraList_;  // List of camera names
-    vector<bool> isMindVision_;  // Whether each camera is MindVision
-    vector<Mode> v4l2_modes_;    // V4L2 camera modes
-    vector<MVMode> mv_modes_;    // MindVision camera modes
-    Mat currentFrame_;
-    mutex frameMutex_;
-    string suggestedCaptureFilename_;  // Generated filename for capture
-    
-    // Algorithm processing threads and synchronization
-    bool algorithmRunning_ = false;
-    std::thread *captureThread_ = nullptr;
-    std::thread *processThread_ = nullptr;
-    std::thread *detectionThread_ = nullptr;
-    std::thread *displayThread_ = nullptr;
-    
-    // Frame buffers for multi-threaded pipeline
-    Mat capturedFrame_;
-    Mat processedFrame_;
-    Mat detectedFrame_;
-    std::mutex capturedFrameMutex_;
-    std::mutex processedFrameMutex_;
-    std::mutex detectedFrameMutex_;
-    std::condition_variable capturedFrameReady_;
-    std::condition_variable processedFrameReady_;
-    std::condition_variable detectedFrameReady_;
-    
-    // Timing statistics
-    double captureTime_ = 0.0;
-    double processTime_ = 0.0;
-    double detectionTime_ = 0.0;
-    double displayTime_ = 0.0;
-    double totalTime_ = 0.0;
-    int frameCount_ = 0;
-    
-    // Separate FPS tracking
-    double captureFPS_ = 0.0;
-    double detectionFPS_ = 0.0;
-    double displayFPS_ = 0.0;
-    int captureFrameCount_ = 0;
-    int detectionFrameCount_ = 0;
-    int displayFrameCount_ = 0;
-    chrono::high_resolution_clock::time_point captureFPSStart_;
-    chrono::high_resolution_clock::time_point detectionFPSStart_;
-    chrono::high_resolution_clock::time_point displayFPSStart_;
-    
-    // Latest detection data for quality and pose (store only needed fields)
-    struct DetectionData {
-        int id;
-        double decision_margin;
-        int hamming;
-        Point2f corners[4];  // p[0] through p[3]
-        Point2f center;      // c[0], c[1]
-    };
-    vector<DetectionData> latestDetections_;
-    Mat latestDetectedFrame_;
-    mutex latestDetectionsMutex_;
-    
-    // Algorithm-specific camera
-    VideoCapture algorithmCamera_;
-    bool algorithmUseMindVision_ = false;
-#ifdef HAVE_MINDVISION_SDK
-    CameraHandle algorithmMvHandle_ = 0;
-#else
-    void* algorithmMvHandle_ = nullptr;
-#endif
-    
-    // Fisheye undistortion
-    Mat fisheye_map1_, fisheye_map2_;
-    Mat fisheye_K_, fisheye_D_;
-    bool fisheye_undistort_enabled_;
-    bool fisheye_calibration_loaded_ = false;
-    Size fisheye_image_size_;
-    
-    // AprilTag detector
-    apriltag_family_t* tf_;
-    apriltag_detector_t* td_;
-    
-#ifdef HAVE_CUDA_APRILTAG
-    apriltag_gpu::GpuDetector* gpuDetector_;
-    apriltag_detector_t* td_gpu_;
-    apriltag_family_t* tf_gpu_;
-    bool useCudaAlgorithm_;
-#endif
+    // All member variables declared above - duplicates removed (UI elements declared later in file at line 4635+)
     
     // Helper function to generate capture filename
     QString generateCaptureFilename() {
