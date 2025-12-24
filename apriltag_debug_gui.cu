@@ -134,16 +134,6 @@ private:
     // AprilTag detectors
     apriltag_family_t* tf_;
     apriltag_detector_t* td_;
-#ifdef HAVE_CUDA_APRILTAG
-    apriltag_gpu::GpuDetector* gpuDetector_;
-    apriltag_detector_t* td_gpu_;
-    apriltag_detector_t* td_for_gpu_;
-    apriltag_family_t* tf_gpu_;
-    bool useCudaAlgorithm_;
-    bool useFastVideoAlgorithm_;
-    apriltag_gpu::CameraMatrix gpu_cam_;
-    apriltag_gpu::DistCoeffs gpu_dist_;
-#endif
     
     // Images
     Mat image1_, image2_;
@@ -174,6 +164,7 @@ private:
     VideoCapture algorithmCamera_;
     bool algorithmUseMindVision_;
     std::unique_ptr<AprilTagAlgorithm> currentAlgorithm_;  // For Fast AprilTag and future algorithms
+    std::unique_ptr<AprilTagAlgorithm> captureAlgorithm_;  // For Capture tab preview
 #ifdef HAVE_MINDVISION_SDK
     CameraHandle algorithmMvHandle_;
 #else
@@ -222,16 +213,6 @@ private:
     Mat latestDetectedFrame_;
     mutex latestDetectionsMutex_;
     
-    // CUDA debug info
-    struct CudaDebugInfo {
-        int num_quads = 0;
-        int num_detections_before_scale = 0;
-        int num_detections_after_scale = 0;
-        bool detector_initialized = false;
-    };
-    CudaDebugInfo cudaDebugInfo_;
-    mutex cudaDebugInfoMutex_;
-    
     // Fisheye undistortion
     Mat fisheye_map1_, fisheye_map2_;
     Mat fisheye_K_, fisheye_D_;
@@ -259,14 +240,6 @@ public:
         td_(nullptr),
         previewTimer_(nullptr),
         calibrationPreviewTimer_(nullptr)
-#ifdef HAVE_CUDA_APRILTAG
-        , gpuDetector_(nullptr)
-        , td_gpu_(nullptr)
-        , td_for_gpu_(nullptr)
-        , tf_gpu_(nullptr)
-        , useCudaAlgorithm_(false)
-        , useFastVideoAlgorithm_(false)
-#endif
     {
         setupUI();
         
@@ -290,25 +263,6 @@ public:
         stopAlgorithm();  // Ensure threads are stopped
         apriltag_detector_destroy(td_);
         tag36h11_destroy(tf_);
-        
-#ifdef HAVE_CUDA_APRILTAG
-        if (gpuDetector_ != nullptr) {
-            delete gpuDetector_;
-            gpuDetector_ = nullptr;
-        }
-        if (td_for_gpu_ != nullptr) {
-            apriltag_detector_destroy(td_for_gpu_);
-            td_for_gpu_ = nullptr;
-        }
-        if (td_gpu_ != nullptr) {
-            apriltag_detector_destroy(td_gpu_);
-            td_gpu_ = nullptr;
-        }
-        if (tf_gpu_ != nullptr) {
-            tag36h11_destroy(tf_gpu_);
-            tf_gpu_ = nullptr;
-        }
-#endif
     }
 
 private slots:
@@ -370,152 +324,6 @@ private slots:
 #endif
     }
     
-    // Initialize CUDA detector after camera stabilizes (called after 2 second delay)
-    void initializeCudaDetector() {
-#ifdef HAVE_CUDA_APRILTAG
-        if (!useCudaAlgorithm_ || gpuDetector_ != nullptr || !algorithmRunning_) {
-            return;  // Already initialized, not using CUDA, or algorithm stopped
-        }
-        
-        qDebug() << "Starting delayed CUDA detector initialization (2 seconds after camera start)...";
-        
-        // Get frame dimensions from video or camera (now it should be stable)
-        int width = 1280, height = 1024;
-        Mat testFrame;
-        bool dimensionsFound = false;
-        
-        if (algorithmUseMindVision_) {
-#ifdef HAVE_MINDVISION_SDK
-            tSdkFrameHead frameHead;
-            BYTE *pbyBuffer;
-            if (CameraGetImageBuffer(algorithmMvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
-                width = frameHead.iWidth;
-                height = frameHead.iHeight;
-                dimensionsFound = true;
-                CameraReleaseImageBuffer(algorithmMvHandle_, pbyBuffer);
-                qDebug() << "MindVision camera dimensions:" << width << "x" << height;
-            }
-#endif
-        } else if (algorithmCamera_.isOpened()) {
-            algorithmCamera_ >> testFrame;
-            if (!testFrame.empty()) {
-                width = testFrame.cols;
-                height = testFrame.rows;
-                dimensionsFound = true;
-                qDebug() << "V4L2 camera dimensions:" << width << "x" << height;
-            }
-        }
-        
-        // Get camera parameters from fisheye calibration
-        double fx = 905.495617, fy = 609.916016, cx = 907.909470, cy = 352.682645;
-        double k1 = 0.0, k2 = 0.0, p1 = 0.0, p2 = 0.0, k3 = 0.0;
-        
-        if (fisheye_calibration_loaded_ && !fisheye_K_.empty() && !fisheye_D_.empty()) {
-            fx = fisheye_K_.at<double>(0, 0);
-            fy = fisheye_K_.at<double>(1, 1);
-            cx = fisheye_K_.at<double>(0, 2);
-            cy = fisheye_K_.at<double>(1, 2);
-            
-            if (fisheye_D_.rows >= 4) {
-                k1 = fisheye_D_.at<double>(0);
-                k2 = fisheye_D_.at<double>(1);
-                p1 = fisheye_D_.at<double>(2);
-                p2 = fisheye_D_.at<double>(3);
-            }
-            if (fisheye_D_.rows >= 5) {
-                k3 = fisheye_D_.at<double>(4);
-            }
-        }
-        
-        // Validate dimensions - must be even numbers for CUDA decimation
-        if (width <= 0 || height <= 0 || width > 10000 || height > 10000) {
-            qDebug() << "Error: Invalid frame dimensions:" << width << "x" << height;
-            return;
-        }
-        
-        // Ensure dimensions are even (required for quad_decimate = 2.0)
-        if (width % 2 != 0) width = (width / 2) * 2;
-        if (height % 2 != 0) height = (height / 2) * 2;
-        
-        qDebug() << "Initializing CUDA detector with dimensions:" << width << "x" << height;
-        
-        // Initialize GPU detector (same pattern as video_visualize_fixed)
-        tf_gpu_ = tag36h11_create();
-        if (!tf_gpu_) {
-            qDebug() << "Error: Failed to create tag family";
-            return;
-        }
-        
-        // Create detector for GpuDetector (same as 'td' in video_visualize_fixed)
-        apriltag_detector_t *td_for_gpu = apriltag_detector_create();
-        if (!td_for_gpu) {
-            tag36h11_destroy(tf_gpu_);
-            tf_gpu_ = nullptr;
-            qDebug() << "Error: Failed to create tag detector";
-            return;
-        }
-        
-        apriltag_detector_add_family(td_for_gpu, tf_gpu_);
-        td_for_gpu->quad_decimate = 2.0;  // CUDA requires 2.0
-        td_for_gpu->quad_sigma = 0.0;  // Match video_visualize_fixed
-        td_for_gpu->refine_edges = 1;  // Match video_visualize_fixed (true)
-        td_for_gpu->debug = false;  // Match video_visualize_fixed
-        td_for_gpu->nthreads = std::max(1, 1);  // Match video_visualize_fixed default (1)
-        td_for_gpu->wp = workerpool_create(td_for_gpu->nthreads);
-        
-        // Create SEPARATE detector for CPU decode (exactly like td_cpu in video_visualize_fixed)
-        td_gpu_ = apriltag_detector_create();
-        if (!td_gpu_) {
-            apriltag_detector_destroy(td_for_gpu);
-            tag36h11_destroy(tf_gpu_);
-            tf_gpu_ = nullptr;
-            qDebug() << "Error: Failed to create CPU decode detector";
-            return;
-        }
-        apriltag_detector_add_family(td_gpu_, tf_gpu_);
-        // Copy settings from GPU detector (same as video_visualize_fixed does)
-        td_gpu_->quad_decimate = td_for_gpu->quad_decimate;
-        td_gpu_->quad_sigma = td_for_gpu->quad_sigma;
-        td_gpu_->refine_edges = td_for_gpu->refine_edges;
-        td_gpu_->debug = td_for_gpu->debug;
-        td_gpu_->nthreads = td_for_gpu->nthreads;
-        td_gpu_->wp = workerpool_create(td_gpu_->nthreads);
-        
-        gpu_cam_ = apriltag_gpu::CameraMatrix{fx, fy, cx, cy};
-        gpu_dist_ = apriltag_gpu::DistCoeffs{k1, k2, p1, p2, k3};
-        
-        try {
-            // Pass td_for_gpu to GpuDetector, use td_gpu_ for decode (same pattern as video_visualize_fixed)
-            gpuDetector_ = new apriltag_gpu::GpuDetector(width, height, td_for_gpu, gpu_cam_, gpu_dist_);
-            // Store td_for_gpu so we can clean it up later (GpuDetector doesn't take ownership)
-            td_for_gpu_ = td_for_gpu;
-            qDebug() << "✓ CUDA detector initialized successfully!";
-        } catch (const std::exception& e) {
-            qDebug() << "Exception creating GpuDetector:" << e.what();
-            apriltag_detector_destroy(td_for_gpu);
-            if (td_gpu_) {
-                apriltag_detector_destroy(td_gpu_);
-                td_gpu_ = nullptr;
-            }
-            if (tf_gpu_) {
-                tag36h11_destroy(tf_gpu_);
-                tf_gpu_ = nullptr;
-            }
-        } catch (...) {
-            qDebug() << "Unknown exception creating GpuDetector";
-            apriltag_detector_destroy(td_for_gpu);
-            if (td_gpu_) {
-                apriltag_detector_destroy(td_gpu_);
-                td_gpu_ = nullptr;
-            }
-            if (tf_gpu_) {
-                tag36h11_destroy(tf_gpu_);
-                tf_gpu_ = nullptr;
-            }
-        }
-#endif
-    }
-    
     void loadImage1() {
         QString filename = QFileDialog::getOpenFileName(this, "Load Image 1", "", "Images (*.png *.jpg *.jpeg *.bmp)");
         if (!filename.isEmpty()) {
@@ -573,6 +381,192 @@ private slots:
             bool isMindVision = isMindVision_[index];
             algorithmMirrorCheckbox_->setChecked(isMindVision);
         }
+    }
+    
+    void onCaptureAlgorithmChanged(int index) {
+        // Initialize or cleanup algorithm based on selection
+        if (cameraOpen_) {
+            initializeCaptureAlgorithm();
+        }
+    }
+    
+    void savePatternVisualizations() {
+        std::cerr << "=== savePatternVisualizations() CALLED ===" << std::endl;
+        std::cerr.flush();
+        qDebug() << "=== savePatternVisualizations() CALLED ===";
+        qDebug() << "Button clicked, entering function...";
+        
+        std::lock_guard<std::mutex> lock(storedPatternsMutex_);
+        std::cerr << "storedPatterns_.size() = " << storedPatterns_.size() << std::endl;
+        std::cerr.flush();
+        qDebug() << "savePatternVisualizations: storedPatterns_.size() =" << storedPatterns_.size();
+        
+        if (storedPatterns_.empty()) {
+            QMessageBox::information(this, "Save Patterns", "No patterns to save. Please detect tags first.");
+            return;
+        }
+        
+        // Default save directory: output/pattern_visualizations/ (relative to workspace root, not build dir)
+        QString workspaceRoot = QDir::currentPath();
+        // If we're in build directory, go up to workspace root
+        if (workspaceRoot.endsWith("/build") || workspaceRoot.endsWith("/Tools/build")) {
+            workspaceRoot = QFileInfo(workspaceRoot).absolutePath();
+            if (workspaceRoot.endsWith("/Tools")) {
+                workspaceRoot = QFileInfo(workspaceRoot).absolutePath();
+            }
+        }
+        QString defaultDir = workspaceRoot + "/output/pattern_visualizations";
+        qDebug() << "Workspace root:" << workspaceRoot;
+        qDebug() << "Saving to directory:" << defaultDir;
+        
+        // Convert to absolute path
+        QDir defaultDirObj(defaultDir);
+        QString dir = defaultDirObj.absolutePath();
+        
+        // Create directory if it doesn't exist
+        bool dirCreated = QDir().mkpath(dir);
+        qDebug() << "Directory creation result:" << dirCreated;
+        
+        if (!dirCreated) {
+            QMessageBox::warning(this, "Error", QString("Failed to create directory: %1").arg(dir));
+            return;
+        }
+        
+        // Verify directory exists and is writable
+        QDir selectedDir(dir);
+        if (!selectedDir.exists()) {
+            QMessageBox::warning(this, "Error", QString("Directory does not exist: %1").arg(dir));
+            return;
+        }
+        if (!QFileInfo(dir).isWritable()) {
+            QMessageBox::warning(this, "Error", QString("Directory is not writable: %1").arg(dir));
+            return;
+        }
+        
+        std::cerr << "Saving patterns to: " << std::string(dir.toLocal8Bit().constData()) << std::endl;
+        std::cerr.flush();
+        
+        // Generate timestamp for filenames
+        QDateTime now = QDateTime::currentDateTime();
+        QString timestamp = now.toString("yyyyMMdd_hhmmss");
+        
+        int savedCount = 0;
+        for (size_t i = 0; i < storedPatterns_.size(); i++) {
+            const StoredPatternData& sp = storedPatterns_[i];
+            
+            // Create visualization image: warped image on left, pattern on right
+            int tagSize = 36;
+            int displaySize = 200;  // Size for each part (warped + pattern)
+            int spacing = 10;
+            int padding = 20;
+            int totalWidth = displaySize * 2 + spacing + padding * 2;
+            int totalHeight = displaySize + padding * 2 + 40;  // Extra space for header
+            
+            Mat vis = Mat::ones(totalHeight, totalWidth, CV_8UC3) * 240;
+            
+            // Header
+            stringstream header;
+            header << "Tag ID: " << sp.tag_id;
+            putText(vis, header.str(), Point(padding, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 0), 2);
+            
+            // Draw warped image (left side)
+            if (!sp.warped_image.empty()) {
+                Mat warped_resized;
+                cv::resize(sp.warped_image, warped_resized, Size(displaySize, displaySize), 0, 0, INTER_NEAREST);
+                Mat warped_bgr;
+                if (warped_resized.channels() == 1) {
+                    cvtColor(warped_resized, warped_bgr, COLOR_GRAY2BGR);
+                } else {
+                    warped_bgr = warped_resized;
+                }
+                warped_bgr.copyTo(vis(Rect(padding, padding + 40, displaySize, displaySize)));
+                rectangle(vis, Rect(padding, padding + 40, displaySize, displaySize), Scalar(0, 0, 255), 2);
+                putText(vis, "Warped", Point(padding, padding + 35), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 255), 1);
+            }
+            
+            // Draw digitized pattern (right side) - 8x8 grid with border
+            // Tag36h11: 8x8 cells total, 1-cell black border, 6x6 data region
+            // Scale to 75% to fit width better
+            int patternX = padding + displaySize + spacing;
+            int cellSize = (int)((displaySize / 8) * 0.75);  // 8x8 grid, 75% of original size
+            if (sp.pattern.size() == 6 && sp.pattern[0].size() == 6) {
+                // Draw border cells (all black)
+                // Top row (row 0)
+                for (int c = 0; c < 8; c++) {
+                    int y_pos = padding + 40;
+                    int x_pos = patternX + c * cellSize;
+                    Rect cell(x_pos, y_pos, cellSize, cellSize);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                // Bottom row (row 7)
+                for (int c = 0; c < 8; c++) {
+                    int y_pos = padding + 40 + 7 * cellSize;
+                    int x_pos = patternX + c * cellSize;
+                    Rect cell(x_pos, y_pos, cellSize, cellSize);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                // Left column (col 0, rows 1-6)
+                for (int r = 1; r < 7; r++) {
+                    int y_pos = padding + 40 + r * cellSize;
+                    int x_pos = patternX;
+                    Rect cell(x_pos, y_pos, cellSize, cellSize);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                // Right column (col 7, rows 1-6)
+                for (int r = 1; r < 7; r++) {
+                    int y_pos = padding + 40 + r * cellSize;
+                    int x_pos = patternX + 7 * cellSize;
+                    Rect cell(x_pos, y_pos, cellSize, cellSize);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                
+                // Draw 6x6 data pattern in center (rows 1-6, columns 1-6)
+                for (int r = 0; r < 6; r++) {
+                    for (int c = 0; c < 6; c++) {
+                        int val = sp.pattern[r][c];
+                        bool is_black = val < 128;
+                        
+                        Scalar color = is_black ? Scalar(0, 0, 0) : Scalar(255, 255, 255);
+                        // Map 6x6 pattern (r,c) to 8x8 grid position (r+1, c+1)
+                        int y_pos = padding + 40 + (r + 1) * cellSize;
+                        int x_pos = patternX + (c + 1) * cellSize;
+                        Rect cell(x_pos, y_pos, cellSize, cellSize);
+                        rectangle(vis, cell, color, -1);
+                        rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                    }
+                }
+                rectangle(vis, Rect(patternX, padding + 40, displaySize, displaySize), Scalar(255, 0, 0), 2);
+                putText(vis, "Digitized (8x8: border + data)", Point(patternX, padding + 35), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 0, 0), 1);
+            }
+            
+            // Save image
+            QString filename = QString("%1/tag_%2_%3.png").arg(dir).arg(sp.tag_id).arg(timestamp);
+            string filename_std = filename.toStdString();
+            std::cerr << "Attempting to save pattern to: " << filename_std << std::endl;
+            std::cerr.flush();
+            qDebug() << "Attempting to save pattern to:" << filename;
+            
+            bool saved = imwrite(filename_std, vis);
+            if (saved) {
+                savedCount++;
+                std::cerr << "Successfully saved: " << filename_std << std::endl;
+                std::cerr.flush();
+                qDebug() << "Successfully saved:" << filename;
+            } else {
+                std::cerr << "FAILED to save: " << filename_std << std::endl;
+                std::cerr.flush();
+                qDebug() << "Failed to save:" << filename;
+            }
+        }
+        
+        std::cerr << "Save complete. savedCount=" << savedCount << std::endl;
+        std::cerr.flush();
+        qDebug() << "Saved" << savedCount << "pattern visualization(s) to:" << dir;
+        // Don't show message box - just log to console to avoid hanging the GUI
     }
     
     void startAlgorithm() {
@@ -745,7 +739,7 @@ private slots:
         // Check which algorithm is selected
         int algorithmIndex = algorithmCombo_->currentIndex();
         
-        // Initialize algorithm class for CPU (index 0) or Fast AprilTag (index 2)
+        // Initialize algorithm class for CPU (index 0) or Fast AprilTag (index 1)
         if (algorithmIndex == 0) {
             // CPU algorithm
             AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::CPU;
@@ -776,8 +770,7 @@ private slots:
                 return;
             }
             qDebug() << "CPU algorithm initialized successfully with dimensions:" << width << "x" << height;
-            useCudaAlgorithm_ = false;  // Don't use old CUDA code
-        } else if (algorithmIndex == 2) {
+        } else if (algorithmIndex == 1) {
 #ifdef HAVE_CUDA_APRILTAG
             AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::FAST_APRILTAG;
             currentAlgorithm_ = AprilTagAlgorithmFactory::create(algoType);
@@ -801,38 +794,19 @@ private slots:
                 height = static_cast<int>(algorithmCamera_.get(CAP_PROP_FRAME_HEIGHT));
             }
             
-            // Delay initialization until camera stabilizes (like regular CUDA algorithm)
+            // Delay initialization until camera stabilizes
             // Store dimensions for later initialization
             // Will be initialized in initializeFastAprilTagDetector() slot after 2 seconds
             qDebug() << "Fast AprilTag algorithm will initialize after 2 seconds with dimensions:" << width << "x" << height;
-            useCudaAlgorithm_ = false;  // Don't use old CUDA code
 #else
             QMessageBox::warning(this, "Error", "Fast AprilTag requires CUDA support. Please compile with CUDA.");
             algorithmRunning_ = false;
             return;
 #endif
         } else {
-            // CPU or CUDA GPU - use existing code
-            currentAlgorithm_.reset();
-            
-#ifdef HAVE_CUDA_APRILTAG
-            useCudaAlgorithm_ = (algorithmIndex == 1);  // Index 1 = CUDA-based
-            useFastVideoAlgorithm_ = false;  // Not used without video support
-            
-            // For CUDA algorithm, delay detector initialization until camera stabilizes
-            // Detector will be initialized after 2 seconds via initializeCudaDetector() slot
-            if (useCudaAlgorithm_) {
-                // Regular CUDA with camera - delay initialization
-                // Variables will be initialized in initializeCudaDetector()
-                qDebug() << "CUDA algorithm selected - detector will initialize after 2 seconds";
-            }
-#else
-            if (algorithmIndex == 1) {
-                QMessageBox::warning(this, "Error", "CUDA AprilTag library not available. Please compile with CUDA support.");
-                algorithmRunning_ = false;
-                return;
-            }
-#endif
+            QMessageBox::warning(this, "Error", QString("Unknown algorithm index: %1").arg(algorithmIndex));
+            algorithmRunning_ = false;
+            return;
         }
         
         // Start threads with error handling
@@ -872,13 +846,9 @@ private slots:
         algorithmStartBtn_->setEnabled(false);
         algorithmStopBtn_->setEnabled(true);
         
-        // Schedule delayed initialization after 2 seconds for CUDA-based algorithms
+        // Schedule delayed initialization after 2 seconds for Fast AprilTag
 #ifdef HAVE_CUDA_APRILTAG
-        if (useCudaAlgorithm_ && algorithmIndex != 2) {
-            // Regular CUDA - delay for camera stabilization
-            QTimer::singleShot(2000, this, &AprilTagDebugGUI::initializeCudaDetector);
-            qDebug() << "Scheduled CUDA detector initialization in 2 seconds";
-        } else if (algorithmIndex == 2 && currentAlgorithm_) {
+        if (algorithmIndex == 1 && currentAlgorithm_) {
             // Fast AprilTag - delay for camera stabilization
             QTimer::singleShot(2000, this, &AprilTagDebugGUI::initializeFastAprilTagDetector);
             qDebug() << "Scheduled Fast AprilTag detector initialization in 2 seconds";
@@ -945,26 +915,6 @@ private slots:
             latestDetections_.clear();
             latestDetectedFrame_ = Mat();
         }
-        
-#ifdef HAVE_CUDA_APRILTAG
-        if (gpuDetector_) {
-            delete gpuDetector_;
-            gpuDetector_ = nullptr;
-        }
-        if (td_for_gpu_) {
-            apriltag_detector_destroy(td_for_gpu_);
-            td_for_gpu_ = nullptr;
-        }
-        if (td_gpu_) {
-            apriltag_detector_destroy(td_gpu_);
-            td_gpu_ = nullptr;
-        }
-        if (tf_gpu_) {
-            tag36h11_destroy(tf_gpu_);
-            tf_gpu_ = nullptr;
-        }
-        useCudaAlgorithm_ = false;
-#endif
         
         algorithmStartBtn_->setEnabled(true);
         algorithmStopBtn_->setEnabled(false);
@@ -1192,184 +1142,6 @@ private:
                     }
                 }
             }
-#ifdef HAVE_CUDA_APRILTAG
-            // Use CUDA GPU detector if selected (existing code, index 1)
-            else if (useCudaAlgorithm_) {
-                // Check if GPU detector is initialized (it takes 2 seconds to initialize)
-                if (!gpuDetector_) {
-                    // Detector not yet initialized, create empty detections array and skip
-                    {
-                        std::unique_lock<std::mutex> lock(cudaDebugInfoMutex_);
-                        cudaDebugInfo_.detector_initialized = false;
-                        cudaDebugInfo_.num_quads = 0;
-                        cudaDebugInfo_.num_detections_before_scale = 0;
-                        cudaDebugInfo_.num_detections_after_scale = 0;
-                    }
-                    detections = zarray_create(sizeof(apriltag_detection_t *));
-                    // Continue to display thread with empty detections
-                } else {
-                    // GPU detector is initialized, proceed with CUDA detection
-                    try {
-                        // Validate frame dimensions match detector
-                        int detector_width = gpuDetector_->Width();
-                        int detector_height = gpuDetector_->Height();
-                        
-                        if (gray.cols != detector_width || gray.rows != detector_height) {
-                            cerr << "Error: Frame size mismatch: " << gray.cols << "x" << gray.rows 
-                                 << " expected " << detector_width << "x" << detector_height << endl;
-                            detections = zarray_create(sizeof(apriltag_detection_t *));
-                        } else if (gray.data == nullptr || gray.empty()) {
-                            cerr << "Error: Invalid frame data for CUDA detection" << endl;
-                            detections = zarray_create(sizeof(apriltag_detection_t *));
-                        } else {
-                            // EXACT COPY from video_visualize_fixed.cu - no changes
-                            // Check frame validity
-                            if (gray.cols != gpuDetector_->Width() || gray.rows != gpuDetector_->Height()) {
-                                qDebug() << "CUDA ERROR: Frame size mismatch:" << gray.cols << "x" << gray.rows 
-                                         << "expected" << gpuDetector_->Width() << "x" << gpuDetector_->Height();
-                                detections = zarray_create(sizeof(apriltag_detection_t *));
-                            } else if (!gray.isContinuous()) {
-                                qDebug() << "CUDA ERROR: Frame is not contiguous";
-                                detections = zarray_create(sizeof(apriltag_detection_t *));
-                            } else {
-                                // Always use original frame for detection (mirroring will be applied to coordinates after detection)
-                                // Stage 1: GPU-only detection on this frame.
-                                gpuDetector_->DetectGpuOnly(gray.data);
-                                
-                                // Check if mirroring is enabled
-                                bool use_mirror = algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked();
-                                qDebug() << "CUDA: use_mirror =" << use_mirror << "frame size:" << gray.cols << "x" << gray.rows;
-                            
-                                // EXACT COPY from video_visualize_fixed.cu - Build decode job
-                                // FitQuads returns quads in full resolution (after AdjustPixelCenters)
-                                // CopyGrayHostTo returns full resolution gray image
-                                // So we use both in full resolution, then scale detection results afterward
-                                auto quads_fullres = gpuDetector_->FitQuads();
-                                
-                                // Mirror gray image on GPU if requested (faster than CPU)
-                                if (use_mirror) {
-                                    gpuDetector_->MirrorGrayImageOnGpu();
-                                    // Also mirror quad coordinates (on CPU, they're small)
-                                    int gray_width = gpuDetector_->Width();  // Full resolution width
-                                    for (auto& quad : quads_fullres) {
-                                        // Mirror x coordinates for all 4 corners
-                                        for (int i = 0; i < 4; i++) {
-                                            quad.corners[i][0] = gray_width - 1 - quad.corners[i][0];
-                                        }
-                                        // Swap corners to maintain correct orientation: 0<->1, 2<->3
-                                        float temp[2];
-                                        temp[0] = quad.corners[0][0]; temp[1] = quad.corners[0][1];
-                                        quad.corners[0][0] = quad.corners[1][0]; quad.corners[0][1] = quad.corners[1][1];
-                                        quad.corners[1][0] = temp[0]; quad.corners[1][1] = temp[1];
-                                        
-                                        temp[0] = quad.corners[2][0]; temp[1] = quad.corners[2][1];
-                                        quad.corners[2][0] = quad.corners[3][0]; quad.corners[2][1] = quad.corners[3][1];
-                                        quad.corners[3][0] = temp[0]; quad.corners[3][1] = temp[1];
-                                    }
-                                }
-                                
-                                // Copy full-resolution gray image from GPU
-                                vector<uint8_t> gray_host(gpuDetector_->Width() * gpuDetector_->Height());
-                                gpuDetector_->CopyGrayHostTo(gray_host);
-                                
-                                int num_quads = quads_fullres.size();
-                                {
-                                    std::unique_lock<std::mutex> lock(cudaDebugInfoMutex_);
-                                    cudaDebugInfo_.num_quads = num_quads;
-                                    cudaDebugInfo_.detector_initialized = true;
-                                }
-                                
-                                // Use full-resolution quads
-                                std::vector<apriltag_gpu::QuadCorners> quads = quads_fullres;
-                                
-                                // Create temporary arrays for decode
-                                zarray_t *poly0 = g2d_polygon_create_zeros(4);
-                                zarray_t *poly1 = g2d_polygon_create_zeros(4);
-                                zarray_t *temp_detections = zarray_create(sizeof(apriltag_detection_t *));
-                                
-                                // Decode tags (EXACT COPY from video_visualize_fixed.cu)
-                                frc971::apriltag::DecodeTagsFromQuads(
-                                    quads, gray_host.data(), gpuDetector_->Width(), gpuDetector_->Height(),
-                                    td_gpu_, gpu_cam_, gpu_dist_, temp_detections, poly0, poly1);
-                                
-                                detections = temp_detections;
-                                // Clean up poly arrays, keep detections
-                                // Note: g2d_polygon_destroy is from g2d.h (external C library)
-                                // These are temporary arrays, cleanup handled by library
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        qDebug() << "Exception in CUDA detection:" << e.what();
-                        detections = zarray_create(sizeof(apriltag_detection_t *));
-                    } catch (...) {
-                        qDebug() << "Unknown exception in CUDA detection";
-                        detections = zarray_create(sizeof(apriltag_detection_t *));
-                    }
-                }
-            } else
-#endif
-            {
-                // CPU detection - apply mirroring if enabled (before detection)
-                bool use_mirror_cpu = algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked();
-                Mat gray_for_detection;
-                if (use_mirror_cpu) {
-                    flip(gray, gray_for_detection, 1);  // 1 = horizontal flip
-                } else {
-                    gray_for_detection = gray;
-                }
-                
-                // Debug: Save CPU frames for comparison (first CPU frame only)
-                {
-                    static int cpu_debug_counter = 0;
-                    if (cpu_debug_counter < 1) {
-                        cpu_debug_counter++;
-                        // Save original gray frame
-                        imwrite("/tmp/debug_cpu_original_gray.png", gray);
-                        // Save mirrored gray (if mirroring was applied)
-                        if (use_mirror_cpu) {
-                            imwrite("/tmp/debug_cpu_mirrored_gray.png", gray_for_detection);
-                        } else {
-                            imwrite("/tmp/debug_cpu_mirrored_gray.png", gray_for_detection);  // Same as original if no mirror
-                        }
-                        // Save the exact image used for detection
-                        imwrite("/tmp/debug_cpu_detector_gray.png", gray_for_detection);
-                        qDebug() << "Saved CPU debug frames to /tmp/debug_cpu_*.png";
-                    }
-                }
-                
-                image_u8_t im = {
-                    .width = gray_for_detection.cols,
-                    .height = gray_for_detection.rows,
-                    .stride = gray_for_detection.cols,
-                    .buf = gray_for_detection.data
-                };
-                
-                detections = apriltag_detector_detect(td_, &im);
-                
-                // Debug: Draw CPU detections/quads if available (first CPU frame only)
-                if (detections && zarray_size(detections) > 0) {
-                    static int cpu_det_debug_counter = 0;
-                    if (cpu_det_debug_counter < 1) {
-                        cpu_det_debug_counter++;
-                        Mat detections_vis = gray_for_detection.clone();
-                        cvtColor(detections_vis, detections_vis, COLOR_GRAY2BGR);
-                        for (int i = 0; i < zarray_size(detections); i++) {
-                            apriltag_detection_t *det;
-                            zarray_get(detections, i, &det);
-                            for (int j = 0; j < 4; j++) {
-                                int x1 = static_cast<int>(det->p[j][0]);
-                                int y1 = static_cast<int>(det->p[j][1]);
-                                int x2 = static_cast<int>(det->p[(j+1)%4][0]);
-                                int y2 = static_cast<int>(det->p[(j+1)%4][1]);
-                                line(detections_vis, Point(x1, y1), Point(x2, y2), Scalar(0, 255, 0), 2);
-                            }
-                            putText(detections_vis, to_string(det->id), Point(static_cast<int>(det->c[0]), static_cast<int>(det->c[1])),
-                                    FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 2);
-                        }
-                        imwrite("/tmp/debug_cpu_detections.png", detections_vis);
-                    }
-                }
-            }
             detectionFrameCount_++;
             
             // Update detection FPS every 30 frames
@@ -1470,13 +1242,12 @@ private:
                         num_detections_drawn++;
                     } else {
                         // Log invalid coordinates for debugging
-                        qDebug() << "CUDA: Detection" << i << "has invalid coordinates - frame:" 
+                        qDebug() << "Detection" << i << "has invalid coordinates - frame:" 
                                  << detected.cols << "x" << detected.rows
                                  << "corners:" << det->p[0][0] << "," << det->p[0][1] << "...";
                     }
                     
-                    // Only destroy detections for Fast AprilTag (it owns them)
-                    // For CUDA algorithm, GPU detector manages detections
+                    // Destroy detections (all algorithms own their detections)
                     if (currentAlgorithm_) {
                         apriltag_detection_destroy(det);
                     }
@@ -1489,25 +1260,9 @@ private:
                 overhead_draw_ms += chrono::duration<double, milli>(draw_end - draw_start).count();
             }
             
-            // Update debug info with number of drawn detections
-#ifdef HAVE_CUDA_APRILTAG
-            if (useCudaAlgorithm_) {
-                std::unique_lock<std::mutex> lock(cudaDebugInfoMutex_);
-                cudaDebugInfo_.num_detections_after_scale = num_detections_drawn;
-            }
-#endif
-            
-            // Destroy detections array
-            // For Fast AprilTag: destroy the array (detections already destroyed above)
-            // For CUDA algorithm: don't destroy (GPU detector manages them)
+            // Destroy detections array (all algorithms own their detections)
             if (detections) {
-#ifdef HAVE_CUDA_APRILTAG
-                if (!useCudaAlgorithm_ || !gpuDetector_) {
-                    zarray_destroy(detections);
-                }
-#else
                 zarray_destroy(detections);
-#endif
             }
             
             // Measure frame copying time
@@ -1622,20 +1377,6 @@ private:
         // Update quality metrics
         if (algorithmQualityText_) {
             QString qualityText;
-            
-            // Add CUDA debug info if using CUDA algorithm
-#ifdef HAVE_CUDA_APRILTAG
-            if (useCudaAlgorithm_) {
-                std::unique_lock<std::mutex> debugLock(cudaDebugInfoMutex_);
-                qualityText += "=== CUDA DEBUG INFO ===\n";
-                qualityText += QString("Detector Initialized: %1\n").arg(cudaDebugInfo_.detector_initialized ? "Yes" : "No");
-                qualityText += QString("Quads Found: %1\n").arg(cudaDebugInfo_.num_quads);
-                qualityText += QString("Detections (before scale): %1\n").arg(cudaDebugInfo_.num_detections_before_scale);
-                qualityText += QString("Detections (after scale): %1\n").arg(cudaDebugInfo_.num_detections_after_scale);
-                qualityText += "\n";
-                debugLock.unlock();
-            }
-#endif
             
             if (latestDetections_.empty()) {
                 qualityText += "No detections";
@@ -2261,16 +2002,61 @@ private:
     }
     
     // Extract 6x6 pattern from warped tag image
+    // Tag36h11 is 8x8 cells: 1-cell black border on all sides, 6x6 data region in center
+    // The extracted 6x6 pattern contains ONLY data cells (no border)
     vector<vector<int>> extractPattern(const Mat& warped, int tagSize = 36, int borderSize = 4) {
-        int dataSize = tagSize - 2 * borderSize;
+        // Calculate border size: Tag36h11 is 8x8 cells, so border = tagSize / 8
+        // Use provided borderSize if it makes sense, otherwise calculate
+        if (borderSize <= 0) {
+            borderSize = tagSize / 8;  // Tag36h11: 8 cells total, 1 cell border
+        }
+        
+        // Add a small margin to avoid sampling too close to the border
+        // This helps avoid edge cases where border pixels leak into data region
+        int borderMargin = max(1, borderSize / 4);  // Add ~25% margin, minimum 1 pixel
+        int effectiveBorderSize = borderSize + borderMargin;
+        
+        // Debug: Sample border pixels to verify border detection
+        static int debug_count = 0;
+        if (debug_count < 5) {
+            qDebug() << "=== Pattern Extraction Debug #" << debug_count << "===";
+            qDebug() << "tagSize:" << tagSize << "borderSize:" << borderSize << "effectiveBorderSize:" << effectiveBorderSize;
+            // Sample border pixels (should be black/dark)
+            vector<pair<string, Point>> border_samples = {
+                {"Top-left", Point(borderSize/2, borderSize/2)},
+                {"Top-center", Point(tagSize/2, borderSize/2)},
+                {"Top-right", Point(tagSize - borderSize/2, borderSize/2)},
+                {"Left-center", Point(borderSize/2, tagSize/2)},
+                {"Right-center", Point(tagSize - borderSize/2, tagSize/2)},
+                {"Bottom-left", Point(borderSize/2, tagSize - borderSize/2)},
+                {"Bottom-center", Point(tagSize/2, tagSize - borderSize/2)},
+                {"Bottom-right", Point(tagSize - borderSize/2, tagSize - borderSize/2)}
+            };
+            for (auto& sample : border_samples) {
+                int x = min(max(0, sample.second.x), tagSize - 1);
+                int y = min(max(0, sample.second.y), tagSize - 1);
+                int val = (int)warped.at<uchar>(y, x);
+                qDebug() << "Border" << sample.first.c_str() << "(" << x << "," << y << "):" << val << (val < 128 ? "BLACK" : "WHITE");
+            }
+            debug_count++;
+        }
+        
+        // Use effectiveBorderSize to ensure we're well inside the data region
+        int dataSize = tagSize - 2 * effectiveBorderSize;
         int cellSize = dataSize / 6;
+        
+        qDebug() << "dataSize:" << dataSize << "cellSize:" << cellSize << "borderMargin:" << borderMargin;
         
         vector<vector<int>> pattern(6, vector<int>(6));
         
+        // Extract 6x6 data region (rows 1-6, columns 1-6 from 8x8 tag)
+        // This excludes the border, so all 6x6 cells are data bits
+        // Use effectiveBorderSize to sample further from the border edge
         for (int row = 0; row < 6; row++) {
             for (int col = 0; col < 6; col++) {
-                int x_center = borderSize + col * cellSize + cellSize / 2;
-                int y_center = borderSize + row * cellSize + cellSize / 2;
+                // Sample center of each data cell, starting from effectiveBorderSize
+                int x_center = effectiveBorderSize + col * cellSize + cellSize / 2;
+                int y_center = effectiveBorderSize + row * cellSize + cellSize / 2;
                 
                 x_center = min(max(0, x_center), tagSize - 1);
                 y_center = min(max(0, y_center), tagSize - 1);
@@ -3305,6 +3091,12 @@ private:
     }
     
     void setupCaptureTab(QVBoxLayout *layout) {
+        // Main horizontal split layout (left: controls, right: preview/pattern)
+        QHBoxLayout *mainSplitLayout = new QHBoxLayout();
+        
+        // ========== LEFT HALF: Controls ==========
+        QVBoxLayout *leftControlsLayout = new QVBoxLayout();
+        
         // Camera selection
         QGroupBox *cameraGroup = new QGroupBox("Camera Selection", this);
         QHBoxLayout *cameraLayout = new QHBoxLayout();
@@ -3316,7 +3108,7 @@ private:
         cameraLayout->addWidget(cameraCombo_);
         cameraLayout->addStretch();
         cameraGroup->setLayout(cameraLayout);
-        layout->addWidget(cameraGroup);
+        leftControlsLayout->addWidget(cameraGroup);
         
         // Resolution/FPS selection
         QGroupBox *modeGroup = new QGroupBox("Resolution & FPS", this);
@@ -3330,7 +3122,7 @@ private:
         modeLayout->addWidget(modeCombo_);
         modeLayout->addStretch();
         modeGroup->setLayout(modeLayout);
-        layout->addWidget(modeGroup);
+        leftControlsLayout->addWidget(modeGroup);
         
         // Camera settings
         QGroupBox *settingsGroup = new QGroupBox("Camera Settings", this);
@@ -3433,36 +3225,97 @@ private:
         settingsLayout->addRow("Sharpness:", sharpnessLayout);
         
         settingsGroup->setLayout(settingsLayout);
-        layout->addWidget(settingsGroup);
+        leftControlsLayout->addWidget(settingsGroup);
         
-        // Preview and controls
-        QHBoxLayout *previewLayout = new QHBoxLayout();
+        // Algorithm selection for preview
+        QGroupBox *algorithmGroup = new QGroupBox("AprilTag Detection (Preview)", this);
+        QVBoxLayout *algorithmLayout = new QVBoxLayout();
+        
+        QHBoxLayout *algorithmSelectLayout = new QHBoxLayout();
+        QLabel *algorithmLabel = new QLabel("Algorithm:", this);
+        captureAlgorithmCombo_ = new QComboBox(this);
+        captureAlgorithmCombo_->addItem("None");
+        captureAlgorithmCombo_->addItem("OpenCV CPU (AprilTag)");
+#ifdef HAVE_CUDA_APRILTAG
+        captureAlgorithmCombo_->addItem("Fast AprilTag");
+#endif
+        connect(captureAlgorithmCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, &AprilTagDebugGUI::onCaptureAlgorithmChanged);
+        algorithmSelectLayout->addWidget(algorithmLabel);
+        algorithmSelectLayout->addWidget(captureAlgorithmCombo_);
+        algorithmSelectLayout->addStretch();
+        algorithmLayout->addLayout(algorithmSelectLayout);
+        
+        captureMirrorCheckbox_ = new QCheckBox("Mirror (Horizontal Flip)", this);
+        algorithmLayout->addWidget(captureMirrorCheckbox_);
+        
+        algorithmGroup->setLayout(algorithmLayout);
+        leftControlsLayout->addWidget(algorithmGroup);
+        
+        // Controls on left side
+        loadImageBtn_ = new QPushButton("Load Image", this);
+        connect(loadImageBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage1);
+        leftControlsLayout->addWidget(loadImageBtn_);
+        
+        captureBtn_ = new QPushButton("Capture Frame", this);
+        captureBtn_->setEnabled(false);
+        connect(captureBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::captureFrame);
+        leftControlsLayout->addWidget(captureBtn_);
+        
+        saveSettingsBtn_ = new QPushButton("Save Camera Settings", this);
+        saveSettingsBtn_->setEnabled(false);
+        connect(saveSettingsBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::saveCameraSettings);
+        leftControlsLayout->addWidget(saveSettingsBtn_);
+        
+        // Video preview on left side (bottom)
         previewLabel_ = new QLabel(this);
         previewLabel_->setMinimumSize(640, 480);
         previewLabel_->setAlignment(Qt::AlignCenter);
         previewLabel_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
         previewLabel_->setText("No camera selected");
-        previewLayout->addWidget(previewLabel_);
+        previewLabel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        leftControlsLayout->addWidget(previewLabel_);
         
-        QVBoxLayout *controlLayout = new QVBoxLayout();
-        loadImageBtn_ = new QPushButton("Load Image", this);
-        connect(loadImageBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage1);
-        controlLayout->addWidget(loadImageBtn_);
+        // ========== RIGHT HALF: Pattern Visualization Only ==========
+        QVBoxLayout *rightPreviewLayout = new QVBoxLayout();
         
-        captureBtn_ = new QPushButton("Capture Frame", this);
-        captureBtn_->setEnabled(false);
-        connect(captureBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::captureFrame);
-        controlLayout->addWidget(captureBtn_);
+        // Pattern visualization
+        QGroupBox *patternGroup = new QGroupBox("Pattern Visualization", this);
+        QVBoxLayout *patternGroupLayout = new QVBoxLayout();
+        capturePatternLabel_ = new QLabel("No detection", this);
+        capturePatternLabel_->setMinimumSize(400, 400);
+        capturePatternLabel_->setAlignment(Qt::AlignCenter);
+        capturePatternLabel_->setStyleSheet("border: 1px solid black; background-color: #f0f0f0;");
+        capturePatternLabel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        patternGroupLayout->addWidget(capturePatternLabel_);
         
-        saveSettingsBtn_ = new QPushButton("Save Camera Settings", this);
-        saveSettingsBtn_->setEnabled(false);
-        connect(saveSettingsBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::saveCameraSettings);
-        controlLayout->addWidget(saveSettingsBtn_);
+        // Save patterns button
+        savePatternsBtn_ = new QPushButton("Save Pattern Visualizations", this);
+        savePatternsBtn_->setEnabled(false);
+        connect(savePatternsBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::savePatternVisualizations);
+        patternGroupLayout->addWidget(savePatternsBtn_);
         
-        controlLayout->addStretch();
+        patternGroup->setLayout(patternGroupLayout);
+        rightPreviewLayout->addWidget(patternGroup);
         
-        previewLayout->addLayout(controlLayout);
-        layout->addLayout(previewLayout);
+        // Pattern info text
+        capturePatternInfoText_ = new QTextEdit(this);
+        capturePatternInfoText_->setReadOnly(true);
+        capturePatternInfoText_->setFont(QFont("Courier", 9));
+        capturePatternInfoText_->setPlainText("Pattern and Hamming code will appear here when tags are detected.");
+        capturePatternInfoText_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        rightPreviewLayout->addWidget(capturePatternInfoText_);
+        
+        // Add both halves to main split layout with equal stretch
+        QWidget *leftContainer = new QWidget(this);
+        leftContainer->setLayout(leftControlsLayout);
+        mainSplitLayout->addWidget(leftContainer, 1);  // Stretch factor 1 (50%)
+        
+        QWidget *rightContainer = new QWidget(this);
+        rightContainer->setLayout(rightPreviewLayout);
+        mainSplitLayout->addWidget(rightContainer, 1);  // Stretch factor 1 (50%)
+        
+        layout->addLayout(mainSplitLayout);
         
         // Setup preview timer FIRST (before enumerateCameras, which might trigger signals)
         previewTimer_ = new QTimer(this);
@@ -3494,7 +3347,6 @@ private:
         QLabel *algorithmLabel = new QLabel("Algorithm:", this);
         algorithmCombo_ = new QComboBox(this);
         algorithmCombo_->addItem("OpenCV CPU (AprilTag)");
-        algorithmCombo_->addItem("CUDA GPU (AprilTag)");
         algorithmCombo_->addItem("Fast AprilTag");
         algorithmLayout->addWidget(algorithmLabel);
         algorithmLayout->addWidget(algorithmCombo_);
@@ -4650,6 +4502,14 @@ private:
         saveSettingsBtn_->setEnabled(true);
         previewTimer_->start(33);  // ~30 FPS
         
+        // Initialize algorithm if one is selected
+        initializeCaptureAlgorithm();
+        
+        // Set mirror checkbox default based on camera type
+        if (captureMirrorCheckbox_) {
+            captureMirrorCheckbox_->setChecked(useMindVision_);
+        }
+        
         // Load camera settings from config file
         loadCameraSettings();
         
@@ -4679,6 +4539,85 @@ private:
         modeCombo_->setEnabled(false);
         modeCombo_->clear();
         previewLabel_->setText("Camera closed");
+        
+        // Clean up capture algorithm
+        if (captureAlgorithm_) {
+            captureAlgorithm_->cleanup();
+            captureAlgorithm_.reset();
+        }
+    }
+    
+    void initializeCaptureAlgorithm() {
+        // Clean up existing algorithm
+        if (captureAlgorithm_) {
+            captureAlgorithm_->cleanup();
+            captureAlgorithm_.reset();
+        }
+        
+        if (!captureAlgorithmCombo_ || captureAlgorithmCombo_->currentIndex() <= 0) {
+            return;  // No algorithm selected or "None" selected
+        }
+        
+        int algorithmIndex = captureAlgorithmCombo_->currentIndex();
+        
+        // Create algorithm instance
+        if (algorithmIndex == 1) {
+            // CPU algorithm
+            AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::CPU;
+            captureAlgorithm_ = AprilTagAlgorithmFactory::create(algoType);
+            if (captureAlgorithm_) {
+                // Get frame dimensions
+                int width = 1280, height = 1024;
+                Mat testFrame;
+                if (useMindVision_ && mvHandle_ != 0) {
+#ifdef HAVE_MINDVISION_SDK
+                    tSdkFrameHead frameHead;
+                    BYTE *pbyBuffer;
+                    if (CameraGetImageBuffer(mvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
+                        width = frameHead.iWidth;
+                        height = frameHead.iHeight;
+                        CameraReleaseImageBuffer(mvHandle_, pbyBuffer);
+                    }
+#endif
+                } else if (cameraCap_.isOpened()) {
+                    cameraCap_ >> testFrame;
+                    if (!testFrame.empty()) {
+                        width = testFrame.cols;
+                        height = testFrame.rows;
+                    }
+                }
+                captureAlgorithm_->initialize(width, height);
+            }
+        } else if (algorithmIndex == 2) {
+#ifdef HAVE_CUDA_APRILTAG
+            // Fast AprilTag
+            AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::FAST_APRILTAG;
+            captureAlgorithm_ = AprilTagAlgorithmFactory::create(algoType);
+            if (captureAlgorithm_) {
+                // Get frame dimensions
+                int width = 1280, height = 1024;
+                Mat testFrame;
+                if (useMindVision_ && mvHandle_ != 0) {
+#ifdef HAVE_MINDVISION_SDK
+                    tSdkFrameHead frameHead;
+                    BYTE *pbyBuffer;
+                    if (CameraGetImageBuffer(mvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
+                        width = frameHead.iWidth;
+                        height = frameHead.iHeight;
+                        CameraReleaseImageBuffer(mvHandle_, pbyBuffer);
+                    }
+#endif
+                } else if (cameraCap_.isOpened()) {
+                    cameraCap_ >> testFrame;
+                    if (!testFrame.empty()) {
+                        width = testFrame.cols;
+                        height = testFrame.rows;
+                    }
+                }
+                captureAlgorithm_->initialize(width, height);
+            }
+#endif
+        }
     }
     
     void updateCameraSettings() {
@@ -4791,11 +4730,756 @@ private:
                 currentFrame_ = frame_for_display.clone();
             }
             
+            // Run detection if algorithm is selected (before converting to display format)
+            zarray_t *detections = nullptr;
+            bool mirror = captureMirrorCheckbox_ && captureMirrorCheckbox_->isChecked();
+            if (captureAlgorithm_ && captureAlgorithmCombo_ && captureAlgorithmCombo_->currentIndex() > 0 && !frame_for_display.empty()) {
+                // Validate frame before processing
+                if (frame_for_display.data == nullptr || frame_for_display.rows <= 0 || frame_for_display.cols <= 0) {
+                    qDebug() << "Invalid frame for detection: data=" << (void*)frame_for_display.data 
+                             << "rows=" << frame_for_display.rows << "cols=" << frame_for_display.cols;
+                } else {
+                    try {
+                        // Always clone the frame first to ensure it's independent
+                        // Then convert to grayscale if needed (algorithms expect grayscale)
+                        Mat frame_for_detection;
+                        if (frame_for_display.channels() == 3) {
+                            cvtColor(frame_for_display, frame_for_detection, COLOR_BGR2GRAY);
+                        } else if (frame_for_display.channels() == 1) {
+                            frame_for_detection = frame_for_display.clone();
+                        } else {
+                            qDebug() << "Unsupported frame format: channels=" << frame_for_display.channels();
+                            frame_for_detection = Mat();
+                        }
+                        
+                        // Always ensure the frame is continuous and independent
+                        if (!frame_for_detection.empty() && !frame_for_detection.isContinuous()) {
+                            frame_for_detection = frame_for_detection.clone();
+                        }
+                        
+                        if (frame_for_detection.empty()) {
+                            qDebug() << "Failed to convert frame to grayscale for detection";
+                        } else {
+                            // Validate frame before processing
+                            if (frame_for_detection.data == nullptr || frame_for_detection.rows <= 0 || frame_for_detection.cols <= 0) {
+                                qDebug() << "Invalid frame_for_detection: data=" << (void*)frame_for_detection.data 
+                                         << "rows=" << frame_for_detection.rows << "cols=" << frame_for_detection.cols;
+                            } else {
+                                // Verify algorithm is still valid
+                                if (!captureAlgorithm_) {
+                                    qDebug() << "captureAlgorithm_ is null!";
+                                } else {
+                                    qDebug() << "Calling processFrame for algorithm:" << QString::fromStdString(captureAlgorithm_->getName());
+                                    qDebug() << "Frame info: rows=" << frame_for_detection.rows << "cols=" << frame_for_detection.cols 
+                                             << "channels=" << frame_for_detection.channels() << "data=" << (void*)frame_for_detection.data
+                                             << "mirror=" << mirror;
+                                    qDebug() << "About to call processFrame...";
+                                    std::cerr << "About to call processFrame..." << std::endl;
+                                    std::cerr.flush();
+                                    
+                                    // Verify algorithm object is valid before calling
+                                    if (!captureAlgorithm_) {
+                                        qDebug() << "ERROR: captureAlgorithm_ is null!";
+                                        std::cerr << "ERROR: captureAlgorithm_ is null!" << std::endl;
+                                        std::cerr.flush();
+                                    } else {
+                                        std::cerr << "captureAlgorithm_ pointer is valid: " << (void*)captureAlgorithm_.get() << std::endl;
+                                        std::cerr.flush();
+                                        
+                                        // Try to call with exception handling
+                                        try {
+                                            std::cerr << "Attempting to call processFrame..." << std::endl;
+                                            std::cerr.flush();
+                                            detections = captureAlgorithm_->processFrame(frame_for_detection, mirror);
+                                            std::cerr << "processFrame call succeeded" << std::endl;
+                                            std::cerr.flush();
+                                        } catch (const std::exception& e) {
+                                            qDebug() << "Exception caught in processFrame call:" << e.what();
+                                            std::cerr << "Exception caught in processFrame call: " << e.what() << std::endl;
+                                            std::cerr.flush();
+                                            detections = nullptr;
+                                        } catch (...) {
+                                            qDebug() << "Unknown exception caught in processFrame call";
+                                            std::cerr << "Unknown exception caught in processFrame call" << std::endl;
+                                            std::cerr.flush();
+                                            detections = nullptr;
+                                        }
+                                    }
+                                    qDebug() << "processFrame call completed";
+                                    std::cerr << "processFrame call completed" << std::endl;
+                                    qDebug() << "processFrame returned, detections pointer:" << (void*)detections;
+                                    // Validate returned detections pointer
+                                    if (detections != nullptr) {
+                                        // Try to get size to validate the array is valid
+                                        try {
+                                            int size = zarray_size(detections);
+                                            qDebug() << "Detections array size:" << size;
+                                            if (size < 0) {
+                                                qDebug() << "Invalid detections size:" << size;
+                                                // Don't destroy here - let the cleanup code handle it
+                                                detections = nullptr;
+                                            }
+                                        } catch (const std::exception& e) {
+                                            qDebug() << "Exception getting detections size:" << e.what();
+                                            // Don't destroy here - detections might be invalid
+                                            detections = nullptr;
+                                        } catch (...) {
+                                            qDebug() << "Unknown exception getting detections size";
+                                            // Don't destroy here - detections might be invalid
+                                            detections = nullptr;
+                                        }
+                                    } else {
+                                        qDebug() << "processFrame returned nullptr detections";
+                                    }
+                                }
+                                }
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        qDebug() << "Exception in processFrame:" << e.what();
+                        detections = nullptr;
+                    } catch (...) {
+                        qDebug() << "Unknown exception in processFrame";
+                        detections = nullptr;
+                    }
+                }
+            }
+            
             Mat display;
             if (frame_for_display.channels() == 1) {
                 cvtColor(frame_for_display, display, COLOR_GRAY2RGB);
             } else {
                 cvtColor(frame_for_display, display, COLOR_BGR2RGB);
+            }
+            
+            // Apply mirror to display frame if mirroring was used (so coordinates match)
+            // This matches the behavior in the Algorithms tab
+            if (mirror) {
+                flip(display, display, 1);  // Mirror display to match detection coordinates
+            }
+            
+            // Draw detections on display and extract patterns from all detections
+            // Save all detection data before destroying them
+            struct DetectionData {
+                int id;
+                double decision_margin;
+                int hamming;
+                vector<Point2f> corners;
+            };
+            vector<DetectionData> all_detections_data;
+            
+            if (detections) {
+                int num_detections = 0;
+                try {
+                    num_detections = zarray_size(detections);
+                } catch (...) {
+                    qDebug() << "Error getting detections array size";
+                    num_detections = 0;
+                }
+                
+                if (num_detections > 0) {
+                    // Save all detection data before processing
+                    for (int i = 0; i < num_detections; i++) {
+                        apriltag_detection_t* det = nullptr;
+                        try {
+                            zarray_get(detections, i, &det);
+                        } catch (...) {
+                            qDebug() << "Error getting detection" << i;
+                            continue;
+                        }
+                        if (det) {
+                            try {
+                                DetectionData data;
+                                // Validate detection structure before accessing
+                                if (det->p == nullptr || det->c == nullptr) {
+                                    qDebug() << "Invalid detection structure at index" << i;
+                                    continue;
+                                }
+                                data.id = det->id;
+                                data.decision_margin = det->decision_margin;
+                                data.hamming = det->hamming;
+                                // Save corners (will un-mirror later if needed)
+                                // Check for NaN or invalid values
+                                bool valid_corners = true;
+                                for (int j = 0; j < 4; j++) {
+                                    if (!isfinite(det->p[j][0]) || !isfinite(det->p[j][1])) {
+                                        valid_corners = false;
+                                        break;
+                                    }
+                                }
+                                if (!valid_corners) {
+                                    qDebug() << "Invalid corner coordinates in detection" << i;
+                                    continue;
+                                }
+                                data.corners.push_back(Point2f(det->p[0][0], det->p[0][1]));
+                                data.corners.push_back(Point2f(det->p[1][0], det->p[1][1]));
+                                data.corners.push_back(Point2f(det->p[2][0], det->p[2][1]));
+                                data.corners.push_back(Point2f(det->p[3][0], det->p[3][1]));
+                                all_detections_data.push_back(data);
+                            } catch (const std::exception& e) {
+                                qDebug() << "Error copying detection data" << i << ":" << e.what();
+                                continue;
+                            } catch (...) {
+                                qDebug() << "Error copying detection data" << i;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                // Draw detections on display
+                if (num_detections > 0 && detections) {
+                    for (int i = 0; i < num_detections; i++) {
+                        apriltag_detection_t *det = nullptr;
+                        try {
+                            zarray_get(detections, i, &det);
+                        } catch (...) {
+                            qDebug() << "Error getting detection for drawing" << i;
+                            continue;
+                        }
+                        
+                        if (!det) continue;
+                        
+                        // Validate detection structure
+                        if (det->p == nullptr || det->c == nullptr) {
+                            qDebug() << "Invalid detection structure for drawing at index" << i;
+                            continue;
+                        }
+                        
+                        // Validate coordinates are within frame bounds and are finite
+                        bool valid = true;
+                        for (int j = 0; j < 4; j++) {
+                            if (!isfinite(det->p[j][0]) || !isfinite(det->p[j][1])) {
+                                valid = false;
+                                break;
+                            }
+                            if (det->p[j][0] < 0 || det->p[j][0] >= display.cols ||
+                                det->p[j][1] < 0 || det->p[j][1] >= display.rows) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if (!isfinite(det->c[0]) || !isfinite(det->c[1])) {
+                            valid = false;
+                        } else if (det->c[0] < 0 || det->c[0] >= display.cols ||
+                                   det->c[1] < 0 || det->c[1] >= display.rows) {
+                            valid = false;
+                        }
+                        
+                        if (valid) {
+                            // Draw quad (green lines)
+                            line(display, Point((int)det->p[0][0], (int)det->p[0][1]), 
+                                 Point((int)det->p[1][0], (int)det->p[1][1]), Scalar(0, 255, 0), 2);
+                            line(display, Point((int)det->p[1][0], (int)det->p[1][1]), 
+                                 Point((int)det->p[2][0], (int)det->p[2][1]), Scalar(0, 255, 0), 2);
+                            line(display, Point((int)det->p[2][0], (int)det->p[2][1]), 
+                                 Point((int)det->p[3][0], (int)det->p[3][1]), Scalar(0, 255, 0), 2);
+                            line(display, Point((int)det->p[3][0], (int)det->p[3][1]), 
+                                 Point((int)det->p[0][0], (int)det->p[0][1]), Scalar(0, 255, 0), 2);
+                            
+                            // Draw ID
+                            putText(display, to_string(det->id), Point((int)det->c[0], (int)det->c[1]), 
+                                   FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 0), 2);
+                        }
+                        
+                        // Destroy individual detections (both algorithm and non-algorithm create new detections)
+                        apriltag_detection_destroy(det);
+                    }
+                }
+            }
+            
+            // Clean up detections array
+            // FastAprilTagAlgorithm creates a NEW zarray_t* each call that must be destroyed
+            // For direct CPU detection, we also need to destroy the array
+            if (detections) {
+                try {
+                    // Destroy individual detections first (if not already destroyed above)
+                    // Actually, we already destroyed them in the loop above, so just destroy the array
+                    zarray_destroy(detections);
+                } catch (...) {
+                    qDebug() << "Error destroying detections array";
+                }
+                detections = nullptr;
+            }
+            
+            // Extract and display patterns from all detections
+            // Skip pattern extraction if no detections or if frame is invalid
+            if (!all_detections_data.empty() && capturePatternLabel_ && capturePatternInfoText_ && 
+                !frame_for_display.empty() && frame_for_display.data != nullptr &&
+                frame_for_display.rows > 0 && frame_for_display.cols > 0) {
+                // Convert frame_for_display to grayscale if needed (use original before mirroring)
+                Mat gray_for_pattern = frame_for_display.clone();
+                if (gray_for_pattern.empty()) {
+                    // Frame clone failed, skip pattern extraction
+                } else {
+                    if (gray_for_pattern.channels() == 3) {
+                        cvtColor(frame_for_display, gray_for_pattern, COLOR_BGR2GRAY);
+                    }
+                    
+                    int num_tags = all_detections_data.size();
+                    
+                    // Extract patterns first (before calculating grid, since some may fail)
+                    struct PatternData {
+                        size_t detection_idx;  // Index into all_detections_data
+                        vector<vector<int>> pattern;
+                        Mat warped_image;  // The warped tag image before digitization
+                    };
+                    vector<PatternData> all_patterns;
+                for (size_t tag_idx = 0; tag_idx < all_detections_data.size(); tag_idx++) {
+                    const DetectionData& data = all_detections_data[tag_idx];
+                    
+                    // Safety check: ensure corners are valid
+                    if (data.corners.size() != 4) {
+                        continue; // Skip if corners are invalid
+                    }
+                    
+                    // Extract pattern from detection
+                    vector<Point2f> corners = data.corners;
+                    if (mirror) {
+                        // Un-mirror the coordinates (flip x coordinates)
+                        int frame_width = gray_for_pattern.cols;
+                        for (size_t i = 0; i < corners.size(); i++) {
+                            corners[i].x = frame_width - 1 - corners[i].x;
+                        }
+                        // Swap corners to maintain correct orientation after un-mirroring
+                        Point2f temp = corners[0];
+                        corners[0] = corners[1];
+                        corners[1] = temp;
+                        temp = corners[2];
+                        corners[2] = corners[3];
+                        corners[3] = temp;
+                    }
+                    
+                    // Validate corners before processing
+                    bool corners_valid = true;
+                    for (size_t i = 0; i < corners.size(); i++) {
+                        if (corners[i].x < 0 || corners[i].x >= gray_for_pattern.cols ||
+                            corners[i].y < 0 || corners[i].y >= gray_for_pattern.rows) {
+                            corners_valid = false;
+                            break;
+                        }
+                    }
+                    if (!corners_valid || corners.size() != 4) {
+                        continue; // Skip this detection if corners are invalid
+                    }
+                    
+                    // Refine corners
+                    try {
+                        refineCorners(gray_for_pattern, corners);
+                    } catch (...) {
+                        continue; // Skip if corner refinement fails
+                    }
+                    
+                    // Warp tag to square
+                    int tagSize = 36;
+                    vector<Point2f> dstQuad;
+                    dstQuad.push_back(Point2f(0, 0));
+                    dstQuad.push_back(Point2f(tagSize - 1, 0));
+                    dstQuad.push_back(Point2f(tagSize - 1, tagSize - 1));
+                    dstQuad.push_back(Point2f(0, tagSize - 1));
+                    
+                    Mat H;
+                    Mat warped;
+                    try {
+                        H = getPerspectiveTransform(corners, dstQuad);
+                        if (H.empty()) {
+                            continue; // Skip if transform matrix is invalid
+                        }
+                        warpPerspective(gray_for_pattern, warped, H, Size(tagSize, tagSize));
+                        if (warped.empty()) {
+                            continue; // Skip if warping failed
+                        }
+                    } catch (...) {
+                        continue; // Skip if transformation fails
+                    }
+                    
+                    // Extract pattern
+                    vector<vector<int>> pattern = extractPattern(warped, tagSize);
+                    PatternData pdata;
+                    pdata.detection_idx = tag_idx;
+                    pdata.pattern = pattern;
+                    pdata.warped_image = warped.clone();  // Store the warped image before digitization
+                    all_patterns.push_back(pdata);
+                }
+                
+                // Calculate grid layout based on successfully extracted patterns
+                int num_patterns = all_patterns.size();
+                if (num_patterns > 0) {
+                    // Calculate grid layout: try to make it roughly square
+                    int cols = (int)ceil(sqrt(num_patterns));
+                    int rows = (int)ceil((double)num_patterns / cols);
+                    
+                    // Determine cell size based on number of patterns (smaller when multiple)
+                    // Display 8x8 grid: 6x6 data + 1-cell black border on all sides
+                    // Scale to 75% to fit width better
+                    int base_cell_size = (num_patterns == 1) ? 50 : 30;
+                    int cell_size = (int)(base_cell_size * 0.75);  // 75% of original size
+                    if (cell_size < 1) cell_size = 1;  // Ensure minimum size
+                    int padding = (num_patterns == 1) ? 30 : 15;
+                    int grid_size = 8 * cell_size;  // 8x8 grid (6x6 data + border)
+                    int header_height = (num_patterns == 1) ? 40 : 25;
+                    int spacing = 10; // Space between multiple patterns
+                    
+                    // Calculate total visualization size
+                    // Each pattern cell includes: warped image (left) + digitized pattern (right)
+                    int warped_image_size = grid_size;  // Same size as pattern grid
+                    int cell_total_width = warped_image_size + spacing + grid_size;  // Warped image + spacing + pattern
+                    int total_width = cols * (cell_total_width + padding * 2) + (cols - 1) * spacing;
+                    int total_height = rows * (grid_size + padding * 2 + header_height) + (rows - 1) * spacing;
+                    
+                    // Ensure valid dimensions before creating Mat
+                    Mat pattern_vis;
+                    if (total_width > 0 && total_height > 0 && grid_size > 0 && cell_size > 0) {
+                        pattern_vis = Mat::ones(total_height, total_width, CV_8UC3) * 240;
+                    
+                    // Draw all successfully extracted patterns
+                    for (size_t pattern_idx = 0; pattern_idx < all_patterns.size(); pattern_idx++) {
+                        const PatternData& pdata = all_patterns[pattern_idx];
+                        // Safety check: ensure detection index is valid
+                        if (pdata.detection_idx >= all_detections_data.size()) {
+                            continue; // Skip if detection index is out of bounds
+                        }
+                        const DetectionData& data = all_detections_data[pdata.detection_idx];
+                        const vector<vector<int>>& pattern = pdata.pattern;
+                        
+                        // Safety check: ensure pattern is valid (6x6)
+                        if (pattern.size() != 6) {
+                            continue; // Skip if pattern has wrong number of rows
+                        }
+                        // Check all rows have correct size
+                        bool pattern_valid = true;
+                        for (size_t i = 0; i < pattern.size(); i++) {
+                            if (pattern[i].size() != 6) {
+                                pattern_valid = false;
+                                break;
+                            }
+                        }
+                        if (!pattern_valid) {
+                            continue; // Skip if pattern rows have wrong size
+                        }
+                        
+                        // Calculate position in grid
+                        int col = pattern_idx % cols;
+                        int row = pattern_idx / cols;
+                        int cell_total_width = warped_image_size + spacing + grid_size;
+                        int x_offset = col * (cell_total_width + padding * 2) + (col * spacing);
+                        int y_offset = row * (grid_size + padding * 2 + header_height) + (row * spacing);
+                        
+                        // Draw header
+                        stringstream header;
+                        header << "ID:" << data.id;
+                        putText(pattern_vis, header.str(), Point(x_offset + padding, y_offset + 20),
+                               FONT_HERSHEY_SIMPLEX, (num_patterns == 1) ? 0.5 : 0.4, Scalar(0, 0, 0), 1);
+                        
+                        // Draw warped image (before digitization) on the left
+                        if (!pdata.warped_image.empty() && pdata.warped_image.rows > 0 && pdata.warped_image.cols > 0) {
+                            Mat warped_resized;
+                            cv::resize(pdata.warped_image, warped_resized, Size(warped_image_size, warped_image_size), 0, 0, INTER_NEAREST);
+                            
+                            // Convert to BGR for display
+                            Mat warped_bgr;
+                            if (warped_resized.channels() == 1) {
+                                cvtColor(warped_resized, warped_bgr, COLOR_GRAY2BGR);
+                            } else {
+                                warped_bgr = warped_resized;
+                            }
+                            
+                            // DEBUG: Draw border extraction region on warped image
+                            int debug_tagSize = pdata.warped_image.rows;  // Original warped image size
+                            int debug_borderSize = (debug_tagSize <= 0) ? 4 : debug_tagSize / 8;
+                            int debug_borderMargin = max(1, debug_borderSize / 4);
+                            int debug_effectiveBorderSize = debug_borderSize + debug_borderMargin;
+                            double scale = (double)warped_image_size / debug_tagSize;
+                            
+                            // Draw actual border boundary (where border ends) in green
+                            int actual_border_x1 = (int)(debug_borderSize * scale);
+                            int actual_border_y1 = (int)(debug_borderSize * scale);
+                            int actual_border_x2 = (int)((debug_tagSize - debug_borderSize) * scale);
+                            int actual_border_y2 = (int)((debug_tagSize - debug_borderSize) * scale);
+                            // Top border line (green - actual border)
+                            line(warped_bgr, Point(0, actual_border_y1), Point(warped_image_size - 1, actual_border_y1), Scalar(0, 255, 0), 1);
+                            // Bottom border line (green)
+                            line(warped_bgr, Point(0, actual_border_y2), Point(warped_image_size - 1, actual_border_y2), Scalar(0, 255, 0), 1);
+                            // Left border line (green)
+                            line(warped_bgr, Point(actual_border_x1, 0), Point(actual_border_x1, warped_image_size - 1), Scalar(0, 255, 0), 1);
+                            // Right border line (green)
+                            line(warped_bgr, Point(actual_border_x2, 0), Point(actual_border_x2, warped_image_size - 1), Scalar(0, 255, 0), 1);
+                            
+                            // Draw effective extraction boundary (where we start sampling) in red
+                            int effective_border_x1 = (int)(debug_effectiveBorderSize * scale);
+                            int effective_border_y1 = (int)(debug_effectiveBorderSize * scale);
+                            int effective_border_x2 = (int)((debug_tagSize - debug_effectiveBorderSize) * scale);
+                            int effective_border_y2 = (int)((debug_tagSize - debug_effectiveBorderSize) * scale);
+                            // Top extraction line (red - where we start sampling)
+                            line(warped_bgr, Point(0, effective_border_y1), Point(warped_image_size - 1, effective_border_y1), Scalar(0, 0, 255), 1);
+                            // Bottom extraction line (red)
+                            line(warped_bgr, Point(0, effective_border_y2), Point(warped_image_size - 1, effective_border_y2), Scalar(0, 0, 255), 1);
+                            // Left extraction line (red)
+                            line(warped_bgr, Point(effective_border_x1, 0), Point(effective_border_x1, warped_image_size - 1), Scalar(0, 0, 255), 1);
+                            // Right extraction line (red)
+                            line(warped_bgr, Point(effective_border_x2, 0), Point(effective_border_x2, warped_image_size - 1), Scalar(0, 0, 255), 1);
+                            
+                            // Copy warped image to visualization
+                            Rect warped_rect(x_offset + padding, y_offset + header_height + padding, 
+                                           warped_image_size, warped_image_size);
+                            warped_bgr.copyTo(pattern_vis(warped_rect));
+                            
+                            // Draw border around warped image
+                            rectangle(pattern_vis, warped_rect, Scalar(0, 0, 255), 2);
+                            
+                            // Label for warped image
+                            putText(pattern_vis, "Warped (green=border, red=extraction)", Point(x_offset + padding, y_offset + header_height + padding - 5),
+                                   FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
+                        }
+                        
+                        // Pattern grid position (to the right of warped image)
+                        int pattern_x_offset = x_offset + padding + warped_image_size + spacing;
+                        
+                        // Draw 8x8 grid with pattern (6x6 data + 1-cell black border)
+                        // Tag36h11 structure: 8x8 cells total, 1-cell black border, 6x6 data region
+                        
+                        // Bounds check: ensure pattern grid fits within pattern_vis
+                        int pattern_grid_right = pattern_x_offset + grid_size;
+                        int pattern_grid_bottom = y_offset + header_height + padding + grid_size;
+                        if (pattern_grid_right > pattern_vis.cols || pattern_grid_bottom > pattern_vis.rows) {
+                            qDebug() << "Warning: Pattern grid extends beyond visualization bounds. Skipping pattern visualization.";
+                            continue; // Skip this pattern to avoid out-of-bounds access
+                        }
+                        
+                        // First, draw border cells (all black)
+                        // Top row (row 0)
+                        for (int c = 0; c < 8; c++) {
+                            int y_pos = y_offset + header_height + padding;
+                            int x_pos = pattern_x_offset + c * cell_size;
+                            // Defensive bounds check
+                            if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                            Rect cell(x_pos, y_pos, cell_size, cell_size);
+                            rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                            rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                        }
+                        // Bottom row (row 7)
+                        for (int c = 0; c < 8; c++) {
+                            int y_pos = y_offset + header_height + padding + 7 * cell_size;
+                            int x_pos = pattern_x_offset + c * cell_size;
+                            // Defensive bounds check
+                            if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                            Rect cell(x_pos, y_pos, cell_size, cell_size);
+                            rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                            rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                        }
+                        // Left column (col 0, rows 1-6)
+                        for (int r = 1; r < 7; r++) {
+                            int y_pos = y_offset + header_height + padding + r * cell_size;
+                            int x_pos = pattern_x_offset;
+                            // Defensive bounds check
+                            if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                            Rect cell(x_pos, y_pos, cell_size, cell_size);
+                            rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                            rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                        }
+                        // Right column (col 7, rows 1-6)
+                        for (int r = 1; r < 7; r++) {
+                            int y_pos = y_offset + header_height + padding + r * cell_size;
+                            int x_pos = pattern_x_offset + 7 * cell_size;
+                            // Defensive bounds check
+                            if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                            Rect cell(x_pos, y_pos, cell_size, cell_size);
+                            rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                            rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                        }
+                        
+                        // Now draw the 6x6 data pattern in the center (rows 1-6, columns 1-6)
+                        // Defensive bounds checking (pattern should already be validated above)
+                        for (int r = 0; r < 6 && r < (int)pattern.size(); r++) {
+                            if (r >= (int)pattern.size() || pattern[r].size() != 6) continue;
+                            for (int c = 0; c < 6 && c < (int)pattern[r].size(); c++) {
+                                int val = pattern[r][c];
+                                bool is_black = val < 128;
+                                
+                                Scalar color = is_black ? Scalar(0, 0, 0) : Scalar(255, 255, 255);
+                                // Map 6x6 pattern (r,c) to 8x8 grid position (r+1, c+1)
+                                int y_pos = y_offset + header_height + padding + (r + 1) * cell_size;
+                                int x_pos = pattern_x_offset + (c + 1) * cell_size;
+                                // Defensive bounds check
+                                if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) continue;
+                                Rect cell(x_pos, y_pos, cell_size, cell_size);
+                                rectangle(pattern_vis, cell, color, -1);
+                                rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                                
+                                // Draw bit value (only if cell is large enough)
+                                if (cell_size >= 25) {
+                                    string bit_str = is_black ? "1" : "0";
+                                    int font_scale = (num_patterns == 1) ? 0.6 : 0.4;
+                                    Scalar text_color = is_black ? Scalar(255, 255, 255) : Scalar(0, 0, 0);
+                                    putText(pattern_vis, bit_str, Point(x_pos + cell_size/4, y_pos + cell_size/2),
+                                           FONT_HERSHEY_SIMPLEX, font_scale, text_color, 1);
+                                }
+                            }
+                        }
+                        
+                        // Label for digitized pattern
+                        putText(pattern_vis, "Digitized (8x8: border + 6x6 data)", Point(pattern_x_offset, y_offset + header_height + padding - 5),
+                               FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
+                    }
+                    
+                        // Display pattern visualization
+                        if (!pattern_vis.empty() && pattern_vis.cols > 0 && pattern_vis.rows > 0 && pattern_vis.data != nullptr) {
+                            try {
+                                // Ensure Mat is continuous (QImage requires contiguous data)
+                                Mat pattern_vis_cont;
+                                if (!pattern_vis.isContinuous()) {
+                                    pattern_vis_cont = pattern_vis.clone();
+                                } else {
+                                    pattern_vis_cont = pattern_vis;
+                                }
+                                
+                                // Verify the Mat is valid before creating QImage
+                                if (pattern_vis_cont.data != nullptr && pattern_vis_cont.cols > 0 && pattern_vis_cont.rows > 0) {
+                                    QImage pattern_qimg(pattern_vis_cont.data, pattern_vis_cont.cols, pattern_vis_cont.rows, 
+                                                       pattern_vis_cont.step, QImage::Format_RGB888);
+                                    if (!pattern_qimg.isNull()) {
+                                        QPixmap pattern_pixmap = QPixmap::fromImage(pattern_qimg.copy());
+                                        if (!pattern_pixmap.isNull() && capturePatternLabel_) {
+                                            capturePatternLabel_->setPixmap(pattern_pixmap);
+                                        }
+                                    } else {
+                                        qDebug() << "Failed to create QImage from pattern visualization";
+                                    }
+                                } else {
+                                    qDebug() << "Pattern visualization Mat is invalid for QImage conversion";
+                                }
+                            } catch (const std::exception& e) {
+                                qDebug() << "Exception converting pattern visualization to QImage/QPixmap:" << e.what();
+                            } catch (...) {
+                                qDebug() << "Unknown error converting pattern visualization to QImage/QPixmap";
+                            }
+                        }
+                    } else {
+                        qDebug() << "Skipping pattern visualization due to invalid dimensions - width:" << total_width 
+                                 << "height:" << total_height << "grid_size:" << grid_size << "cell_size:" << cell_size;
+                    }
+                    
+                    // Store patterns for saving
+                    {
+                        std::lock_guard<std::mutex> lock(storedPatternsMutex_);
+                        storedPatterns_.clear();
+                        qDebug() << "Storing" << all_patterns.size() << "patterns for saving";
+                        for (size_t i = 0; i < all_patterns.size(); i++) {
+                            const PatternData& pdata = all_patterns[i];
+                            if (pdata.detection_idx < all_detections_data.size()) {
+                                const DetectionData& data = all_detections_data[pdata.detection_idx];
+                                StoredPatternData sp;
+                                sp.tag_id = data.id;
+                                sp.warped_image = pdata.warped_image.clone();
+                                sp.pattern = pdata.pattern;
+                                storedPatterns_.push_back(sp);
+                                qDebug() << "  - Stored pattern for tag ID:" << sp.tag_id << "warped empty:" << sp.warped_image.empty() << "pattern size:" << sp.pattern.size();
+                            }
+                        }
+                        qDebug() << "Total stored patterns:" << storedPatterns_.size();
+                    }
+                    
+                    // Enable save button
+                    if (savePatternsBtn_) {
+                        savePatternsBtn_->setEnabled(true);
+                    }
+                } else {
+                    // No patterns successfully extracted - clear the display
+                    if (capturePatternLabel_) {
+                        capturePatternLabel_->clear();
+                        capturePatternLabel_->setText("Pattern extraction failed for all detections");
+                    }
+                    // Disable save button and clear stored patterns
+                    if (savePatternsBtn_) {
+                        savePatternsBtn_->setEnabled(false);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(storedPatternsMutex_);
+                        storedPatterns_.clear();
+                    }
+                }
+                
+                // Build info text: show patterns first, then hamming codes
+                stringstream info_ss;
+                info_ss << "=== DETECTED TAGS: " << num_tags << " ===\n";
+                info_ss << "=== SUCCESSFULLY EXTRACTED PATTERNS: " << all_patterns.size() << " ===\n\n";
+                
+                for (size_t pattern_idx = 0; pattern_idx < all_patterns.size(); pattern_idx++) {
+                    const PatternData& pdata = all_patterns[pattern_idx];
+                    // Safety check: ensure detection index is valid
+                    if (pdata.detection_idx >= all_detections_data.size()) {
+                        continue; // Skip if detection index is out of bounds
+                    }
+                    const DetectionData& data = all_detections_data[pdata.detection_idx];
+                    const vector<vector<int>>& pattern = pdata.pattern;
+                    
+                    // Safety check: ensure pattern is valid (6x6)
+                    if (pattern.size() != 6) {
+                        continue; // Skip if pattern has wrong number of rows
+                    }
+                    // Check all rows have correct size
+                    bool pattern_valid = true;
+                    for (size_t i = 0; i < pattern.size(); i++) {
+                        if (pattern[i].size() != 6) {
+                            pattern_valid = false;
+                            break;
+                        }
+                    }
+                    if (!pattern_valid) {
+                        continue; // Skip if pattern rows have wrong size
+                    }
+                    
+                    info_ss << "--- Tag " << (pattern_idx + 1) << " (ID: " << data.id << ") ---\n";
+                    
+                    // Show 6x6 Pattern (data cells only, no border)
+                    // Tag36h11 structure: 8x8 cells total, 1-cell black border, 6x6 data region
+                    info_ss << "6x6 Data Pattern (border excluded):\n";
+                    info_ss << "    0 1 2 3 4 5\n";
+                    info_ss << "  ┌─────────────┐\n";
+                    // Defensive bounds checking (pattern should already be validated above)
+                    for (int row = 0; row < 6 && row < (int)pattern.size(); row++) {
+                        if (row >= (int)pattern.size() || pattern[row].size() != 6) continue;
+                        info_ss << row << " │";
+                        for (int col = 0; col < 6 && col < (int)pattern[row].size(); col++) {
+                            int val = pattern[row][col];
+                            info_ss << ((val < 128) ? "1" : "0") << " ";
+                        }
+                        info_ss << "│\n";
+                    }
+                    info_ss << "  └─────────────┘\n";
+                    info_ss << "Note: This 6x6 pattern contains ONLY data cells.\n";
+                    info_ss << "      The 1-cell black border is excluded (Tag36h11: 8x8 total, 6x6 data).\n\n";
+                    
+                    // Then show hamming code info
+                    uint64_t code = extractCodeFromPattern(pattern);
+                    info_ss << "Hamming Code:\n";
+                    info_ss << "  Decision Margin: " << fixed << setprecision(2) << data.decision_margin << "\n";
+                    info_ss << "  Hamming: " << data.hamming << "\n";
+                    info_ss << "  Decimal: " << code << "\n";
+                    info_ss << "  Hex: 0x" << hex << setfill('0') << setw(9) << code << dec << "\n";
+                    info_ss << "  Binary: ";
+                    for (int i = 35; i >= 0; i--) {
+                        info_ss << ((code >> i) & 1);
+                        if (i % 9 == 0 && i > 0) info_ss << " ";
+                    }
+                    info_ss << "\n\n";
+                    }
+                    
+                    capturePatternInfoText_->setPlainText(QString::fromStdString(info_ss.str()));
+                } // End of if (!gray_for_pattern.empty())
+            } else if (capturePatternLabel_ && capturePatternInfoText_) {
+                // No detections
+                capturePatternLabel_->clear();
+                capturePatternLabel_->setText("No detection");
+                capturePatternInfoText_->setPlainText("No tags detected. Pattern will appear here when tags are found.");
+                // Disable save button and clear stored patterns
+                if (savePatternsBtn_) {
+                    savePatternsBtn_->setEnabled(false);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(storedPatternsMutex_);
+                    storedPatterns_.clear();
+                }
             }
             
             // Convert to QImage safely (copy data to avoid dangling pointer)
@@ -4879,10 +5563,24 @@ private:
     // UI elements (Capture tab)
     QComboBox *cameraCombo_;
     QComboBox *modeCombo_;  // Resolution/FPS selection
+    QComboBox *captureAlgorithmCombo_;  // Algorithm selection for Capture tab
+    QCheckBox *captureMirrorCheckbox_;  // Mirror checkbox for Capture tab
     QLabel *previewLabel_;
+    QLabel *capturePatternLabel_;  // Pattern visualization for Capture tab
+    QTextEdit *capturePatternInfoText_;  // Pattern info text for Capture tab
+    QPushButton *savePatternsBtn_;  // Button to save pattern visualizations
     QPushButton *loadImageBtn_;
     QPushButton *captureBtn_;
     QPushButton *saveSettingsBtn_;
+    
+    // Stored pattern data for saving
+    struct StoredPatternData {
+        int tag_id;
+        Mat warped_image;
+        vector<vector<int>> pattern;
+    };
+    vector<StoredPatternData> storedPatterns_;
+    mutex storedPatternsMutex_;
     // previewTimer_ and calibrationPreviewTimer_ already declared at line 159-160
     
     // UI elements (Fisheye tab)

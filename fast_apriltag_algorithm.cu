@@ -245,49 +245,110 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
 }
 
 zarray_t* FastAprilTagAlgorithm::processFrame(const cv::Mat& gray_frame, bool mirror) {
+    std::cerr << "FastAprilTagAlgorithm::processFrame ENTRY" << std::endl;
+    std::cerr.flush();
+    
     using namespace std::chrono;
+    std::cerr << "FastAprilTagAlgorithm::processFrame: About to get time" << std::endl;
+    std::cerr.flush();
     auto total_start = high_resolution_clock::now();
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Got time" << std::endl;
+    std::cerr.flush();
     
     // Reset timing for this frame
+    std::cerr << "FastAprilTagAlgorithm::processFrame: About to reset timing" << std::endl;
+    std::cerr.flush();
     last_frame_timing_.reset();
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Timing reset" << std::endl;
+    std::cerr.flush();
     
     if (!initialized_) {
+        std::cerr << "FastAprilTagAlgorithm::processFrame: Not initialized, returning nullptr" << std::endl;
+        std::cerr.flush();
         // Silently return - this is expected before delayed initialization completes
         return nullptr;
     }
     
     // Safety check: ensure GPU detector is valid
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Checking gpu_detector_" << std::endl;
+    std::cerr.flush();
     if (!gpu_detector_) {
         std::cerr << "FastAprilTagAlgorithm: ERROR - GPU detector is null but initialized_ is true!" << std::endl;
+        std::cerr.flush();
         return nullptr;
     }
+    std::cerr << "FastAprilTagAlgorithm::processFrame: gpu_detector_ is valid" << std::endl;
+    std::cerr.flush();
     
     // Validate frame (from video_visualize_fixed.cu process_frame lambda)
+    std::cerr << "FastAprilTagAlgorithm::processFrame: About to validate frame" << std::endl;
+    std::cerr.flush();
     if (gray_frame.empty() || gray_frame.data == nullptr) {
         std::cerr << "FastAprilTagAlgorithm: Invalid frame (empty or null data)" << std::endl;
+        std::cerr.flush();
         return nullptr;
     }
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame is not empty, checking size" << std::endl;
+    std::cerr.flush();
     if (gray_frame.cols != width_ || gray_frame.rows != height_) {
         std::cerr << "FastAprilTagAlgorithm: Frame size mismatch: " << gray_frame.cols << "x" << gray_frame.rows 
                   << " expected " << width_ << "x" << height_ << std::endl;
+        std::cerr.flush();
         return nullptr;
     }
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame size matches, checking continuity" << std::endl;
+    std::cerr.flush();
     if (!gray_frame.isContinuous()) {
         std::cerr << "FastAprilTagAlgorithm: Frame is not contiguous" << std::endl;
+        std::cerr.flush();
         return nullptr;
     }
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame is continuous, checking type" << std::endl;
+    std::cerr.flush();
     if (gray_frame.type() != CV_8UC1) {
         std::cerr << "FastAprilTagAlgorithm: Frame is not grayscale (CV_8UC1)" << std::endl;
+        std::cerr.flush();
         return nullptr;
     }
+    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame validation complete" << std::endl;
+    std::cerr.flush();
     
     // Get GPU detector timing before operations (to calculate delta)
-    double prev_gpu_cuda_total = gpu_detector_->GetCudaOperationsDurationMs();
+    double prev_gpu_cuda_total = 0.0;
+    try {
+        prev_gpu_cuda_total = gpu_detector_->GetCudaOperationsDurationMs();
+    } catch (const std::exception& e) {
+        std::cerr << "FastAprilTagAlgorithm: Exception getting CUDA operations duration: " << e.what() << std::endl;
+        std::cerr.flush();
+        return nullptr;
+    } catch (...) {
+        std::cerr << "FastAprilTagAlgorithm: Unknown exception getting CUDA operations duration" << std::endl;
+        std::cerr.flush();
+        return nullptr;
+    }
     
     // Stage 1: GPU-only detection (from video_visualize_fixed.cu line 1115)
     auto stage1_start = high_resolution_clock::now();
+    std::cerr << "FastAprilTagAlgorithm: About to call DetectGpuOnly" << std::endl;
+    std::cerr.flush();
     try {
+        // Ensure GPU detector is in valid state before detection
+        if (!gpu_detector_) {
+            std::cerr << "FastAprilTagAlgorithm: ERROR - GPU detector is null before DetectGpuOnly!" << std::endl;
+            std::cerr.flush();
+            return nullptr;
+        }
+        // Validate frame data pointer
+        if (!gray_frame.data) {
+            std::cerr << "FastAprilTagAlgorithm: ERROR - Frame data is null!" << std::endl;
+            std::cerr.flush();
+            return nullptr;
+        }
+        std::cerr << "FastAprilTagAlgorithm: Calling DetectGpuOnly with data=" << (void*)gray_frame.data << std::endl;
+        std::cerr.flush();
         gpu_detector_->DetectGpuOnly(gray_frame.data);
+        std::cerr << "FastAprilTagAlgorithm: DetectGpuOnly returned" << std::endl;
+        std::cerr.flush();
     } catch (const std::exception& e) {
         std::cerr << "FastAprilTagAlgorithm: Exception in DetectGpuOnly: " << e.what() << std::endl;
         return nullptr;
@@ -313,17 +374,58 @@ zarray_t* FastAprilTagAlgorithm::processFrame(const cv::Mat& gray_frame, bool mi
     // Stage 3: Mirror handling (from video_visualize_fixed.cu lines 1159-1178)
     auto stage3_start = high_resolution_clock::now();
     if (mirror) {
+        std::cerr << "FastAprilTagAlgorithm: Starting mirror stage, quads_fullres.size()=" << quads_fullres.size() << std::endl;
+        std::cerr.flush();
         try {
+            // Validate GPU detector state before mirroring
+            if (!gpu_detector_) {
+                std::cerr << "FastAprilTagAlgorithm: ERROR - GPU detector is null in mirror stage!" << std::endl;
+                std::cerr.flush();
+                return nullptr;
+            }
+            std::cerr << "FastAprilTagAlgorithm: About to call MirrorGrayImageOnGpu()" << std::endl;
+            std::cerr.flush();
+            
+            // Mirror the gray image on GPU
+            // Note: This operation modifies GPU memory, so we need to ensure CUDA operations are synchronized
+            // Check for CUDA errors before and after
+            cudaError_t cudaErr = cudaGetLastError();
+            if (cudaErr != cudaSuccess) {
+                std::cerr << "FastAprilTagAlgorithm: CUDA error before MirrorGrayImageOnGpu: " 
+                          << cudaGetErrorString(cudaErr) << std::endl;
+                std::cerr.flush();
+                // Clear the error and continue (might be from previous operation)
+                cudaGetLastError();
+            }
+            std::cerr << "FastAprilTagAlgorithm: Calling gpu_detector_->MirrorGrayImageOnGpu()" << std::endl;
+            std::cerr.flush();
             gpu_detector_->MirrorGrayImageOnGpu();
+            std::cerr << "FastAprilTagAlgorithm: MirrorGrayImageOnGpu() returned" << std::endl;
+            std::cerr.flush();
+            
+            // Check for CUDA errors after mirroring
+            cudaErr = cudaDeviceSynchronize();
+            if (cudaErr != cudaSuccess) {
+                std::cerr << "FastAprilTagAlgorithm: CUDA error after MirrorGrayImageOnGpu: " 
+                          << cudaGetErrorString(cudaErr) << std::endl;
+                std::cerr.flush();
+                return nullptr;
+            }
+            std::cerr << "FastAprilTagAlgorithm: About to mirror quad coordinates, width_=" << width_ << std::endl;
+            std::cerr.flush();
+            // Also mirror quad coordinates (on CPU, they're small)
+            mirrorQuadCoordinates(quads_fullres, width_);
+            std::cerr << "FastAprilTagAlgorithm: Mirror stage complete" << std::endl;
+            std::cerr.flush();
         } catch (const std::exception& e) {
             std::cerr << "FastAprilTagAlgorithm: Exception in MirrorGrayImageOnGpu: " << e.what() << std::endl;
+            std::cerr.flush();
             return nullptr;
         } catch (...) {
             std::cerr << "FastAprilTagAlgorithm: Unknown exception in MirrorGrayImageOnGpu" << std::endl;
+            std::cerr.flush();
             return nullptr;
         }
-        // Also mirror quad coordinates (on CPU, they're small)
-        mirrorQuadCoordinates(quads_fullres, width_);
     }
     auto stage3_end = high_resolution_clock::now();
     last_frame_timing_.mirror_ms = duration<double, milli>(stage3_end - stage3_start).count();

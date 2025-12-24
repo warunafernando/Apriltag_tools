@@ -3025,6 +3025,7 @@ private:
         
         // Clear maps if disabled
         if (!fisheye_undistort_enabled_) {
+            std::lock_guard<std::mutex> lock(fisheye_maps_mutex_);
             fisheye_map1_ = Mat();
             fisheye_map2_ = Mat();
         }
@@ -3518,6 +3519,8 @@ private:
             return;
         }
         
+        std::lock_guard<std::mutex> lock(fisheye_maps_mutex_);
+        
         // Check if maps are already initialized for this size
         if (!fisheye_map1_.empty() && fisheye_map1_.size() == image_size) {
             return;
@@ -3545,17 +3548,38 @@ private:
         
         // Initialize maps if needed (first frame or size changed)
         Size frameSize = frame.size();
-        if (fisheye_map1_.empty() || fisheye_map1_.size() != frameSize) {
+        if (frameSize.width <= 0 || frameSize.height <= 0) {
+            return frame;  // Invalid frame size
+        }
+        
+        // Check if maps need initialization (outside lock to avoid deadlock)
+        bool need_init = false;
+        {
+            std::lock_guard<std::mutex> lock(fisheye_maps_mutex_);
+            if (fisheye_map1_.empty() || fisheye_map1_.size() != frameSize) {
+                need_init = true;
+            }
+        }
+        
+        if (need_init) {
             initFisheyeUndistortMaps(frameSize);
         }
         
-        if (fisheye_map1_.empty() || fisheye_map2_.empty()) {
-            return frame;  // Return original if maps failed to initialize
+        // Copy maps locally while holding lock (to avoid issues if maps are reinitialized)
+        Mat map1_copy, map2_copy;
+        {
+            std::lock_guard<std::mutex> lock(fisheye_maps_mutex_);
+            if (fisheye_map1_.empty() || fisheye_map2_.empty()) {
+                return frame;  // Return original if maps failed to initialize
+            }
+            // Copy maps to avoid issues if they're reinitialized during remap
+            map1_copy = fisheye_map1_.clone();
+            map2_copy = fisheye_map2_.clone();
         }
         
         Mat undistorted;
         // Use INTER_CUBIC for better quality (preserves edges better than LINEAR)
-        remap(frame, undistorted, fisheye_map1_, fisheye_map2_, INTER_CUBIC, BORDER_CONSTANT);
+        remap(frame, undistorted, map1_copy, map2_copy, INTER_CUBIC, BORDER_CONSTANT);
         
         return undistorted;
     }
@@ -4138,6 +4162,7 @@ private:
     bool fisheye_undistort_enabled_;
     bool fisheye_calibration_loaded_ = false;
     Size fisheye_image_size_;
+    std::mutex fisheye_maps_mutex_;  // Protect fisheye maps from concurrent access
     
     // AprilTag detector
     apriltag_family_t* tf_;
