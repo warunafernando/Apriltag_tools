@@ -62,3 +62,13 @@ std::string AprilTagAlgorithmFactory::getName(AlgorithmType type) {
     }
 }
 
+
+
+
+
+
+
+
+
+
+

@@ -11,6 +11,12 @@
 #include <memory>
 #include <chrono>
 #include <string>
+#include <mutex>
+#include <thread>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+#include <future>
 
 // Forward declaration for DecodeTagsFromQuads
 namespace frc971 {
@@ -99,6 +105,9 @@ private:
     // GPU detector
     frc971::apriltag::GpuDetector* gpu_detector_;
     
+    // Mutex to protect CUDA operations (CUDA context is thread-local)
+    std::mutex cuda_mutex_;
+    
     // CPU decode detector
     apriltag_family_t* tf_gpu_;
     apriltag_detector_t* td_gpu_;
@@ -110,6 +119,30 @@ private:
     
     // Reusable buffer to avoid per-frame allocations
     std::vector<uint8_t> gray_host_buffer_;  // Reused for CopyGrayHostTo (resized by CopyGrayHostTo if needed)
+    
+    // Persistent frame buffer to ensure data remains valid during async CUDA operations
+    cv::Mat current_frame_buffer_;
+    
+    // TEST #1: Threading - Run CUDA operations in dedicated thread (like standalone)
+    struct FrameJob {
+        cv::Mat frame;
+        bool mirror;
+        std::promise<zarray_t*> result_promise;
+    };
+    
+    std::thread cuda_worker_thread_;
+    std::queue<std::unique_ptr<FrameJob>> frame_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::atomic<bool> worker_running_;
+    
+    void cudaWorkerThread();
+    
+    // Frame skip counter (skip first frame for debugging)
+    mutable std::atomic<int> frames_seen_;
+    
+    // Process frame directly using the detector (same pattern as video_visualize_fixed.cu)
+    zarray_t* processFrameDirect(const cv::Mat& gray_frame, bool mirror);
     
     // Minimum distance for duplicate filtering (pixels)
     double min_distance_;

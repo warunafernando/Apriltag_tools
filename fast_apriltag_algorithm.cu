@@ -4,7 +4,7 @@
 #include "../src/apriltags_cuda/src/apriltag_utils.h"
 #include "apriltag/tag36h11.h"
 #include "apriltag/common/workerpool.h"
-#include "g2d.h"  // For g2d_polygon_create_zeros and g2d_polygon_destroy
+#include "g2d.h"  // For g2d_polygon_create_zeros and zarray_destroy
 #include <opencv2/opencv.hpp>
 #include <map>
 #include <algorithm>
@@ -13,6 +13,8 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <cuda_runtime.h>
+#include <future>
 
 using namespace cv;
 using namespace std;
@@ -22,7 +24,9 @@ FastAprilTagAlgorithm::FastAprilTagAlgorithm()
       gpu_detector_(nullptr),
       tf_gpu_(nullptr), td_gpu_(nullptr), td_for_gpu_(nullptr),
       min_distance_(50.0),
-      frame_count_(0) {
+      frame_count_(0),
+      frames_seen_(0),
+      worker_running_(false) {
     accumulated_stats_.reset();
     last_frame_timing_.reset();
 }
@@ -145,7 +149,11 @@ void FastAprilTagAlgorithm::loadCalibration(double& fx, double& fy, double& cx, 
 }
 
 bool FastAprilTagAlgorithm::initialize(int width, int height) {
+    // Multiple GpuDetector instances or recreations can cause CUDA context issues
     if (initialized_) {
+        if (width == width_ && height == height_) {
+            return true;  // Already initialized with same dimensions, no need to recreate
+        }
         cleanup();
     }
     
@@ -154,7 +162,6 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
     
     // Validate dimensions - must be even numbers for CUDA decimation
     if (width <= 0 || height <= 0 || width > 10000 || height > 10000) {
-        std::cerr << "FastAprilTagAlgorithm: Invalid frame dimensions: " << width << "x" << height << std::endl;
         return false;
     }
     
@@ -165,7 +172,6 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
     // Setup tag family
     tf_gpu_ = tag36h11_create();
     if (!tf_gpu_) {
-        std::cerr << "FastAprilTagAlgorithm: Failed to create tag family" << std::endl;
         return false;
     }
     
@@ -174,7 +180,6 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
     if (!td_for_gpu_) {
         tag36h11_destroy(tf_gpu_);
         tf_gpu_ = nullptr;
-        std::cerr << "FastAprilTagAlgorithm: Failed to create tag detector" << std::endl;
         return false;
     }
     
@@ -193,7 +198,6 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
         tag36h11_destroy(tf_gpu_);
         tf_gpu_ = nullptr;
         td_for_gpu_ = nullptr;
-        std::cerr << "FastAprilTagAlgorithm: Failed to create CPU decode detector" << std::endl;
         return false;
     }
     apriltag_detector_add_family(td_gpu_, tf_gpu_);
@@ -211,271 +215,303 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
     gpu_cam_ = frc971::apriltag::CameraMatrix{fx, fy, cx, cy};
     gpu_dist_ = frc971::apriltag::DistCoeffs{k1, k2, p1, p2, k3};
     
-    // Create GPU detector
-    try {
-        gpu_detector_ = new frc971::apriltag::GpuDetector(width_, height_, td_for_gpu_, gpu_cam_, gpu_dist_);
-        std::cerr << "FastAprilTagAlgorithm: GPU detector initialized successfully" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "FastAprilTagAlgorithm: Exception creating GpuDetector: " << e.what() << std::endl;
-        apriltag_detector_destroy(td_for_gpu_);
-        apriltag_detector_destroy(td_gpu_);
-        tag36h11_destroy(tf_gpu_);
-        td_for_gpu_ = nullptr;
-        td_gpu_ = nullptr;
-        tf_gpu_ = nullptr;
-        return false;
-    } catch (...) {
-        std::cerr << "FastAprilTagAlgorithm: Unknown exception creating GpuDetector" << std::endl;
-        apriltag_detector_destroy(td_for_gpu_);
-        apriltag_detector_destroy(td_gpu_);
-        tag36h11_destroy(tf_gpu_);
-        td_for_gpu_ = nullptr;
-        td_gpu_ = nullptr;
-        tf_gpu_ = nullptr;
-        return false;
-    }
-    
     // Pre-allocate reusable buffer for gray image (will be resized by CopyGrayHostTo if needed)
     gray_host_buffer_.reserve(width_ * height_);
     gray_host_buffer_.resize(width_ * height_);
-    // Note: polygon arrays (poly0, poly1) are created per-frame to avoid threading/state issues
+    
+    // This matches standalone pattern where detector is created in the processing thread
+    gpu_detector_ = nullptr;  // Will be created in worker thread
+    
+    // This isolates CUDA context from Qt event loop, matching standalone's working pattern
+    worker_running_ = true;
+    cuda_worker_thread_ = std::thread(&FastAprilTagAlgorithm::cudaWorkerThread, this);
     
     initialized_ = true;
     return true;
 }
 
 zarray_t* FastAprilTagAlgorithm::processFrame(const cv::Mat& gray_frame, bool mirror) {
-    std::cerr << "FastAprilTagAlgorithm::processFrame ENTRY" << std::endl;
     std::cerr.flush();
     
-    using namespace std::chrono;
-    std::cerr << "FastAprilTagAlgorithm::processFrame: About to get time" << std::endl;
-    std::cerr.flush();
-    auto total_start = high_resolution_clock::now();
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Got time" << std::endl;
-    std::cerr.flush();
-    
-    // Reset timing for this frame
-    std::cerr << "FastAprilTagAlgorithm::processFrame: About to reset timing" << std::endl;
-    std::cerr.flush();
-    last_frame_timing_.reset();
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Timing reset" << std::endl;
-    std::cerr.flush();
-    
-    if (!initialized_) {
-        std::cerr << "FastAprilTagAlgorithm::processFrame: Not initialized, returning nullptr" << std::endl;
-        std::cerr.flush();
-        // Silently return - this is expected before delayed initialization completes
+    // Basic frame validation
+    if (gray_frame.empty() || gray_frame.data == nullptr || 
+        !gray_frame.isContinuous() || gray_frame.type() != CV_8UC1) {
         return nullptr;
     }
     
-    // Safety check: ensure GPU detector is valid
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Checking gpu_detector_" << std::endl;
-    std::cerr.flush();
-    if (!gpu_detector_) {
-        std::cerr << "FastAprilTagAlgorithm: ERROR - GPU detector is null but initialized_ is true!" << std::endl;
-        std::cerr.flush();
-        return nullptr;
-    }
-    std::cerr << "FastAprilTagAlgorithm::processFrame: gpu_detector_ is valid" << std::endl;
-    std::cerr.flush();
+    // Frame counter for logging
+    int frame_num = frames_seen_.fetch_add(1);
     
-    // Validate frame (from video_visualize_fixed.cu process_frame lambda)
-    std::cerr << "FastAprilTagAlgorithm::processFrame: About to validate frame" << std::endl;
-    std::cerr.flush();
-    if (gray_frame.empty() || gray_frame.data == nullptr) {
-        std::cerr << "FastAprilTagAlgorithm: Invalid frame (empty or null data)" << std::endl;
-        std::cerr.flush();
-        return nullptr;
+    // Get frame dimensions and ensure they're even (required for quad_decimate = 2.0)
+    int frame_width = gray_frame.cols;
+    int frame_height = gray_frame.rows;
+    if (frame_width % 2 != 0) frame_width = (frame_width / 2) * 2;
+    if (frame_height % 2 != 0) frame_height = (frame_height / 2) * 2;
+    
+    // Handle size changes: reinitialize if dimensions changed
+    if (!initialized_ || frame_width != width_ || frame_height != height_) {
+        if (initialized_) {
+            // Size changed - need to reinitialize
+            cleanup();
+        }
+        
+        width_ = frame_width;
+        height_ = frame_height;
+        
+        if (!initialize(width_, height_)) {
+            return nullptr;
+        }
     }
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame is not empty, checking size" << std::endl;
-    std::cerr.flush();
+    
+    // Handle frame size mismatch: create resized copy if needed
+    cv::Mat frame_to_process = gray_frame;
     if (gray_frame.cols != width_ || gray_frame.rows != height_) {
-        std::cerr << "FastAprilTagAlgorithm: Frame size mismatch: " << gray_frame.cols << "x" << gray_frame.rows 
-                  << " expected " << width_ << "x" << height_ << std::endl;
-        std::cerr.flush();
+        // Frame doesn't match - resize it to match detector dimensions
+        cv::resize(gray_frame, frame_to_process, cv::Size(width_, height_));
+    }
+    
+    // Ensure frame is continuous (required for direct memory access)
+    if (!frame_to_process.isContinuous()) {
+        frame_to_process = frame_to_process.clone();
+    }
+    
+    // This isolates CUDA context from Qt event loop
+    if (!worker_running_.load()) {
         return nullptr;
     }
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame size matches, checking continuity" << std::endl;
-    std::cerr.flush();
+    
+    // Limit queue size to prevent memory buildup
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (frame_queue_.size() > 3) {
+            return nullptr;  // Drop frame if queue is too full
+        }
+    }
+    
+    auto job = std::make_unique<FrameJob>();
+    // Clone the processed frame (may be resized) to ensure data stays valid during async CUDA operations
+    // The cloned frame will stay in the FrameJob struct until processing completes
+    job->frame = frame_to_process.clone();
+    if (job->frame.empty() || !job->frame.isContinuous()) {
+        return nullptr;
+    }
+    job->mirror = mirror;
+    auto future = job->result_promise.get_future();
+    
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        frame_queue_.push(std::move(job));
+    }
+    queue_cv_.notify_one();
+    
+    // Wait for result (with timeout to prevent deadlock)
+    // Use longer timeout since CUDA operations can take time
+    auto status = future.wait_for(std::chrono::milliseconds(5000));
+    if (status == std::future_status::timeout) {
+        // Remove timed-out job from queue
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (!frame_queue_.empty()) {
+                frame_queue_.pop();  // Remove the timed-out job
+            }
+        }
+        return nullptr;
+    }
+    
+    return future.get();
+}
+
+// Process frame directly using the detector (same pattern as video_visualize_fixed.cu)
+zarray_t* FastAprilTagAlgorithm::processFrameDirect(const cv::Mat& gray_frame, bool mirror) {
+    using namespace std::chrono;
+    using std::chrono::high_resolution_clock;
+    using std::chrono::duration;
+    
+    auto total_start = high_resolution_clock::now();
+    
+    last_frame_timing_.reset();
+    
+    // Validate frame (matching standalone program validation exactly)
+    if (gray_frame.empty() || gray_frame.data == nullptr) {
+        return nullptr;
+    }
+    if (gray_frame.cols != width_ || gray_frame.rows != height_) {
+        return nullptr;
+    }
     if (!gray_frame.isContinuous()) {
-        std::cerr << "FastAprilTagAlgorithm: Frame is not contiguous" << std::endl;
-        std::cerr.flush();
         return nullptr;
     }
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame is continuous, checking type" << std::endl;
-    std::cerr.flush();
     if (gray_frame.type() != CV_8UC1) {
-        std::cerr << "FastAprilTagAlgorithm: Frame is not grayscale (CV_8UC1)" << std::endl;
-        std::cerr.flush();
-        return nullptr;
-    }
-    std::cerr << "FastAprilTagAlgorithm::processFrame: Frame validation complete" << std::endl;
-    std::cerr.flush();
-    
-    // Get GPU detector timing before operations (to calculate delta)
-    double prev_gpu_cuda_total = 0.0;
-    try {
-        prev_gpu_cuda_total = gpu_detector_->GetCudaOperationsDurationMs();
-    } catch (const std::exception& e) {
-        std::cerr << "FastAprilTagAlgorithm: Exception getting CUDA operations duration: " << e.what() << std::endl;
-        std::cerr.flush();
-        return nullptr;
-    } catch (...) {
-        std::cerr << "FastAprilTagAlgorithm: Unknown exception getting CUDA operations duration" << std::endl;
-        std::cerr.flush();
         return nullptr;
     }
     
-    // Stage 1: GPU-only detection (from video_visualize_fixed.cu line 1115)
+    // Validate GPU detector
+    if (!gpu_detector_) {
+        return nullptr;
+    }
+    
+    // Stage 1: GPU-only detection (same as video_visualize_fixed.cu)
+    // Use frame data directly like standalone program (frame stays in scope during call)
     auto stage1_start = high_resolution_clock::now();
-    std::cerr << "FastAprilTagAlgorithm: About to call DetectGpuOnly" << std::endl;
-    std::cerr.flush();
-    try {
-        // Ensure GPU detector is in valid state before detection
-        if (!gpu_detector_) {
-            std::cerr << "FastAprilTagAlgorithm: ERROR - GPU detector is null before DetectGpuOnly!" << std::endl;
-            std::cerr.flush();
-            return nullptr;
-        }
-        // Validate frame data pointer
-        if (!gray_frame.data) {
-            std::cerr << "FastAprilTagAlgorithm: ERROR - Frame data is null!" << std::endl;
-            std::cerr.flush();
-            return nullptr;
-        }
-        std::cerr << "FastAprilTagAlgorithm: Calling DetectGpuOnly with data=" << (void*)gray_frame.data << std::endl;
-        std::cerr.flush();
-        gpu_detector_->DetectGpuOnly(gray_frame.data);
-        std::cerr << "FastAprilTagAlgorithm: DetectGpuOnly returned" << std::endl;
-        std::cerr.flush();
-    } catch (const std::exception& e) {
-        std::cerr << "FastAprilTagAlgorithm: Exception in DetectGpuOnly: " << e.what() << std::endl;
-        return nullptr;
-    } catch (...) {
-        std::cerr << "FastAprilTagAlgorithm: Unknown exception in DetectGpuOnly" << std::endl;
+    
+    // Check CUDA context before calling (CUDA operations require valid context)
+    // Note: CUDA errors don't throw C++ exceptions, so we can't catch them with try/catch
+    
+    // Clear any previous CUDA errors
+    cudaError_t cuda_err = cudaGetLastError();
+    if (cuda_err != cudaSuccess && cuda_err != cudaErrorNotReady) {
+    }
+    
+    // Check CUDA device and context before calling
+    int current_device = -1;
+    cuda_err = cudaGetDevice(&current_device);
+    if (cuda_err != cudaSuccess) {
         return nullptr;
     }
+    
+    // Check CUDA memory info
+    size_t free_mem = 0, total_mem = 0;
+    cuda_err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (cuda_err == cudaSuccess) {
+    }
+    
+    if (gray_frame.data == nullptr) {
+        return nullptr;
+    }
+    
+    // Validate frame data is accessible
+    if (gray_frame.data == nullptr) {
+        return nullptr;
+    }
+    
+    // Validate frame matches detector dimensions
+    if (gray_frame.cols != width_ || gray_frame.rows != height_) {
+        return nullptr;
+    }
+    
+    // Ensure frame is continuous (required for direct memory access)
+    if (!gray_frame.isContinuous()) {
+        return nullptr;
+    }
+    
+    // Clear any pending CUDA errors
+    cudaGetLastError();
+    
+    std::cerr.flush();  // Force flush before potentially crashing call
+    
+    try {
+        // Call DetectGpuOnly - this is where the crash happens
+        gpu_detector_->DetectGpuOnly(gray_frame.data);
+        
+        
+        // Immediately check for CUDA errors (async operations may have failed)
+        cuda_err = cudaGetLastError();
+        if (cuda_err != cudaSuccess) {
+            return nullptr;
+        }
+        
+        // Verify CUDA context is still valid
+        int device_after = -1;
+        cuda_err = cudaGetDevice(&device_after);
+        if (cuda_err != cudaSuccess) {
+            return nullptr;
+        }
+        
+    } catch (const std::exception& e) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+    
+    // The image pointer must stay valid until FitQuads() synchronizes the stream
+    // Syncing here too early might interfere with the async operations
     auto stage1_end = high_resolution_clock::now();
-    last_frame_timing_.detect_gpu_only_ms = duration<double, milli>(stage1_end - stage1_start).count();
+    last_frame_timing_.detect_gpu_only_ms = duration<double, std::milli>(stage1_end - stage1_start).count();
     
-    // Update GPU CUDA operations timing (delta from detector)
-    double cur_gpu_cuda_total = gpu_detector_->GetCudaOperationsDurationMs();
-    last_frame_timing_.gpu_cuda_ops_ms = cur_gpu_cuda_total - prev_gpu_cuda_total;
-    
-    // Stage 2: Fit quads (full resolution, from video_visualize_fixed.cu line 1155)
+    // Stage 2: Fit quads
+    // This ensures the async memcpy from DetectGpuOnly completes
+    // After FitQuads returns, the image pointer is safe to reuse
     auto stage2_start = high_resolution_clock::now();
-    // Make a copy since FitQuads() returns const reference and we may need to modify it
-    std::vector<frc971::apriltag::QuadCorners> quads_fullres = gpu_detector_->FitQuads();
+    
+    std::vector<frc971::apriltag::QuadCorners> quads_fullres;
+    try {
+        quads_fullres = gpu_detector_->FitQuads();
+    } catch (const std::exception& e) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+    
+    // This ensures all async operations from DetectGpuOnly are complete
+    cuda_err = cudaDeviceSynchronize();
+    if (cuda_err != cudaSuccess) {
+        return nullptr;
+    }
+    
     auto stage2_end = high_resolution_clock::now();
-    last_frame_timing_.fit_quads_ms = duration<double, milli>(stage2_end - stage2_start).count();
+    last_frame_timing_.fit_quads_ms = duration<double, std::milli>(stage2_end - stage2_start).count();
     last_frame_timing_.num_quads = static_cast<int>(quads_fullres.size());
     
-    // Stage 3: Mirror handling (from video_visualize_fixed.cu lines 1159-1178)
+    // Stage 3: Mirror handling
     auto stage3_start = high_resolution_clock::now();
     if (mirror) {
-        std::cerr << "FastAprilTagAlgorithm: Starting mirror stage, quads_fullres.size()=" << quads_fullres.size() << std::endl;
-        std::cerr.flush();
         try {
-            // Validate GPU detector state before mirroring
-            if (!gpu_detector_) {
-                std::cerr << "FastAprilTagAlgorithm: ERROR - GPU detector is null in mirror stage!" << std::endl;
-                std::cerr.flush();
-                return nullptr;
-            }
-            std::cerr << "FastAprilTagAlgorithm: About to call MirrorGrayImageOnGpu()" << std::endl;
-            std::cerr.flush();
-            
-            // Mirror the gray image on GPU
-            // Note: This operation modifies GPU memory, so we need to ensure CUDA operations are synchronized
-            // Check for CUDA errors before and after
-            cudaError_t cudaErr = cudaGetLastError();
-            if (cudaErr != cudaSuccess) {
-                std::cerr << "FastAprilTagAlgorithm: CUDA error before MirrorGrayImageOnGpu: " 
-                          << cudaGetErrorString(cudaErr) << std::endl;
-                std::cerr.flush();
-                // Clear the error and continue (might be from previous operation)
-                cudaGetLastError();
-            }
-            std::cerr << "FastAprilTagAlgorithm: Calling gpu_detector_->MirrorGrayImageOnGpu()" << std::endl;
-            std::cerr.flush();
             gpu_detector_->MirrorGrayImageOnGpu();
-            std::cerr << "FastAprilTagAlgorithm: MirrorGrayImageOnGpu() returned" << std::endl;
-            std::cerr.flush();
-            
-            // Check for CUDA errors after mirroring
-            cudaErr = cudaDeviceSynchronize();
-            if (cudaErr != cudaSuccess) {
-                std::cerr << "FastAprilTagAlgorithm: CUDA error after MirrorGrayImageOnGpu: " 
-                          << cudaGetErrorString(cudaErr) << std::endl;
-                std::cerr.flush();
-                return nullptr;
-            }
-            std::cerr << "FastAprilTagAlgorithm: About to mirror quad coordinates, width_=" << width_ << std::endl;
-            std::cerr.flush();
-            // Also mirror quad coordinates (on CPU, they're small)
             mirrorQuadCoordinates(quads_fullres, width_);
-            std::cerr << "FastAprilTagAlgorithm: Mirror stage complete" << std::endl;
-            std::cerr.flush();
         } catch (const std::exception& e) {
-            std::cerr << "FastAprilTagAlgorithm: Exception in MirrorGrayImageOnGpu: " << e.what() << std::endl;
-            std::cerr.flush();
             return nullptr;
         } catch (...) {
-            std::cerr << "FastAprilTagAlgorithm: Unknown exception in MirrorGrayImageOnGpu" << std::endl;
-            std::cerr.flush();
             return nullptr;
         }
     }
     auto stage3_end = high_resolution_clock::now();
-    last_frame_timing_.mirror_ms = duration<double, milli>(stage3_end - stage3_start).count();
+    last_frame_timing_.mirror_ms = duration<double, std::milli>(stage3_end - stage3_start).count();
     
-    // Stage 4: Copy full-resolution gray image from GPU (from video_visualize_fixed.cu line 1183)
+    // Stage 4: Copy gray image to host
     auto stage4_start = high_resolution_clock::now();
-    // Reuse pre-allocated buffer (CopyGrayHostTo will resize if needed)
     try {
         gpu_detector_->CopyGrayHostTo(gray_host_buffer_);
     } catch (const std::exception& e) {
-        std::cerr << "FastAprilTagAlgorithm: Exception in CopyGrayHostTo: " << e.what() << std::endl;
         return nullptr;
     } catch (...) {
-        std::cerr << "FastAprilTagAlgorithm: Unknown exception in CopyGrayHostTo" << std::endl;
         return nullptr;
     }
     auto stage4_end = high_resolution_clock::now();
-    last_frame_timing_.copy_gray_ms = duration<double, milli>(stage4_end - stage4_start).count();
+    last_frame_timing_.copy_gray_ms = duration<double, std::milli>(stage4_end - stage4_start).count();
     
-    // Stage 5: Decode tags (from video_visualize_fixed.cu lines 954-956)
+    // Stage 5: Decode tags
     auto stage5_start = high_resolution_clock::now();
-    // Create polygon arrays per-frame (like video_visualize_fixed.cu does in decode thread)
     zarray_t* poly0 = g2d_polygon_create_zeros(4);
     zarray_t* poly1 = g2d_polygon_create_zeros(4);
     zarray_t* detections = zarray_create(sizeof(apriltag_detection_t*));
+    
     frc971::apriltag::DecodeTagsFromQuads(
-        quads_fullres, gray_host_buffer_.data(), gpu_detector_->Width(), gpu_detector_->Height(),
+        quads_fullres, gray_host_buffer_.data(), width_, height_,
         td_gpu_, gpu_cam_, gpu_dist_, detections, poly0, poly1);
-    // Note: poly0 and poly1 are small temporary arrays, will be cleaned up when function returns
+    
+    // Cleanup polygon arrays
+    zarray_destroy(poly0);
+    zarray_destroy(poly1);
+    
     auto stage5_end = high_resolution_clock::now();
-    last_frame_timing_.decode_tags_ms = duration<double, milli>(stage5_end - stage5_start).count();
+    last_frame_timing_.decode_tags_ms = duration<double, std::milli>(stage5_end - stage5_start).count();
     last_frame_timing_.num_detections_before_filter = zarray_size(detections);
     
-    // Stage 6: Scale coordinates if needed (from video_visualize_fixed.cu lines 969-977)
+    // Stage 6: Scale coordinates (if decimation was used)
     auto stage6_start = high_resolution_clock::now();
-    const double gpu_decimate = td_for_gpu_->quad_decimate;
-    if (gpu_decimate > 1.0) {
+    if (td_gpu_ && td_gpu_->quad_decimate > 1.0) {
         for (int i = 0; i < zarray_size(detections); i++) {
             apriltag_detection_t* det;
             zarray_get(detections, i, &det);
-            scaleDetectionCoordinates(det, gpu_decimate);
+            scaleDetectionCoordinates(det, td_gpu_->quad_decimate);
         }
     }
     auto stage6_end = high_resolution_clock::now();
-    last_frame_timing_.scale_coords_ms = duration<double, milli>(stage6_end - stage6_start).count();
+    last_frame_timing_.scale_coords_ms = duration<double, std::milli>(stage6_end - stage6_start).count();
     
-    // Stage 7: Filter duplicates (from video_visualize_fixed.cu lines 986-990)
+    // Stage 7: Filter duplicates
     auto stage7_start = high_resolution_clock::now();
-    std::vector<apriltag_detection_t*> filtered = filterDuplicates(
-        detections, width_, height_, min_distance_);
+    std::vector<apriltag_detection_t*> filtered = filterDuplicates(detections, width_, height_, min_distance_);
     
     // Destroy detections that are NOT in the filtered list
     for (int i = 0; i < zarray_size(detections); i++) {
@@ -494,20 +530,21 @@ zarray_t* FastAprilTagAlgorithm::processFrame(const cv::Mat& gray_frame, bool mi
     }
     zarray_destroy(detections);
     
-    // Create new array with filtered detections
-    detections = zarray_create(sizeof(apriltag_detection_t*));
-    for (auto* det : filtered) {
-        zarray_add(detections, &det);
+    // Create new zarray with filtered detections
+    zarray_t* result = zarray_create(sizeof(apriltag_detection_t*));
+    for (apriltag_detection_t* det : filtered) {
+        zarray_add(result, &det);
     }
+    
     auto stage7_end = high_resolution_clock::now();
-    last_frame_timing_.filter_duplicates_ms = duration<double, milli>(stage7_end - stage7_start).count();
-    last_frame_timing_.num_detections_after_filter = zarray_size(detections);
+    last_frame_timing_.filter_duplicates_ms = duration<double, std::milli>(stage7_end - stage7_start).count();
+    last_frame_timing_.num_detections_after_filter = filtered.size();
     
     // Calculate total time
     auto total_end = high_resolution_clock::now();
-    last_frame_timing_.total_ms = duration<double, milli>(total_end - total_start).count();
+    last_frame_timing_.total_ms = duration<double, std::milli>(total_end - total_start).count();
     
-    // Accumulate statistics for averaging
+    // Update accumulated stats
     accumulated_stats_.detect_gpu_only_ms += last_frame_timing_.detect_gpu_only_ms;
     accumulated_stats_.fit_quads_ms += last_frame_timing_.fit_quads_ms;
     accumulated_stats_.mirror_ms += last_frame_timing_.mirror_ms;
@@ -516,41 +553,12 @@ zarray_t* FastAprilTagAlgorithm::processFrame(const cv::Mat& gray_frame, bool mi
     accumulated_stats_.scale_coords_ms += last_frame_timing_.scale_coords_ms;
     accumulated_stats_.filter_duplicates_ms += last_frame_timing_.filter_duplicates_ms;
     accumulated_stats_.total_ms += last_frame_timing_.total_ms;
-    accumulated_stats_.gpu_cuda_ops_ms += last_frame_timing_.gpu_cuda_ops_ms;
     frame_count_++;
     
-    return detections;
+    return result;
 }
 
-void FastAprilTagAlgorithm::cleanup() {
-    // Cleanup reusable buffers
-    gray_host_buffer_.clear();
-    gray_host_buffer_.shrink_to_fit();
-    
-    if (gpu_detector_) {
-        delete gpu_detector_;
-        gpu_detector_ = nullptr;
-    }
-    
-    if (td_for_gpu_) {
-        apriltag_detector_destroy(td_for_gpu_);
-        td_for_gpu_ = nullptr;
-    }
-    
-    if (td_gpu_) {
-        apriltag_detector_destroy(td_gpu_);
-        td_gpu_ = nullptr;
-    }
-    
-    if (tf_gpu_) {
-        tag36h11_destroy(tf_gpu_);
-        tf_gpu_ = nullptr;
-    }
-    
-    initialized_ = false;
-    width_ = 0;
-    height_ = 0;
-}
+
 
 // TimingStats::toString implementation
 std::string FastAprilTagAlgorithm::TimingStats::toString() const {
@@ -648,5 +656,208 @@ std::string FastAprilTagAlgorithm::getTimingReport() const {
     return oss.str();
 }
 
-#endif // HAVE_CUDA_APRILTAG
+// This isolates CUDA context from Qt event loop, matching standalone's working pattern
+void FastAprilTagAlgorithm::cudaWorkerThread() {
+    
+    // CUDA contexts are thread-local, so we need to ensure proper initialization
+    int device_count = 0;
+    cudaError_t init_err = cudaGetDeviceCount(&device_count);
+    if (init_err != cudaSuccess || device_count == 0) {
+        worker_running_ = false;
+        return;
+    }
+    
+    // Set device 0 explicitly to ensure context is created
+    init_err = cudaSetDevice(0);
+    if (init_err != cudaSuccess) {
+        worker_running_ = false;
+        return;
+    }
+    
+    // Verify device is set
+    int current_device = -1;
+    init_err = cudaGetDevice(&current_device);
+    if (init_err != cudaSuccess || current_device != 0) {
+        worker_running_ = false;
+        return;
+    }
+    
+    // Create GpuDetector in worker thread (CUDA contexts are thread-local)
+    if (!gpu_detector_) {
+        try {
+            gpu_detector_ = new frc971::apriltag::GpuDetector(width_, height_, td_for_gpu_, gpu_cam_, gpu_dist_);
+            
+            // Verify CUDA context is still valid after creation
+            init_err = cudaGetDevice(&current_device);
+            if (init_err != cudaSuccess || current_device != 0) {
+            }
+        } catch (const std::exception& e) {
+            worker_running_ = false;
+            return;
+        } catch (...) {
+            worker_running_ = false;
+            return;
+        }
+    }
+    
+    while (worker_running_.load()) {
+        std::unique_ptr<FrameJob> job;
+        
+        // Wait for a frame job
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] { 
+                return !frame_queue_.empty() || !worker_running_.load(); 
+            });
+            
+            if (!worker_running_.load()) {
+                break;
+            }
+            
+            if (frame_queue_.empty()) {
+                continue;
+            }
+            
+            job = std::move(frame_queue_.front());
+            frame_queue_.pop();
+        }
+        
+        int device = -1;
+        cudaError_t ctx_err = cudaGetDevice(&device);
+        if (ctx_err != cudaSuccess) {
+            job->result_promise.set_value(nullptr);
+            continue;
+        }
+        
+        // This is critical - if async operations from previous frame are still pending,
+        // they can cause crashes when DetectGpuOnly starts new async operations
+        cudaError_t pre_sync = cudaDeviceSynchronize();
+        if (pre_sync != cudaSuccess) {
+        }
+        cudaStreamSynchronize(0);  // Also sync default stream
+        cudaGetLastError();  // Clear any errors
+        
+        // Validate gpu_detector_ before processing
+        if (!gpu_detector_) {
+            job->result_promise.set_value(nullptr);
+            continue;
+        }
+        
+        // This resets internal state and might prevent accumulation issues
+        static int frame_count_in_worker = 0;
+        frame_count_in_worker++;
+        if (frame_count_in_worker <= 5) {
+            try {
+                gpu_detector_->ReinitializeDetections();
+            } catch (const std::exception& e) {
+            } catch (...) {
+            }
+        }
+        
+        // Validate frame
+        if (job->frame.empty() || job->frame.data == nullptr) {
+            job->result_promise.set_value(nullptr);
+            continue;
+        }
+        
+        // Store frame data pointer to verify it stays valid
+        uint8_t* frame_data_ptr = job->frame.data;
+        size_t frame_size = job->frame.rows * job->frame.cols;
+        
+        // Process frame in this dedicated CUDA thread (like standalone)
+        zarray_t* result = nullptr;
+        try {
+            // Verify frame data is still valid before processing
+            if (job->frame.data != frame_data_ptr || job->frame.data == nullptr) {
+                job->result_promise.set_value(nullptr);
+                continue;
+            }
+            
+            result = processFrameDirect(job->frame, job->mirror);
+            
+            // Verify frame data is still valid after processing
+            if (job->frame.data != frame_data_ptr) {
+            }
+        } catch (const std::exception& e) {
+            result = nullptr;
+        } catch (...) {
+            result = nullptr;
+        }
+        
+        // Return result (even if nullptr)
+        // Note: zarray_t* is just a pointer, so it's safe to pass through promise
+        try {
+            job->result_promise.set_value(result);
+        } catch (const std::exception& e) {
+        } catch (...) {
+        }
+        
+        // GpuDetector uses a single stream, so we need to ensure it's idle
+        // Check if there are any pending operations on the default stream
+        cudaError_t stream_status = cudaStreamQuery(0);  // Query default stream
+        if (stream_status == cudaErrorNotReady) {
+        }
+        
+        // Verify CUDA device is still accessible after processing
+        int device_check = -1;
+        cudaError_t device_err = cudaGetDevice(&device_check);
+        if (device_err != cudaSuccess) {
+        } else if (device_check != 0) {
+        }
+    }
+    
+}
 
+void FastAprilTagAlgorithm::cleanup() {
+    
+    if (worker_running_.load()) {
+        worker_running_ = false;
+        queue_cv_.notify_all();  // Wake up worker thread
+        
+        if (cuda_worker_thread_.joinable()) {
+            cuda_worker_thread_.join();
+        }
+    }
+    
+    // Clear any remaining jobs
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        while (!frame_queue_.empty()) {
+            auto job = std::move(frame_queue_.front());
+            frame_queue_.pop();
+            job->result_promise.set_value(nullptr);  // Signal failure
+        }
+    }
+    
+    // Destroy detector (created in worker thread)
+    if (gpu_detector_) {
+        delete gpu_detector_;
+        gpu_detector_ = nullptr;
+    }
+    
+    // Cleanup reusable buffers
+    gray_host_buffer_.clear();
+    gray_host_buffer_.shrink_to_fit();
+    
+    if (td_for_gpu_) {
+        apriltag_detector_destroy(td_for_gpu_);
+        td_for_gpu_ = nullptr;
+    }
+    
+    if (td_gpu_) {
+        apriltag_detector_destroy(td_gpu_);
+        td_gpu_ = nullptr;
+    }
+    
+    if (tf_gpu_) {
+        tag36h11_destroy(tf_gpu_);
+        tf_gpu_ = nullptr;
+    }
+    
+    initialized_ = false;
+    width_ = 0;
+    height_ = 0;
+    
+}
+
+#endif // HAVE_CUDA_APRILTAG

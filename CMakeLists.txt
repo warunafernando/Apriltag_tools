@@ -165,11 +165,17 @@ if(APRILTAG_CUDA_LIBRARY AND CUDA_FOUND)
     find_package(glog QUIET)
     
     # Link CUDA libraries with glog AFTER (dependency order)
+    # Note: CUDA Driver API (libcuda.so) is needed for primary context management
+    find_library(CUDA_DRIVER_LIBRARY cuda PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/cuda/lib64)
     target_link_libraries(apriltag_debug_gui 
         ${APRILTAG_CUDA_LIBRARY}
         ${CUDA_LIBRARIES}
         ${CUDA_CUDART_LIBRARY}
     )
+    # Link CUDA Driver API if found (for primary context management)
+    if(CUDA_DRIVER_LIBRARY)
+        target_link_libraries(apriltag_debug_gui ${CUDA_DRIVER_LIBRARY})
+    endif()
     
     # Link glog AFTER CUDA library (required by libapriltag_cuda.a)
     if(glog_FOUND)

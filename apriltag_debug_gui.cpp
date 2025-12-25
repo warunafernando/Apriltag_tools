@@ -16,6 +16,7 @@ namespace apriltag_gpu = frc971::apriltag;
 #include <apriltag/common/workerpool.h>
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -68,6 +69,7 @@ extern "C" {
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <cstdlib>  // For setenv
 
 using namespace cv;
 using namespace std;
@@ -1965,10 +1967,24 @@ private:
     
     uint64_t extractCodeFromPattern(const vector<vector<int>>& pattern) {
         uint64_t code = 0;
+        
+        // Safety check: ensure pattern is valid (6x6)
+        if (pattern.size() != 6) {
+            qDebug() << "extractCodeFromPattern: Invalid pattern size (rows):" << pattern.size();
+            return 0;
+        }
+        
         for (int i = 0; i < 36; i++) {
             // Convert 1-indexed to 0-indexed
             int x = TAG36H11_BIT_X[i] - 1;
             int y = TAG36H11_BIT_Y[i] - 1;
+            
+            // Bounds checking
+            if (y < 0 || y >= (int)pattern.size() || x < 0 || x >= (int)pattern[y].size()) {
+                qDebug() << "extractCodeFromPattern: Out of bounds access at bit" << i << "x=" << x << "y=" << y 
+                         << "pattern size:" << pattern.size() << "row" << y << "size:" << (y >= 0 && y < (int)pattern.size() ? pattern[y].size() : 0);
+                continue; // Skip this bit
+            }
             
             // Extract bit (0 = white/bright, 1 = black/dark)
             int val = pattern[y][x];
@@ -4307,6 +4323,7 @@ private:
                         if (!ok) continue;
                         
                         // Block signals while setting values to prevent immediate camera updates
+                        // Only load exposure, gain, and brightness (matching standalone program)
                         if (key == "exposure") {
                             exposureSlider_->blockSignals(true);
                             exposureSlider_->setValue(intValue);
@@ -4322,22 +4339,10 @@ private:
                             brightnessSlider_->setValue(intValue);
                             brightnessSpin_->setValue(intValue);
                             brightnessSlider_->blockSignals(false);
-                        } else if (key == "contrast") {
-                            contrastSlider_->blockSignals(true);
-                            contrastSlider_->setValue(intValue);
-                            contrastSpin_->setValue(intValue);
-                            contrastSlider_->blockSignals(false);
-                        } else if (key == "saturation") {
-                            saturationSlider_->blockSignals(true);
-                            saturationSlider_->setValue(intValue);
-                            saturationSpin_->setValue(intValue);
-                            saturationSlider_->blockSignals(false);
-                        } else if (key == "sharpness") {
-                            sharpnessSlider_->blockSignals(true);
-                            sharpnessSlider_->setValue(intValue);
-                            sharpnessSpin_->setValue(intValue);
-                            sharpnessSlider_->blockSignals(false);
-                        } else if (key == "mode_index") {
+                        }
+                        // Note: contrast, saturation, sharpness are NOT loaded from file
+                        // (matching standalone program behavior)
+                        else if (key == "mode_index") {
                             if (intValue >= 0 && intValue < modeCombo_->count()) {
                                 modeCombo_->blockSignals(true);
                                 modeCombo_->setCurrentIndex(intValue);
@@ -4380,7 +4385,8 @@ private:
         bool settingsSection = false;
         bool cameraMatches = false;
         int savedExposure = -1, savedGain = -1, savedBrightness = -1;
-        int savedContrast = -1, savedSaturation = -1, savedSharpness = -1;
+        // Note: Only loading exposure, gain, brightness (matching standalone program)
+        // savedContrast, savedSaturation, savedSharpness removed
         int savedModeIndex = -1;
         
         while (!in.atEnd()) {
@@ -4426,19 +4432,16 @@ private:
                         
                         if (!ok) continue;
                         
+                        // Only load exposure, gain, brightness (matching standalone program)
                         if (key == "exposure") {
                             savedExposure = intValue;
                         } else if (key == "gain") {
                             savedGain = intValue;
                         } else if (key == "brightness") {
                             savedBrightness = intValue;
-                        } else if (key == "contrast") {
-                            savedContrast = intValue;
-                        } else if (key == "saturation") {
-                            savedSaturation = intValue;
-                        } else if (key == "sharpness") {
-                            savedSharpness = intValue;
-                        } else if (key == "mode_index") {
+                        }
+                        // Note: contrast, saturation, sharpness are NOT loaded from file
+                        else if (key == "mode_index") {
                             savedModeIndex = intValue;
                         }
                     }
@@ -4472,24 +4475,12 @@ private:
                         CameraSetAnalogGain(algorithmMvHandle_, analogGain);
                     }
                     
-                    // Apply contrast
-                    if (savedContrast >= 0) {
-                        CameraSetContrast(algorithmMvHandle_, savedContrast);
-                    }
-                    
-                    // Apply saturation
-                    if (savedSaturation >= 0) {
-                        CameraSetSaturation(algorithmMvHandle_, savedSaturation);
-                    }
-                    
-                    // Apply sharpness
-                    if (savedSharpness >= 0) {
-                        CameraSetSharpness(algorithmMvHandle_, savedSharpness);
-                    }
+                    // Note: Only applying exposure, gain, brightness (matching standalone program)
+                    // contrast, saturation, sharpness are NOT applied from saved settings
                 }
 #endif
             } else {
-                // Apply V4L2 settings
+                // Apply V4L2 settings (only exposure, gain, brightness - matching standalone program)
                 if (algorithmCamera_.isOpened()) {
                     if (savedExposure >= 0) {
                         algorithmCamera_.set(CAP_PROP_EXPOSURE, savedExposure);
@@ -4500,15 +4491,7 @@ private:
                     if (savedBrightness >= 0) {
                         algorithmCamera_.set(CAP_PROP_BRIGHTNESS, savedBrightness);
                     }
-                    if (savedContrast >= 0) {
-                        algorithmCamera_.set(CAP_PROP_CONTRAST, savedContrast);
-                    }
-                    if (savedSaturation >= 0) {
-                        algorithmCamera_.set(CAP_PROP_SATURATION, savedSaturation);
-                    }
-                    if (savedSharpness >= 0) {
-                        algorithmCamera_.set(CAP_PROP_SHARPNESS, savedSharpness);
-                    }
+                    // Note: contrast, saturation, sharpness are NOT applied from saved settings
                 }
             }
         }
@@ -4518,6 +4501,17 @@ private:
 #include "apriltag_debug_gui.moc"
 
 int main(int argc, char *argv[]) {
+    // CRITICAL: Disable OpenGL/GPU rendering to prevent interference with CUDA
+    // Force Qt to use software rendering instead of OpenGL
+    // These attributes MUST be set BEFORE creating QApplication
+    QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL, true);
+    QCoreApplication::setAttribute(Qt::AA_DisableShaderDiskCache, true);
+    
+    // Also set environment variables to force software rendering
+    setenv("QT_XCB_FORCE_SOFTWARE_OPENGL", "1", 1);
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    setenv("QT_QUICK_BACKEND", "software", 1);
+    
     QApplication app(argc, argv);
     
     AprilTagDebugGUI window;
