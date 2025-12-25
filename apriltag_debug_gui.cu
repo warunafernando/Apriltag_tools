@@ -35,6 +35,7 @@ namespace apriltag_gpu = frc971::apriltag;
 #include <apriltag/common/g2d.h>
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -58,8 +59,7 @@ namespace apriltag_gpu = frc971::apriltag;
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstdio>
-#include <unistd.h>
-#include <fcntl.h>
+#include <cstdlib>  // For setenv
 
 using std::cerr;
 using std::endl;
@@ -233,19 +233,159 @@ private:
     QTextEdit *algorithmQualityText_;
     QTextEdit *algorithmPoseText_;
     QTextEdit *algorithmDetailedTimingText_;  // For Fast AprilTag detailed timing analysis
+    
+    // Stored pattern data for saving (declared early for nvcc)
+    struct StoredPatternData {
+        int tag_id;
+        Mat warped_image;
+        vector<vector<int>> pattern;
+    };
+    vector<StoredPatternData> storedPatterns_;
+    mutex storedPatternsMutex_;
+    
+    // UI elements (Processing tab)
+    QTabWidget *tabWidget_;
+    QComboBox *preprocessCombo_;
+    QComboBox *edgeCombo_;
+    QComboBox *detectionCombo_;
+    QComboBox *advancedCombo_;
+    QComboBox *quadCombo1_;
+    QComboBox *quadCombo2_;
+    QCheckBox *mirrorCheckbox1_;
+    QCheckBox *mirrorCheckbox2_;
+    QLabel *label1_;
+    QLabel *label2_;
+    QTextEdit *qualityText1_;
+    QTextEdit *qualityText2_;
+    QTextEdit *infoText_;
+    
+    // UI elements (Capture tab)
+    QComboBox *captureAlgorithmCombo_;
+    QCheckBox *captureMirrorCheckbox_;
+    QLabel *capturePreviewLabel_;
+    QPushButton *loadImageBtn_;
+    QPushButton *captureBtn_;
+    QPushButton *saveSettingsBtn_;
+    QLabel *capturePatternLabel_;
+    QPushButton *savePatternsBtn_;
+    QTextEdit *capturePatternInfoText_;
+    
+    // UI elements (Camera settings)
+    QComboBox *modeCombo_;
+    QComboBox *cameraCombo_;
+    QSlider *exposureSlider_;
+    QSlider *gainSlider_;
+    QSlider *brightnessSlider_;
+    QSlider *contrastSlider_;
+    QSlider *saturationSlider_;
+    QSlider *sharpnessSlider_;
+    QSpinBox *exposureSpin_;
+    QSpinBox *gainSpin_;
+    QSpinBox *brightnessSpin_;
+    QSpinBox *contrastSpin_;
+    QSpinBox *saturationSpin_;
+    QSpinBox *sharpnessSpin_;
+    
+    // UI elements (Fisheye tab)
+    QLineEdit *calibPathEdit_;
+    QLabel *fisheyeStatusLabel_;  // Status label in Fisheye tab
+    
+    // Settings tab UI elements
+    QCheckBox *settingsLoadCalibrationOnStart_;
+    QLineEdit *settingsCalibrationPath_;
+    QCheckBox *settingsEnableFisheyeForMindVision_;
+    QPushButton *settingsSaveBtn_;
+    QPushButton *settingsLoadBtn_;
+    
+    // Settings tab camera settings UI elements
+    QComboBox *settingsCameraCombo_;
+    QSlider *settingsExposureSlider_;
+    QSlider *settingsGainSlider_;
+    QSlider *settingsBrightnessSlider_;
+    QSlider *settingsContrastSlider_;
+    QSlider *settingsSaturationSlider_;
+    QSlider *settingsSharpnessSlider_;
+    QSpinBox *settingsExposureSpin_;
+    QSpinBox *settingsGainSpin_;
+    QSpinBox *settingsBrightnessSpin_;
+    QSpinBox *settingsContrastSpin_;
+    QSpinBox *settingsSaturationSpin_;
+    QSpinBox *settingsSharpnessSpin_;
+    QComboBox *settingsModeCombo_;
+    
+    // Initialize settings pointers to nullptr in constructor
+    QPushButton *loadTestImageBtn_;
+    QLabel *fisheyeOriginalLabel_;
+    QLabel *fisheyeCorrectedLabel_;
+    QRadioButton *fisheyeUseOriginalRadio_;
+    QRadioButton *fisheyeUseCorrectedRadio_;
+    
+    // UI elements (Calibration tab)
+    QPushButton *resetCalibBtn_;
+    QLabel *calibrationPreviewLabel_;
+    QLabel *calibrationStatusLabel_;
+    QLabel *calibrationProgressLabel_;
+    QPushButton *saveCalibBtn_;
+    
+    // UI elements (Preview)
+    QLabel *previewLabel_;
+    
+    // Calibration data
+    bool calibrationInProgress_;
+    vector<vector<Point3f>> objectPoints_;  // 3D points in real world space
+    vector<vector<Point2f>> imagePoints_;   // 2D points in image plane
+    Size checkerboardSize_;     // Inner corners (6x6)
+    vector<Mat> calibrationImages_;
+    vector<bool> gridCaptured_;             // Track which grid positions are captured (6x6 = 36 positions)
+    Mat lastStableFrame_;                    // Last frame with stable checkerboard detection
+    int stableFrameCount_;               // Count of consecutive stable detections
+    static const int STABLE_THRESHOLD = 10;  // Frames needed for stable detection
 
 public:
     AprilTagDebugGUI(QWidget *parent = nullptr) : QWidget(parent),
         tf_(nullptr),
         td_(nullptr),
         previewTimer_(nullptr),
-        calibrationPreviewTimer_(nullptr)
+        calibrationPreviewTimer_(nullptr),
+        settingsLoadCalibrationOnStart_(nullptr),
+        settingsCalibrationPath_(nullptr),
+        settingsEnableFisheyeForMindVision_(nullptr),
+        settingsSaveBtn_(nullptr),
+        settingsLoadBtn_(nullptr),
+        settingsCameraCombo_(nullptr),
+        settingsExposureSlider_(nullptr),
+        settingsGainSlider_(nullptr),
+        settingsBrightnessSlider_(nullptr),
+        settingsContrastSlider_(nullptr),
+        settingsSaturationSlider_(nullptr),
+        settingsSharpnessSlider_(nullptr),
+        settingsExposureSpin_(nullptr),
+        settingsGainSpin_(nullptr),
+        settingsBrightnessSpin_(nullptr),
+        settingsContrastSpin_(nullptr),
+        settingsSaturationSpin_(nullptr),
+        settingsSharpnessSpin_(nullptr),
+        settingsModeCombo_(nullptr)
     {
         setupUI();
         
-        // Load fisheye calibration on startup
-        QString calib_path = "/home/nav/9202/Hiru/Apriltag/calibration_data/camera_params.yaml";
-        loadFisheyeCalibration(calib_path);
+        // Load and apply settings after UI is fully set up
+        if (settingsLoadCalibrationOnStart_ && settingsCalibrationPath_) {
+            loadSettingsFromFile();
+            applySettings();
+        } else {
+            // Fallback to default path if settings UI not ready
+            QString calib_path = "/home/nav/9202/Hiru/Apriltag/calibration_data/camera_params.yaml";
+            if (loadFisheyeCalibration(calib_path)) {
+                qDebug() << "Fisheye calibration loaded successfully on startup (default path)";
+                if (fisheyeStatusLabel_) {
+                    fisheyeStatusLabel_->setText(QString("Calibration: Loaded (Size: %1x%2)")
+                        .arg(fisheye_image_size_.width)
+                        .arg(fisheye_image_size_.height));
+                }
+                updateFisheyeStatusIndicator();
+            }
+        }
         
         // Initialize AprilTag detector
         tf_ = tag36h11_create();
@@ -257,6 +397,14 @@ public:
         td_->decode_sharpening = 0.25;
         td_->nthreads = 4;
         td_->wp = workerpool_create(4);
+        
+        // Switch to Capture tab on startup (first tab, index 0)
+        QTimer::singleShot(100, this, [this]() {
+            if (tabWidget_) {
+                tabWidget_->setCurrentIndex(0); // Capture tab is first (index 0)
+            }
+            // Camera combo defaults to "None" (set in setupCaptureTab)
+        });
     }
 
     ~AprilTagDebugGUI() {
@@ -380,6 +528,18 @@ private slots:
         if (algorithmMirrorCheckbox_ && index >= 0 && index < (int)isMindVision_.size()) {
             bool isMindVision = isMindVision_[index];
             algorithmMirrorCheckbox_->setChecked(isMindVision);
+            
+            // Enable fisheye correction for MindVision cameras if setting is enabled (if calibration is loaded)
+            // Check if settings UI is initialized before accessing it
+            bool enableFisheyeForMV = true;  // Default to true
+            if (settingsEnableFisheyeForMindVision_) {
+                enableFisheyeForMV = settingsEnableFisheyeForMindVision_->isChecked();
+            }
+            if (isMindVision && enableFisheyeForMV && fisheye_calibration_loaded_ && fisheyeStatusIndicator_) {
+                fisheye_undistort_enabled_ = true;
+                fisheyeStatusIndicator_->setText("Fisheye Correction: APPLIED");
+                fisheyeStatusIndicator_->setStyleSheet("background-color: #90EE90; padding: 5px; border: 1px solid #006400;");
+            }
         }
     }
     
@@ -583,8 +743,15 @@ private slots:
         
         // Require camera selection
         int cameraIndex = algorithmCameraCombo_->currentIndex();
-        if (cameraIndex < 0 || cameraIndex >= (int)cameraList_.size()) {
+        if (cameraIndex < 0 || cameraIndex >= (int)algorithmCameraCombo_->count()) {
             QMessageBox::warning(this, "Error", "Please select a camera");
+            return;
+        }
+        
+        // Map algorithm camera index to actual camera list index (skip "None" at index 0)
+        int actualCameraIndex = cameraIndex + 1;  // +1 to skip "None"
+        if (actualCameraIndex < 0 || actualCameraIndex >= (int)cameraList_.size()) {
+            QMessageBox::warning(this, "Error", "Invalid camera selection");
             return;
         }
         
@@ -593,13 +760,21 @@ private slots:
         captureTime_ = processTime_ = detectionTime_ = displayTime_ = totalTime_ = 0.0;
         captureFPS_ = detectionFPS_ = displayFPS_ = 0.0;
         captureFrameCount_ = detectionFrameCount_ = displayFrameCount_ = 0;
+        captureFPSStart_ = chrono::high_resolution_clock::now();
+        detectionFPSStart_ = chrono::high_resolution_clock::now();
+        displayFPSStart_ = chrono::high_resolution_clock::now();
         
-        // Open camera
-        algorithmUseMindVision_ = isMindVision_[cameraIndex];
+        // Open camera (use actual camera index, not algorithm combo index)
+        algorithmUseMindVision_ = isMindVision_[actualCameraIndex];
         
         // Set default settings for MindVision camera: fisheye correction enabled and mirror enabled
-        if (algorithmUseMindVision_ && cameraIndex >= 0) {
-            if (fisheye_calibration_loaded_ && fisheyeStatusIndicator_) {
+        if (algorithmUseMindVision_ && actualCameraIndex >= 0) {
+            // Enable fisheye correction for MindVision cameras if setting is enabled (if calibration is loaded)
+            bool enableFisheyeForMV = true;  // Default to true
+            if (settingsEnableFisheyeForMindVision_) {
+                enableFisheyeForMV = settingsEnableFisheyeForMindVision_->isChecked();
+            }
+            if (enableFisheyeForMV && fisheye_calibration_loaded_ && fisheyeStatusIndicator_) {
                 fisheye_undistort_enabled_ = true;
                 fisheyeStatusIndicator_->setText("Fisheye Correction: APPLIED");
                 fisheyeStatusIndicator_->setStyleSheet("background-color: #90EE90; padding: 5px; border: 1px solid #006400;");
@@ -616,7 +791,7 @@ private slots:
 #ifdef HAVE_MINDVISION_SDK
             // Check if camera is already open in Capture tab - if so, close it first
             // Only close if previewTimer_ exists (it might not exist during GUI initialization)
-            if (cameraOpen_ && useMindVision_ && mvHandle_ != 0 && previewTimer_) {
+            if (cameraOpen_ && useMindVision_ && mvHandle_ != 0 && previewTimer_ != nullptr) {
                 QMessageBox::information(this, "Info", "Closing camera in Capture tab to use in Algorithms tab");
                 closeCamera();
             }
@@ -640,7 +815,7 @@ private slots:
             
             // Find the correct camera index (skip V4L2 cameras)
             int mvIndex = 0;
-            for (int i = 0; i < cameraIndex; i++) {
+            for (int i = 0; i < actualCameraIndex; i++) {
                 if (isMindVision_[i]) mvIndex++;
             }
             
@@ -684,10 +859,10 @@ private slots:
             // Load and apply saved camera settings
             loadCameraSettingsForAlgorithm();
 #endif
-        } else if (cameraIndex >= 0) {
+        } else if (actualCameraIndex >= 0) {
             // Open V4L2 camera - extract device number from camera name
             // Camera name format: "V4L2 Camera X" where X is the device number
-            string cameraName = cameraList_[cameraIndex];
+            string cameraName = cameraList_[actualCameraIndex];
             size_t pos = cameraName.find_last_of(" ");
             if (pos != string::npos) {
                 string deviceNumStr = cameraName.substr(pos + 1);
@@ -825,8 +1000,10 @@ private slots:
             cerr << "Detection thread created successfully" << endl;
             
             cerr << "Creating display thread..." << endl;
-            displayThread_ = new std::thread(&AprilTagDebugGUI::displayThreadFunction, this);
-            cerr << "Display thread created successfully" << endl;
+            // DEBUG MODE: Skip display thread to avoid Qt/OpenGL interference
+            // displayThread_ = new std::thread(&AprilTagDebugGUI::displayThreadFunction, this);
+            displayThread_ = nullptr;
+            cerr << "Display thread DISABLED (debug mode - no Qt/OpenGL rendering)" << endl;
             
             cerr << "All threads started successfully!" << endl;
         } catch (const std::exception& e) {
@@ -846,12 +1023,13 @@ private slots:
         algorithmStartBtn_->setEnabled(false);
         algorithmStopBtn_->setEnabled(true);
         
-        // Schedule delayed initialization after 2 seconds for Fast AprilTag
+        // NOTE: Fast AprilTag detector initialization is now done lazily in processFrame()
+        // when called from the detection thread. This ensures CUDA context is created in
+        // the same thread that uses it, preventing thread-local CUDA context issues.
+        // We no longer initialize from the GUI thread via QTimer::singleShot.
 #ifdef HAVE_CUDA_APRILTAG
         if (algorithmIndex == 1 && currentAlgorithm_) {
-            // Fast AprilTag - delay for camera stabilization
-            QTimer::singleShot(2000, this, &AprilTagDebugGUI::initializeFastAprilTagDetector);
-            qDebug() << "Scheduled Fast AprilTag detector initialization in 2 seconds";
+            qDebug() << "Fast AprilTag algorithm created - will initialize lazily in detection thread on first processFrame() call";
         }
 #endif
     }
@@ -1154,19 +1332,66 @@ private:
                 }
             }
             
-            // Store detections for quality/pose analysis (store only needed data)
-            // Do this BEFORE destroying detections
+            // DEBUG MODE: Skip Qt/OpenGL display, just log tags and timing
+            // Log detected tags
+            if (detections && zarray_size(detections) > 0) {
+                std::cerr << "Frame #" << detectionFrameCount_ << " - Detected " << zarray_size(detections) << " tags: ";
+                for (int i = 0; i < zarray_size(detections); i++) {
+                    apriltag_detection_t *det;
+                    zarray_get(detections, i, &det);
+                    if (det) {
+                        std::cerr << "ID:" << det->id << " ";
+                    }
+                }
+                std::cerr << std::endl;
+            } else {
+                std::cerr << "Frame #" << detectionFrameCount_ << " - No tags detected" << std::endl;
+            }
+            
+            // Log timing
+            auto end = chrono::high_resolution_clock::now();
+            detectionTime_ = chrono::duration<double, milli>(end - start).count();
+            if (currentAlgorithm_) {
+#ifdef HAVE_CUDA_APRILTAG
+                FastAprilTagAlgorithm* fast_algo = dynamic_cast<FastAprilTagAlgorithm*>(currentAlgorithm_.get());
+                if (fast_algo) {
+                    auto timing = fast_algo->getLastFrameTiming();
+                    std::cerr << "  Timing - Total: " << std::fixed << std::setprecision(2) << timing.total_ms 
+                              << " ms, DetectGpuOnly: " << timing.detect_gpu_only_ms 
+                              << " ms, FitQuads: " << timing.fit_quads_ms 
+                              << " ms, DecodeTags: " << timing.decode_tags_ms 
+                              << " ms, Detections: " << timing.num_detections_after_filter << std::endl;
+                }
+#endif
+            }
+            
+            // Store detections for quality/pose analysis and draw on frame for preview
+            Mat displayFrame;
             {
                 std::unique_lock<std::mutex> lock(latestDetectionsMutex_);
                 latestDetections_.clear();
                 
-                // Extract and store detection data
-                if (detections) {  // Safety check
+                // Use the original frame (not gray) for display - same as capture tab
+                // Convert to BGR/RGB for display
+                if (frame.channels() == 1) {
+                    cvtColor(frame, displayFrame, COLOR_GRAY2BGR);
+                } else {
+                    displayFrame = frame.clone();
+                }
+                
+                bool mirror = algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked();
+                
+                // Apply mirror to display frame if mirroring was used (so coordinates match)
+                // This matches the behavior in the Capture tab
+                if (mirror) {
+                    flip(displayFrame, displayFrame, 1);  // Horizontal flip
+                }
+                
+                if (detections) {
                     for (int i = 0; i < zarray_size(detections); i++) {
                         apriltag_detection_t *det;
                         zarray_get(detections, i, &det);
-                        
-                        if (!det) continue;  // Safety check
+                        if (!det) continue;
                         
                         DetectionData det_data;
                         det_data.id = det->id;
@@ -1177,168 +1402,72 @@ private:
                         det_data.corners[2] = Point2f(det->p[2][0], det->p[2][1]);
                         det_data.corners[3] = Point2f(det->p[3][0], det->p[3][1]);
                         det_data.center = Point2f(det->c[0], det->c[1]);
-                        
                         latestDetections_.push_back(det_data);
-                    }
-                }
-            }
-            
-            // Draw detections on frame
-            // Apply mirror to display frame if mirroring was used (so coordinates match)
-            auto draw_start = chrono::high_resolution_clock::now();
-            Mat detected;
-            bool use_mirror_display = (algorithmMirrorCheckbox_ && algorithmMirrorCheckbox_->isChecked());
-            if (use_mirror_display) {
-                Mat temp_frame = frame.clone();
-                if (temp_frame.channels() == 1) {
-                    cvtColor(temp_frame, detected, COLOR_GRAY2BGR);
-                } else {
-                    detected = temp_frame.clone();
-                }
-                flip(detected, detected, 1);  // Mirror display to match coordinates
-            } else {
-                detected = frame.clone();
-                if (frame.channels() == 1) {
-                    cvtColor(frame, detected, COLOR_GRAY2BGR);
-                }
-            }
-            
-            int num_detections_drawn = 0;
-            if (detections) {  // Safety check
-                for (int i = 0; i < zarray_size(detections); i++) {
-                    apriltag_detection_t *det;
-                    zarray_get(detections, i, &det);
-                    
-                    if (!det) continue;  // Safety check
-                    
-                    // Validate coordinates are within frame bounds
-                    bool valid = true;
-                    for (int j = 0; j < 4; j++) {
-                        if (det->p[j][0] < 0 || det->p[j][0] >= detected.cols ||
-                            det->p[j][1] < 0 || det->p[j][1] >= detected.rows) {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    if (det->c[0] < 0 || det->c[0] >= detected.cols ||
-                        det->c[1] < 0 || det->c[1] >= detected.rows) {
-                        valid = false;
-                    }
-                    
-                    if (valid) {
-                        // Draw quad
-                        line(detected, Point((int)det->p[0][0], (int)det->p[0][1]), 
-                             Point((int)det->p[1][0], (int)det->p[1][1]), Scalar(0, 255, 0), 2);
-                        line(detected, Point((int)det->p[1][0], (int)det->p[1][1]), 
-                             Point((int)det->p[2][0], (int)det->p[2][1]), Scalar(0, 255, 0), 2);
-                        line(detected, Point((int)det->p[2][0], (int)det->p[2][1]), 
-                             Point((int)det->p[3][0], (int)det->p[3][1]), Scalar(0, 255, 0), 2);
-                        line(detected, Point((int)det->p[3][0], (int)det->p[3][1]), 
-                             Point((int)det->p[0][0], (int)det->p[0][1]), Scalar(0, 255, 0), 2);
                         
-                        // Draw ID
-                        putText(detected, to_string(det->id), Point((int)det->c[0], (int)det->c[1]), 
-                               FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 255, 0), 2);
-                        num_detections_drawn++;
-                    } else {
-                        // Log invalid coordinates for debugging
-                        qDebug() << "Detection" << i << "has invalid coordinates - frame:" 
-                                 << detected.cols << "x" << detected.rows
-                                 << "corners:" << det->p[0][0] << "," << det->p[0][1] << "...";
-                    }
-                    
-                    // Destroy detections (all algorithms own their detections)
-                    if (currentAlgorithm_) {
-                        apriltag_detection_destroy(det);
+                        // Verify coordinates are within frame bounds
+                        int frame_width = displayFrame.cols;
+                        int frame_height = displayFrame.rows;
+                        
+                        // Draw detection on frame (coordinates should match gray frame dimensions)
+                        Point2i p0((int)det->p[0][0], (int)det->p[0][1]);
+                        Point2i p1((int)det->p[1][0], (int)det->p[1][1]);
+                        Point2i p2((int)det->p[2][0], (int)det->p[2][1]);
+                        Point2i p3((int)det->p[3][0], (int)det->p[3][1]);
+                        Point2i center((int)det->c[0], (int)det->c[1]);
+                        
+                        // Clamp coordinates to frame bounds (safety check)
+                        p0.x = std::max(0, std::min(frame_width - 1, p0.x));
+                        p0.y = std::max(0, std::min(frame_height - 1, p0.y));
+                        p1.x = std::max(0, std::min(frame_width - 1, p1.x));
+                        p1.y = std::max(0, std::min(frame_height - 1, p1.y));
+                        p2.x = std::max(0, std::min(frame_width - 1, p2.x));
+                        p2.y = std::max(0, std::min(frame_height - 1, p2.y));
+                        p3.x = std::max(0, std::min(frame_width - 1, p3.x));
+                        p3.y = std::max(0, std::min(frame_height - 1, p3.y));
+                        center.x = std::max(0, std::min(frame_width - 1, center.x));
+                        center.y = std::max(0, std::min(frame_height - 1, center.y));
+                        
+                        line(displayFrame, p0, p1, Scalar(0, 255, 0), 2);
+                        line(displayFrame, p1, p2, Scalar(0, 255, 0), 2);
+                        line(displayFrame, p2, p3, Scalar(0, 255, 0), 2);
+                        line(displayFrame, p3, p0, Scalar(0, 255, 0), 2);
+                        
+                        // Draw tag ID
+                        stringstream ss;
+                        ss << det->id;
+                        putText(displayFrame, ss.str(), Point2i(center.x - 10, center.y - 10),
+                                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
                     }
                 }
             }
-            auto draw_end = chrono::high_resolution_clock::now();
             
-            // Accumulate overhead timing for Fast AprilTag
-            if (currentAlgorithm_) {
-                overhead_draw_ms += chrono::duration<double, milli>(draw_end - draw_start).count();
+            // Update preview display (thread-safe via Qt signal)
+            auto display_start = chrono::high_resolution_clock::now();
+            if (!displayFrame.empty() && algorithmDisplayLabel_) {
+                // Convert Mat to QPixmap
+                Mat rgbFrame;
+                if (displayFrame.channels() == 3) {
+                    cvtColor(displayFrame, rgbFrame, COLOR_BGR2RGB);
+                } else {
+                    rgbFrame = displayFrame;
+                }
+                
+                QImage qimg(rgbFrame.data, rgbFrame.cols, rgbFrame.rows, rgbFrame.step, QImage::Format_RGB888);
+                QPixmap pixmap = QPixmap::fromImage(qimg);
+                
+                // Scale to fit label while maintaining aspect ratio
+                if (!pixmap.isNull() && algorithmDisplayLabel_) {
+                    QSize labelSize = algorithmDisplayLabel_->size();
+                    if (labelSize.width() > 0 && labelSize.height() > 0) {
+                        pixmap = pixmap.scaled(labelSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+                    }
+                    // Update GUI in main thread (thread-safe)
+                    QMetaObject::invokeMethod(this, "setPixmapFromThread", Qt::QueuedConnection,
+                                            Q_ARG(QPixmap, pixmap));
+                }
             }
-            
-            // Destroy detections array (all algorithms own their detections)
-            if (detections) {
-                zarray_destroy(detections);
-            }
-            
-            // Measure frame copying time
-            auto copy_start = chrono::high_resolution_clock::now();
-            // Store latest frame for pose/quality display
-            {
-                std::unique_lock<std::mutex> lock(latestDetectionsMutex_);
-                latestDetectedFrame_ = detected.clone();
-            }
-            
-            if (algorithmRunning_) {
-                std::unique_lock<std::mutex> lock2(detectedFrameMutex_);
-                detectedFrame_ = detected.clone();
-                lock2.unlock();
-                detectedFrameReady_.notify_one();
-            }
-            auto copy_end = chrono::high_resolution_clock::now();
-            
-            // Accumulate overhead timing for Fast AprilTag
-            if (currentAlgorithm_) {
-                overhead_frame_copy_ms += chrono::duration<double, milli>(copy_end - copy_start).count();
-            }
-            
-            auto end = chrono::high_resolution_clock::now();
-            detectionTime_ = chrono::duration<double, milli>(end - start).count();
-        }
-    }
-    
-    void displayThreadFunction() {
-        displayFPSStart_ = chrono::high_resolution_clock::now();
-        int display_count = 0;
-        while (algorithmRunning_) {
-            std::unique_lock<std::mutex> lock(detectedFrameMutex_);
-            detectedFrameReady_.wait(lock, [this] { return !detectedFrame_.empty() || !algorithmRunning_; });
-            
-            if (!algorithmRunning_) break;
-            
-            Mat frame = detectedFrame_.clone();
-            detectedFrame_ = Mat();  // Clear
-            lock.unlock();
-            
-            if (frame.empty()) {
-                // Debug: Uncomment to debug empty frames
-                // if (display_count % 100 == 0) {
-                //     qDebug() << "Display thread: Received empty frame";
-                // }
-                continue;
-            }
-            
-            display_count++;
-            // Debug: Uncomment to debug frame display
-            // if (display_count % 30 == 0) {
-            //     qDebug() << "Display thread: Displaying frame" << display_count << "size:" << frame.cols << "x" << frame.rows;
-            // }
-            
-            auto start = chrono::high_resolution_clock::now();
-            
-            // Convert to QPixmap and display
-            Mat display;
-            if (frame.channels() == 1) {
-                cvtColor(frame, display, COLOR_GRAY2RGB);
-            } else {
-                cvtColor(frame, display, COLOR_BGR2RGB);
-            }
-            
-            QImage qimg(display.data, display.cols, display.rows, display.step, QImage::Format_RGB888);
-            QPixmap pixmap = QPixmap::fromImage(qimg.copy()).scaled(
-                algorithmDisplayLabel_->width(), algorithmDisplayLabel_->height(),
-                Qt::KeepAspectRatio, Qt::SmoothTransformation);
-            
-            // Update UI in main thread using slot (thread-safe)
-            QMetaObject::invokeMethod(this, "setPixmapFromThread", Qt::QueuedConnection, Q_ARG(QPixmap, pixmap));
-            
-            // Update timing statistics
-            auto end = chrono::high_resolution_clock::now();
-            displayTime_ = chrono::duration<double, milli>(end - start).count();
+            auto display_end = chrono::high_resolution_clock::now();
+            displayTime_ = chrono::duration<double, milli>(display_end - display_start).count();
             displayFrameCount_++;
             
             // Update display FPS every 30 frames
@@ -1351,21 +1480,37 @@ private:
                 }
             }
             
-            frameCount_++;
-            totalTime_ = captureTime_ + processTime_ + detectionTime_ + displayTime_;
-            double fps = 1000.0 / totalTime_;
+            // Update FPS display in GUI (all three threads: capture/read, detection/decode, display)
+            QMetaObject::invokeMethod(this, "updateAlgorithmTimingSlot", Qt::QueuedConnection,
+                                    Q_ARG(double, 0.0));  // FPS value not used, we read from member variables
             
-            // Update all displays - use QMetaObject::invokeMethod for thread-safe UI update
-            QMetaObject::invokeMethod(this, "updateAlgorithmTimingSlot", Qt::QueuedConnection, Q_ARG(double, fps));
-            QMetaObject::invokeMethod(this, "updateAlgorithmMetricsSlot", Qt::QueuedConnection);
+            // Destroy detections array
+            if (detections) {
+                for (int i = 0; i < zarray_size(detections); i++) {
+                    apriltag_detection_t *det;
+                    zarray_get(detections, i, &det);
+                    if (det && currentAlgorithm_) {
+                        apriltag_detection_destroy(det);
+                    }
+                }
+                zarray_destroy(detections);
+            }
+        }
+    }
+    
+    void displayThreadFunction() {
+        // DEBUG MODE: Display thread disabled - no Qt/OpenGL rendering
+        // Just wait for algorithm to stop
+        while (algorithmRunning_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
     
     void updateAlgorithmTiming(double fps) {
         if (!algorithmFPSLabel_) return;
         
-        // Display all three FPS values in the label: Capture, Detection, Display
-        algorithmFPSLabel_->setText(QString("FPS: Capture: %1, Detection: %2, Display: %3")
+        // Display all three FPS values in the label: Read (capture), Decode (detection), Display
+        algorithmFPSLabel_->setText(QString("FPS: Read: %1, Decode: %2, Display: %3")
             .arg(captureFPS_, 0, 'f', 1)
             .arg(detectionFPS_, 0, 'f', 1)
             .arg(displayFPS_, 0, 'f', 1));
@@ -1489,27 +1634,17 @@ private:
         QWidget *processingTab = new QWidget(this);
         QVBoxLayout *processingLayout = new QVBoxLayout(processingTab);
         
-        // Control panel
-        QHBoxLayout *controlLayout = new QHBoxLayout();
-        
-        QPushButton *loadBtn1 = new QPushButton("Load Image 1", this);
-        QPushButton *loadBtn2 = new QPushButton("Load Image 2", this);
-        connect(loadBtn1, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage1);
-        connect(loadBtn2, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage2);
-        
-        controlLayout->addWidget(loadBtn1);
-        controlLayout->addWidget(loadBtn2);
-        controlLayout->addStretch();
-        
-        processingLayout->addLayout(controlLayout);
-
-        // Stage selection
+        // Stage selection (at the top)
         QGroupBox *stageGroup = new QGroupBox("Stage Selection", this);
+        stageGroup->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
         QHBoxLayout *stageLayout = new QHBoxLayout();
+        stageLayout->setContentsMargins(5, 5, 5, 5);
+        stageLayout->setSpacing(5);
         
         // Preprocessing stage
         QLabel *preprocessLabel = new QLabel("Preprocessing:", this);
         preprocessCombo_ = new QComboBox(this);
+        preprocessCombo_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         preprocessCombo_->addItems({
             "Original", "Histogram Equalization", "CLAHE (clip=2.0)", 
             "CLAHE (clip=3.0)", "CLAHE (clip=4.0)", "Gamma 1.2", 
@@ -1521,6 +1656,7 @@ private:
         // Edge detection stage
         QLabel *edgeLabel = new QLabel("Edge Detection:", this);
         edgeCombo_ = new QComboBox(this);
+        edgeCombo_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         edgeCombo_->addItems({
             "None", "Canny (50,150)", "Canny (75,200)", "Canny (100,200)",
             "Sobel", "Laplacian", "Adaptive Threshold"
@@ -1531,6 +1667,7 @@ private:
         // Detection stage
         QLabel *detectionLabel = new QLabel("Detection:", this);
         detectionCombo_ = new QComboBox(this);
+        detectionCombo_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         detectionCombo_->addItems({
             "Original", "With Detection", "Contours Only", "Quadrilaterals Only",
             "Convex Quads Only", "Tag-Sized Quads"
@@ -1541,6 +1678,7 @@ private:
         // Advanced visualization stage
         QLabel *advancedLabel = new QLabel("Advanced:", this);
         advancedCombo_ = new QComboBox(this);
+        advancedCombo_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         advancedCombo_->addItems({
             "None", "Corner Refinement", "Warped Tags", "Pattern Extraction", "Hamming Decode"
         });
@@ -1550,11 +1688,13 @@ private:
         // Quad selection (for Warped Tags and later stages) - independent for each image
         QLabel *quadLabel1 = new QLabel("Quad (Img1):", this);
         quadCombo1_ = new QComboBox(this);
+        quadCombo1_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         quadCombo1_->setEnabled(false);  // Disabled until a quad stage is selected
         connect(quadCombo1_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &AprilTagDebugGUI::stageChanged);
         
         QLabel *quadLabel2 = new QLabel("Quad (Img2):", this);
         quadCombo2_ = new QComboBox(this);
+        quadCombo2_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         quadCombo2_->setEnabled(false);  // Disabled until a quad stage is selected
         connect(quadCombo2_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &AprilTagDebugGUI::stageChanged);
         
@@ -1594,7 +1734,22 @@ private:
         stageLayout->addStretch();
         
         stageGroup->setLayout(stageLayout);
-        mainLayout->addWidget(stageGroup);
+        stageGroup->setMaximumHeight(stageGroup->sizeHint().height() + 10);  // Limit height to fit content
+        processingLayout->addWidget(stageGroup);
+        
+        // Control panel (after Stage Selection)
+        QHBoxLayout *controlLayout = new QHBoxLayout();
+        
+        QPushButton *loadBtn1 = new QPushButton("Load Image 1", this);
+        QPushButton *loadBtn2 = new QPushButton("Load Image 2", this);
+        connect(loadBtn1, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage1);
+        connect(loadBtn2, &QPushButton::clicked, this, &AprilTagDebugGUI::loadImage2);
+        
+        controlLayout->addWidget(loadBtn1);
+        controlLayout->addWidget(loadBtn2);
+        controlLayout->addStretch();
+        
+        processingLayout->addLayout(controlLayout);
 
         // Create splitter for image and info panel
         QSplitter *mainSplitter = new QSplitter(Qt::Horizontal, this);
@@ -1673,22 +1828,27 @@ private:
         mainSplitter->setSizes({700, 300});
         processingLayout->addWidget(mainSplitter);
         processingTab->setLayout(processingLayout);
-        tabWidget_->addTab(processingTab, "Processing");
         
-        // ========== CAPTURE TAB ==========
+        // ========== CAPTURE TAB (FIRST) ==========
         QWidget *captureTab = new QWidget(this);
         QVBoxLayout *captureLayout = new QVBoxLayout(captureTab);
         setupCaptureTab(captureLayout);
         tabWidget_->addTab(captureTab, "Capture");
         
-        // ========== FISHEYE CORRECTION TAB ==========
-        setupFisheyeTab();
-        
-        // ========== ALGORITHMS TAB ==========
+        // ========== ALGORITHMS TAB (SECOND) ==========
         QWidget *algorithmsTab = new QWidget(this);
         QVBoxLayout *algorithmsLayout = new QVBoxLayout(algorithmsTab);
         setupAlgorithmsTab(algorithmsLayout);
         tabWidget_->addTab(algorithmsTab, "Algorithms");
+        
+        // ========== FISHEYE CORRECTION TAB (THIRD) ==========
+        setupFisheyeTab();
+        
+        // ========== SETTINGS TAB (FOURTH) ==========
+        setupSettingsTab();
+        
+        // ========== PROCESSING TAB (FIFTH) ==========
+        tabWidget_->addTab(processingTab, "Processing");
         
         // Fisheye correction status indicator (at the top, outside tabs)
         QGroupBox *fisheyeStatusGroup = new QGroupBox("Fisheye Correction Status", this);
@@ -2588,10 +2748,24 @@ private:
     
     uint64_t extractCodeFromPattern(const vector<vector<int>>& pattern) {
         uint64_t code = 0;
+        
+        // Safety check: ensure pattern is valid (6x6)
+        if (pattern.size() != 6) {
+            qDebug() << "extractCodeFromPattern: Invalid pattern size (rows):" << pattern.size();
+            return 0;
+        }
+        
         for (int i = 0; i < 36; i++) {
             // Convert 1-indexed to 0-indexed
             int x = TAG36H11_BIT_X[i] - 1;
             int y = TAG36H11_BIT_Y[i] - 1;
+            
+            // Bounds checking
+            if (y < 0 || y >= (int)pattern.size() || x < 0 || x >= (int)pattern[y].size()) {
+                qDebug() << "extractCodeFromPattern: Out of bounds access at bit" << i << "x=" << x << "y=" << y 
+                         << "pattern size:" << pattern.size() << "row" << y << "size:" << (y >= 0 && y < (int)pattern.size() ? pattern[y].size() : 0);
+                continue; // Skip this bit
+            }
             
             // Extract bit (0 = white/bright, 1 = black/dark)
             int val = pattern[y][x];
@@ -3324,6 +3498,8 @@ private:
         // Initialize camera enumeration (this may trigger signals, so previewTimer_ must exist)
         cameraCombo_->blockSignals(true);  // Block signals during enumeration
         enumerateCameras();
+        // Set default to "None" (index 0)
+        cameraCombo_->setCurrentIndex(0);
         cameraCombo_->blockSignals(false);  // Re-enable signals
         
         // Calibration preview timer (separate timer for calibration view)
@@ -3337,6 +3513,303 @@ private:
         QVBoxLayout *fisheyeLayout = new QVBoxLayout(fisheyeTab);
         setupFisheyeTabContent(fisheyeLayout);
         tabWidget_->addTab(fisheyeTab, "Fisheye Correction");
+    }
+    
+    void setupSettingsTab() {
+        QWidget *settingsTab = new QWidget(this);
+        QVBoxLayout *settingsLayout = new QVBoxLayout(settingsTab);
+        
+        // Scroll area for settings
+        QScrollArea *scrollArea = new QScrollArea(this);
+        scrollArea->setWidgetResizable(true);
+        scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        
+        QWidget *settingsContent = new QWidget(this);
+        QVBoxLayout *contentLayout = new QVBoxLayout(settingsContent);
+        
+        // ========== FISHEYE SETTINGS ==========
+        QGroupBox *fisheyeSettingsGroup = new QGroupBox("Fisheye Correction Settings", this);
+        QVBoxLayout *fisheyeSettingsLayout = new QVBoxLayout();
+        
+        // Load calibration on startup
+        settingsLoadCalibrationOnStart_ = new QCheckBox("Load calibration file on startup", this);
+        settingsLoadCalibrationOnStart_->setChecked(true);  // Default enabled
+        fisheyeSettingsLayout->addWidget(settingsLoadCalibrationOnStart_);
+        
+        // Calibration file path
+        QHBoxLayout *calibPathLayout = new QHBoxLayout();
+        QLabel *calibPathLabel = new QLabel("Calibration file path:", this);
+        settingsCalibrationPath_ = new QLineEdit(this);
+        settingsCalibrationPath_->setText("/home/nav/9202/Hiru/Apriltag/calibration_data/camera_params.yaml");
+        QPushButton *browseCalibBtn = new QPushButton("Browse...", this);
+        connect(browseCalibBtn, &QPushButton::clicked, this, [this]() {
+            QString filename = QFileDialog::getOpenFileName(this, "Select Calibration File", 
+                settingsCalibrationPath_->text(), "YAML Files (*.yaml *.yml);;All Files (*)");
+            if (!filename.isEmpty()) {
+                settingsCalibrationPath_->setText(filename);
+            }
+        });
+        calibPathLayout->addWidget(calibPathLabel);
+        calibPathLayout->addWidget(settingsCalibrationPath_);
+        calibPathLayout->addWidget(browseCalibBtn);
+        fisheyeSettingsLayout->addLayout(calibPathLayout);
+        
+        // Enable fisheye for MindVision cameras by default
+        settingsEnableFisheyeForMindVision_ = new QCheckBox("Enable fisheye correction for MindVision cameras by default", this);
+        settingsEnableFisheyeForMindVision_->setChecked(true);  // Default enabled
+        fisheyeSettingsLayout->addWidget(settingsEnableFisheyeForMindVision_);
+        
+        fisheyeSettingsGroup->setLayout(fisheyeSettingsLayout);
+        contentLayout->addWidget(fisheyeSettingsGroup);
+        
+        // ========== CAMERA SETTINGS ==========
+        QGroupBox *cameraSettingsGroup = new QGroupBox("Camera Settings (Per Camera)", this);
+        QVBoxLayout *cameraSettingsLayout = new QVBoxLayout();
+        
+        QLabel *cameraSettingsInfo = new QLabel(
+            "Select a camera and edit its settings. Settings are saved per camera to camera_settings.txt",
+            this);
+        cameraSettingsInfo->setWordWrap(true);
+        cameraSettingsInfo->setStyleSheet("color: #666; padding: 5px;");
+        cameraSettingsLayout->addWidget(cameraSettingsInfo);
+        
+        // Camera selector
+        QHBoxLayout *cameraSelectLayout = new QHBoxLayout();
+        QLabel *cameraSelectLabel = new QLabel("Camera:", this);
+        settingsCameraCombo_ = new QComboBox(this);
+        // Populate with cameras (skip "None")
+        for (size_t i = 1; i < cameraList_.size(); i++) {
+            settingsCameraCombo_->addItem(QString::fromStdString(cameraList_[i]));
+        }
+        connect(settingsCameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, &AprilTagDebugGUI::onSettingsCameraChanged);
+        cameraSelectLayout->addWidget(cameraSelectLabel);
+        cameraSelectLayout->addWidget(settingsCameraCombo_);
+        cameraSelectLayout->addStretch();
+        cameraSettingsLayout->addLayout(cameraSelectLayout);
+        
+        // Camera settings form
+        QFormLayout *settingsFormLayout = new QFormLayout();
+        
+        // Exposure
+        settingsExposureSlider_ = new QSlider(Qt::Horizontal, this);
+        settingsExposureSlider_->setRange(0, 100);
+        settingsExposureSlider_->setValue(50);
+        settingsExposureSpin_ = new QSpinBox(this);
+        settingsExposureSpin_->setRange(0, 100);
+        settingsExposureSpin_->setValue(50);
+        connect(settingsExposureSlider_, &QSlider::valueChanged, settingsExposureSpin_, &QSpinBox::setValue);
+        connect(settingsExposureSpin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                settingsExposureSlider_, &QSlider::setValue);
+        QHBoxLayout *exposureLayout = new QHBoxLayout();
+        exposureLayout->addWidget(settingsExposureSlider_);
+        exposureLayout->addWidget(settingsExposureSpin_);
+        settingsFormLayout->addRow("Exposure:", exposureLayout);
+        
+        // Gain
+        settingsGainSlider_ = new QSlider(Qt::Horizontal, this);
+        settingsGainSlider_->setRange(0, 100);
+        settingsGainSlider_->setValue(50);
+        settingsGainSpin_ = new QSpinBox(this);
+        settingsGainSpin_->setRange(0, 100);
+        settingsGainSpin_->setValue(50);
+        connect(settingsGainSlider_, &QSlider::valueChanged, settingsGainSpin_, &QSpinBox::setValue);
+        connect(settingsGainSpin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                settingsGainSlider_, &QSlider::setValue);
+        QHBoxLayout *gainLayout = new QHBoxLayout();
+        gainLayout->addWidget(settingsGainSlider_);
+        gainLayout->addWidget(settingsGainSpin_);
+        settingsFormLayout->addRow("Gain:", gainLayout);
+        
+        // Brightness
+        settingsBrightnessSlider_ = new QSlider(Qt::Horizontal, this);
+        settingsBrightnessSlider_->setRange(0, 100);
+        settingsBrightnessSlider_->setValue(50);
+        settingsBrightnessSpin_ = new QSpinBox(this);
+        settingsBrightnessSpin_->setRange(0, 100);
+        settingsBrightnessSpin_->setValue(50);
+        connect(settingsBrightnessSlider_, &QSlider::valueChanged, settingsBrightnessSpin_, &QSpinBox::setValue);
+        connect(settingsBrightnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                settingsBrightnessSlider_, &QSlider::setValue);
+        QHBoxLayout *brightnessLayout = new QHBoxLayout();
+        brightnessLayout->addWidget(settingsBrightnessSlider_);
+        brightnessLayout->addWidget(settingsBrightnessSpin_);
+        settingsFormLayout->addRow("Brightness:", brightnessLayout);
+        
+        // Contrast
+        settingsContrastSlider_ = new QSlider(Qt::Horizontal, this);
+        settingsContrastSlider_->setRange(0, 100);
+        settingsContrastSlider_->setValue(50);
+        settingsContrastSpin_ = new QSpinBox(this);
+        settingsContrastSpin_->setRange(0, 100);
+        settingsContrastSpin_->setValue(50);
+        connect(settingsContrastSlider_, &QSlider::valueChanged, settingsContrastSpin_, &QSpinBox::setValue);
+        connect(settingsContrastSpin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                settingsContrastSlider_, &QSlider::setValue);
+        QHBoxLayout *contrastLayout = new QHBoxLayout();
+        contrastLayout->addWidget(settingsContrastSlider_);
+        contrastLayout->addWidget(settingsContrastSpin_);
+        settingsFormLayout->addRow("Contrast:", contrastLayout);
+        
+        // Saturation
+        settingsSaturationSlider_ = new QSlider(Qt::Horizontal, this);
+        settingsSaturationSlider_->setRange(0, 100);
+        settingsSaturationSlider_->setValue(50);
+        settingsSaturationSpin_ = new QSpinBox(this);
+        settingsSaturationSpin_->setRange(0, 100);
+        settingsSaturationSpin_->setValue(50);
+        connect(settingsSaturationSlider_, &QSlider::valueChanged, settingsSaturationSpin_, &QSpinBox::setValue);
+        connect(settingsSaturationSpin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                settingsSaturationSlider_, &QSlider::setValue);
+        QHBoxLayout *saturationLayout = new QHBoxLayout();
+        saturationLayout->addWidget(settingsSaturationSlider_);
+        saturationLayout->addWidget(settingsSaturationSpin_);
+        settingsFormLayout->addRow("Saturation:", saturationLayout);
+        
+        // Sharpness
+        settingsSharpnessSlider_ = new QSlider(Qt::Horizontal, this);
+        settingsSharpnessSlider_->setRange(0, 100);
+        settingsSharpnessSlider_->setValue(50);
+        settingsSharpnessSpin_ = new QSpinBox(this);
+        settingsSharpnessSpin_->setRange(0, 100);
+        settingsSharpnessSpin_->setValue(50);
+        connect(settingsSharpnessSlider_, &QSlider::valueChanged, settingsSharpnessSpin_, &QSpinBox::setValue);
+        connect(settingsSharpnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                settingsSharpnessSlider_, &QSlider::setValue);
+        QHBoxLayout *sharpnessLayout = new QHBoxLayout();
+        sharpnessLayout->addWidget(settingsSharpnessSlider_);
+        sharpnessLayout->addWidget(settingsSharpnessSpin_);
+        settingsFormLayout->addRow("Sharpness:", sharpnessLayout);
+        
+        // Mode
+        QLabel *modeLabel = new QLabel("Mode:", this);
+        settingsModeCombo_ = new QComboBox(this);
+        settingsFormLayout->addRow(modeLabel, settingsModeCombo_);
+        
+        cameraSettingsLayout->addLayout(settingsFormLayout);
+        cameraSettingsGroup->setLayout(cameraSettingsLayout);
+        contentLayout->addWidget(cameraSettingsGroup);
+        
+        contentLayout->addStretch();
+        settingsContent->setLayout(contentLayout);
+        scrollArea->setWidget(settingsContent);
+        settingsLayout->addWidget(scrollArea);
+        
+        // Save/Load buttons at the bottom
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        settingsSaveBtn_ = new QPushButton("Save Settings", this);
+        settingsLoadBtn_ = new QPushButton("Load Settings", this);
+        connect(settingsSaveBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::saveSettings);
+        connect(settingsLoadBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::loadSettings);
+        buttonLayout->addWidget(settingsLoadBtn_);
+        buttonLayout->addWidget(settingsSaveBtn_);
+        buttonLayout->addStretch();
+        settingsLayout->addLayout(buttonLayout);
+        
+        settingsTab->setLayout(settingsLayout);
+        tabWidget_->addTab(settingsTab, "Settings");
+    }
+    
+    void loadSettingsFromFile() {
+        QString configPath = QDir::homePath() + "/.apriltag_debug_gui_config.yaml";
+        
+        if (!QFile::exists(configPath)) {
+            qDebug() << "Config file not found, using defaults:" << configPath;
+            return;
+        }
+        
+        FileStorage fs(configPath.toStdString(), FileStorage::READ);
+        if (!fs.isOpened()) {
+            qDebug() << "Failed to open config file:" << configPath;
+            return;
+        }
+        
+        // Load fisheye settings
+        if (fs["fisheye"].isMap()) {
+            FileNode fisheyeNode = fs["fisheye"];
+            
+            if (!fisheyeNode["load_on_startup"].empty()) {
+                bool loadOnStartup = static_cast<int>(fisheyeNode["load_on_startup"]);
+                if (settingsLoadCalibrationOnStart_) {
+                    settingsLoadCalibrationOnStart_->setChecked(loadOnStartup != 0);
+                }
+            }
+            
+            if (!fisheyeNode["calibration_path"].empty()) {
+                string calibPath;
+                fisheyeNode["calibration_path"] >> calibPath;
+                if (settingsCalibrationPath_) {
+                    settingsCalibrationPath_->setText(QString::fromStdString(calibPath));
+                }
+            }
+            
+            if (!fisheyeNode["enable_for_mindvision"].empty()) {
+                bool enableForMV = static_cast<int>(fisheyeNode["enable_for_mindvision"]);
+                if (settingsEnableFisheyeForMindVision_) {
+                    settingsEnableFisheyeForMindVision_->setChecked(enableForMV != 0);
+                }
+            }
+        }
+        
+        fs.release();
+        
+        qDebug() << "Settings loaded from:" << configPath;
+    }
+    
+    void saveSettings() {
+        QString configPath = QDir::homePath() + "/.apriltag_debug_gui_config.yaml";
+        QFileInfo fileInfo(configPath);
+        QDir dir = fileInfo.absoluteDir();
+        if (!dir.exists()) {
+            dir.mkpath(".");
+        }
+        
+        FileStorage fs(configPath.toStdString(), FileStorage::WRITE);
+        if (!fs.isOpened()) {
+            QMessageBox::warning(this, "Error", QString("Failed to open config file for writing: %1").arg(configPath));
+            return;
+        }
+        
+        // Save fisheye settings
+        fs << "fisheye" << "{";
+        fs << "load_on_startup" << settingsLoadCalibrationOnStart_->isChecked();
+        fs << "calibration_path" << settingsCalibrationPath_->text().toStdString();
+        fs << "enable_for_mindvision" << settingsEnableFisheyeForMindVision_->isChecked();
+        fs << "}";
+        
+        // Save camera settings from Settings tab if a camera is selected
+        if (settingsCameraCombo_ && settingsCameraCombo_->currentIndex() >= 0) {
+            saveCameraSettingsFromSettingsTab();
+        }
+        
+        fs.release();
+        
+        QMessageBox::information(this, "Settings", QString("Settings saved to:\n%1").arg(configPath));
+        qDebug() << "Settings saved to:" << configPath;
+    }
+    
+    void loadSettings() {
+        loadSettingsFromFile();
+        applySettings();
+    }
+    
+    void applySettings() {
+        // Apply fisheye settings
+        if (settingsLoadCalibrationOnStart_ && settingsLoadCalibrationOnStart_->isChecked()) {
+            if (settingsCalibrationPath_ && !settingsCalibrationPath_->text().isEmpty()) {
+                QString calibPath = settingsCalibrationPath_->text();
+                if (loadFisheyeCalibration(calibPath)) {
+                    qDebug() << "Calibration loaded from settings:" << calibPath;
+                    if (fisheyeStatusLabel_) {
+                        fisheyeStatusLabel_->setText(QString("Calibration: Loaded (Size: %1x%2)")
+                            .arg(fisheye_image_size_.width)
+                            .arg(fisheye_image_size_.height));
+                    }
+                    updateFisheyeStatusIndicator();
+                }
+            }
+        }
     }
     
     void setupAlgorithmsTab(QVBoxLayout *layout) {
@@ -3362,7 +3835,8 @@ private:
         algorithmCameraCombo_ = new QComboBox(this);
         // Populate from already-enumerated cameras (Capture tab enumerates them first)
         // Use the same cameraList_ that was populated in setupCaptureTab()
-        for (size_t i = 0; i < cameraList_.size(); i++) {
+        // Skip "None" option (index 0) for algorithm tab - algorithm requires a camera
+        for (size_t i = 1; i < cameraList_.size(); i++) {
             algorithmCameraCombo_->addItem(QString::fromStdString(cameraList_[i]));
         }
         
@@ -4285,6 +4759,11 @@ private:
         cameraList_.clear();
         isMindVision_.clear();
         
+        // Add "None" option as first item (default selection)
+        cameraCombo_->addItem("None");
+        cameraList_.push_back("None");
+        isMindVision_.push_back(false);
+        
         // Enumerate V4L2 cameras
         // Temporarily redirect stderr to suppress OpenCV warnings during enumeration
         fflush(stderr);
@@ -4339,6 +4818,12 @@ private:
         
         int index = cameraCombo_->currentIndex();
         if (index < 0 || index >= (int)cameraList_.size()) {
+            return;
+        }
+        
+        // Handle "None" selection
+        if (index == 0 && cameraList_[0] == "None") {
+            previewLabel_->setText("No camera selected");
             return;
         }
         
@@ -4459,6 +4944,17 @@ private:
             }
             
             cameraOpen_ = true;
+            
+            // Enable fisheye correction for MindVision cameras if setting is enabled (if calibration is loaded)
+            bool enableFisheyeForMV = true;  // Default to true
+            if (settingsEnableFisheyeForMindVision_) {
+                enableFisheyeForMV = settingsEnableFisheyeForMindVision_->isChecked();
+            }
+            if (enableFisheyeForMV && fisheye_calibration_loaded_ && fisheyeStatusIndicator_) {
+                fisheye_undistort_enabled_ = true;
+                fisheyeStatusIndicator_->setText("Fisheye Correction: APPLIED");
+                fisheyeStatusIndicator_->setStyleSheet("background-color: #90EE90; padding: 5px; border: 1px solid #006400;");
+            }
 #else
             previewLabel_->setText("MindVision SDK not available");
             return;
@@ -4614,6 +5110,8 @@ private:
                         height = testFrame.rows;
                     }
                 }
+                // Initialize Fast AprilTag immediately (matching standalone program pattern)
+                // The standalone creates GpuDetector in main thread and uses it from same thread
                 captureAlgorithm_->initialize(width, height);
             }
 #endif
@@ -4831,7 +5329,6 @@ private:
                                     } else {
                                         qDebug() << "processFrame returned nullptr detections";
                                     }
-                                }
                                 }
                             }
                         }
@@ -5102,28 +5599,37 @@ private:
                     all_patterns.push_back(pdata);
                 }
                 
-                // Calculate grid layout based on successfully extracted patterns
+                // Calculate layout: one tag per row
                 int num_patterns = all_patterns.size();
                 if (num_patterns > 0) {
-                    // Calculate grid layout: try to make it roughly square
-                    int cols = (int)ceil(sqrt(num_patterns));
-                    int rows = (int)ceil((double)num_patterns / cols);
+                    // One tag per row: each tag gets its own row
+                    int cols = 1;
+                    int rows = num_patterns;
                     
-                    // Determine cell size based on number of patterns (smaller when multiple)
-                    // Display 8x8 grid: 6x6 data + 1-cell black border on all sides
-                    // Scale to 75% to fit width better
-                    int base_cell_size = (num_patterns == 1) ? 50 : 30;
-                    int cell_size = (int)(base_cell_size * 0.75);  // 75% of original size
-                    if (cell_size < 1) cell_size = 1;  // Ensure minimum size
-                    int padding = (num_patterns == 1) ? 30 : 15;
-                    int grid_size = 8 * cell_size;  // 8x8 grid (6x6 data + border)
-                    int header_height = (num_patterns == 1) ? 40 : 25;
-                    int spacing = 10; // Space between multiple patterns
+                    // Calculate available space and size to fit all 3 boxes
+                    // Each pattern cell includes: warped image (left) + gray color box (middle) + digitized pattern (right)
+                    // Estimate available width (will be adjusted based on actual label size)
+                    int estimated_width = 1200;  // Estimate, will be adjusted
+                    int padding = 20;
+                    int spacing = 15; // Space between boxes
+                    int header_height = 30;
                     
-                    // Calculate total visualization size
-                    // Each pattern cell includes: warped image (left) + digitized pattern (right)
-                    int warped_image_size = grid_size;  // Same size as pattern grid
-                    int cell_total_width = warped_image_size + spacing + grid_size;  // Warped image + spacing + pattern
+                    // Calculate box size to fit 3 boxes in available width
+                    // total_width = 3 * box_size + 2 * spacing + 2 * padding
+                    // box_size = (total_width - 2 * spacing - 2 * padding) / 3
+                    int available_width_per_row = estimated_width - 2 * padding;
+                    int box_size = (available_width_per_row - 2 * spacing) / 3;
+                    if (box_size < 50) box_size = 50;  // Minimum size
+                    if (box_size > 200) box_size = 200;  // Maximum size
+                    
+                    int cell_size = box_size / 8;  // 8x8 grid, so cell_size = box_size / 8
+                    if (cell_size < 1) cell_size = 1;
+                    
+                    int grid_size = box_size;  // 8x8 grid
+                    int warped_image_size = box_size;
+                    int gray_box_size = box_size;  // Gray color box same size, 8x8
+                    
+                    int cell_total_width = warped_image_size + spacing + gray_box_size + spacing + grid_size;  // Warped + gray + pattern
                     int total_width = cols * (cell_total_width + padding * 2) + (cols - 1) * spacing;
                     int total_height = rows * (grid_size + padding * 2 + header_height) + (rows - 1) * spacing;
                     
@@ -5158,10 +5664,10 @@ private:
                             continue; // Skip if pattern rows have wrong size
                         }
                         
-                        // Calculate position in grid
-                        int col = pattern_idx % cols;
-                        int row = pattern_idx / cols;
-                        int cell_total_width = warped_image_size + spacing + grid_size;
+                        // Calculate position: one tag per row
+                        int col = 0;
+                        int row = pattern_idx;
+                        int cell_total_width = warped_image_size + spacing + grid_size + spacing + gray_box_size;
                         int x_offset = col * (cell_total_width + padding * 2) + (col * spacing);
                         int y_offset = row * (grid_size + padding * 2 + header_height) + (row * spacing);
                         
@@ -5232,8 +5738,81 @@ private:
                                    FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
                         }
                         
-                        // Pattern grid position (to the right of warped image)
-                        int pattern_x_offset = x_offset + padding + warped_image_size + spacing;
+                        // Gray color box position (middle, between warped image and digitized pattern)
+                        int gray_x_offset = x_offset + padding + warped_image_size + spacing;
+                        
+                        // Draw 8x8 gray color box (middle, showing actual gray values)
+                        // Bounds check
+                        int gray_box_right = gray_x_offset + gray_box_size;
+                        int gray_box_bottom = y_offset + header_height + padding + gray_box_size;
+                        if (gray_box_right <= pattern_vis.cols && gray_box_bottom <= pattern_vis.rows) {
+                            // Draw 8x8 grid with actual gray color values (same structure as digitized pattern)
+                            // First, draw border cells (all black)
+                            // Top row (row 0)
+                            for (int c = 0; c < 8; c++) {
+                                int y_pos = y_offset + header_height + padding;
+                                int x_pos = gray_x_offset + c * cell_size;
+                                if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                                Rect cell(x_pos, y_pos, cell_size, cell_size);
+                                rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                                rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                            }
+                            // Bottom row (row 7)
+                            for (int c = 0; c < 8; c++) {
+                                int y_pos = y_offset + header_height + padding + 7 * cell_size;
+                                int x_pos = gray_x_offset + c * cell_size;
+                                if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                                Rect cell(x_pos, y_pos, cell_size, cell_size);
+                                rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                                rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                            }
+                            // Left column (col 0, rows 1-6)
+                            for (int r = 1; r < 7; r++) {
+                                int y_pos = y_offset + header_height + padding + r * cell_size;
+                                int x_pos = gray_x_offset;
+                                if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                                Rect cell(x_pos, y_pos, cell_size, cell_size);
+                                rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                                rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                            }
+                            // Right column (col 7, rows 1-6)
+                            for (int r = 1; r < 7; r++) {
+                                int y_pos = y_offset + header_height + padding + r * cell_size;
+                                int x_pos = gray_x_offset + 7 * cell_size;
+                                if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) break;
+                                Rect cell(x_pos, y_pos, cell_size, cell_size);
+                                rectangle(pattern_vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                                rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
+                            }
+                            
+                            // Now draw the 6x6 data pattern in the center (rows 1-6, columns 1-6) with actual gray values
+                            for (int r = 0; r < 6 && r < (int)pattern.size(); r++) {
+                                if (r >= (int)pattern.size() || pattern[r].size() != 6) continue;
+                                for (int c = 0; c < 6 && c < (int)pattern[r].size(); c++) {
+                                    int val = pattern[r][c];
+                                    // Use actual gray value
+                                    Scalar gray_color(val, val, val);
+                                    
+                                    // Map 6x6 pattern (r,c) to 8x8 grid position (r+1, c+1)
+                                    int y_pos = y_offset + header_height + padding + (r + 1) * cell_size;
+                                    int x_pos = gray_x_offset + (c + 1) * cell_size;
+                                    
+                                    // Defensive bounds check
+                                    if (x_pos + cell_size > pattern_vis.cols || y_pos + cell_size > pattern_vis.rows) continue;
+                                    
+                                    Rect gray_cell(x_pos, y_pos, cell_size, cell_size);
+                                    rectangle(pattern_vis, gray_cell, gray_color, -1);
+                                    rectangle(pattern_vis, gray_cell, Scalar(128, 128, 128), 1);
+                                }
+                            }
+                            
+                            // Label for gray color box
+                            putText(pattern_vis, "Gray Values (8x8: border + 6x6 data)", Point(gray_x_offset, y_offset + header_height + padding - 5),
+                                   FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
+                        }
+                        
+                        // Pattern grid position (to the right of gray color box)
+                        int pattern_x_offset = gray_x_offset + gray_box_size + spacing;
                         
                         // Draw 8x8 grid with pattern (6x6 data + 1-cell black border)
                         // Tag36h11 structure: 8x8 cells total, 1-cell black border, 6x6 data region
@@ -5306,14 +5885,7 @@ private:
                                 rectangle(pattern_vis, cell, color, -1);
                                 rectangle(pattern_vis, cell, Scalar(128, 128, 128), 1);
                                 
-                                // Draw bit value (only if cell is large enough)
-                                if (cell_size >= 25) {
-                                    string bit_str = is_black ? "1" : "0";
-                                    int font_scale = (num_patterns == 1) ? 0.6 : 0.4;
-                                    Scalar text_color = is_black ? Scalar(255, 255, 255) : Scalar(0, 0, 0);
-                                    putText(pattern_vis, bit_str, Point(x_pos + cell_size/4, y_pos + cell_size/2),
-                                           FONT_HERSHEY_SIMPLEX, font_scale, text_color, 1);
-                                }
+                                // No text - just black and white squares
                             }
                         }
                         
@@ -5401,71 +5973,82 @@ private:
                 
                 // Build info text: show patterns first, then hamming codes
                 stringstream info_ss;
-                info_ss << "=== DETECTED TAGS: " << num_tags << " ===\n";
-                info_ss << "=== SUCCESSFULLY EXTRACTED PATTERNS: " << all_patterns.size() << " ===\n\n";
+                try {
+                    info_ss << "=== DETECTED TAGS: " << num_tags << " ===\n";
+                    info_ss << "=== SUCCESSFULLY EXTRACTED PATTERNS: " << all_patterns.size() << " ===\n\n";
+                    
+                    for (size_t pattern_idx = 0; pattern_idx < all_patterns.size(); pattern_idx++) {
+                        try {
+                            const PatternData& pdata = all_patterns[pattern_idx];
+                            // Safety check: ensure detection index is valid
+                            if (pdata.detection_idx >= all_detections_data.size()) {
+                                qDebug() << "Skipping pattern" << pattern_idx << "due to invalid detection_idx:" << pdata.detection_idx << ">= size:" << all_detections_data.size();
+                                continue; // Skip if detection index is out of bounds
+                            }
+                            const DetectionData& data = all_detections_data[pdata.detection_idx];
+                            const vector<vector<int>>& pattern = pdata.pattern;
+                            
+                            // Safety check: ensure pattern is valid (6x6)
+                            if (pattern.size() != 6) {
+                                qDebug() << "Skipping pattern" << pattern_idx << "due to invalid pattern size (rows):" << pattern.size();
+                                continue; // Skip if pattern has wrong number of rows
+                            }
+                            // Check all rows have correct size
+                            bool pattern_valid = true;
+                            for (size_t i = 0; i < pattern.size(); i++) {
+                                if (pattern[i].size() != 6) {
+                                    pattern_valid = false;
+                                    break;
+                                }
+                            }
+                            if (!pattern_valid) {
+                                qDebug() << "Skipping pattern" << pattern_idx << "due to invalid pattern row sizes";
+                                continue; // Skip if pattern rows have wrong size
+                            }
+                            
+                            info_ss << "--- Tag " << (pattern_idx + 1) << " (ID: " << data.id << ") ---\n";
+                            
+                            // Show hamming code info (pattern visualization is shown in the image above)
+                            uint64_t code = extractCodeFromPattern(pattern);
+                            info_ss << "Hamming Code:\n";
+                            info_ss << "  Decision Margin: " << fixed << setprecision(2) << data.decision_margin << "\n";
+                            info_ss << "  Hamming: " << data.hamming << "\n";
+                            info_ss << "  Decimal: " << code << "\n";
+                            info_ss << "  Hex: 0x" << hex << setfill('0') << setw(9) << code << dec << "\n";
+                            info_ss << "  Binary: ";
+                            for (int i = 35; i >= 0; i--) {
+                                info_ss << ((code >> i) & 1);
+                                if (i % 9 == 0 && i > 0) info_ss << " ";
+                            }
+                            info_ss << "\n\n";
+                        } catch (const std::exception& e) {
+                            qDebug() << "Exception processing pattern" << pattern_idx << ":" << e.what();
+                            continue;
+                        } catch (...) {
+                            qDebug() << "Unknown exception processing pattern" << pattern_idx;
+                            continue;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    qDebug() << "Exception building info text:" << e.what();
+                    info_ss.str(""); // Clear the stream
+                    info_ss << "Error building pattern info: " << e.what();
+                } catch (...) {
+                    qDebug() << "Unknown exception building info text";
+                    info_ss.str(""); // Clear the stream
+                    info_ss << "Error building pattern info";
+                }
                 
-                for (size_t pattern_idx = 0; pattern_idx < all_patterns.size(); pattern_idx++) {
-                    const PatternData& pdata = all_patterns[pattern_idx];
-                    // Safety check: ensure detection index is valid
-                    if (pdata.detection_idx >= all_detections_data.size()) {
-                        continue; // Skip if detection index is out of bounds
+                // Safety check before setting text
+                if (capturePatternInfoText_) {
+                    try {
+                        capturePatternInfoText_->setPlainText(QString::fromStdString(info_ss.str()));
+                    } catch (const std::exception& e) {
+                        qDebug() << "Error setting pattern info text:" << e.what();
+                    } catch (...) {
+                        qDebug() << "Unknown error setting pattern info text";
                     }
-                    const DetectionData& data = all_detections_data[pdata.detection_idx];
-                    const vector<vector<int>>& pattern = pdata.pattern;
-                    
-                    // Safety check: ensure pattern is valid (6x6)
-                    if (pattern.size() != 6) {
-                        continue; // Skip if pattern has wrong number of rows
-                    }
-                    // Check all rows have correct size
-                    bool pattern_valid = true;
-                    for (size_t i = 0; i < pattern.size(); i++) {
-                        if (pattern[i].size() != 6) {
-                            pattern_valid = false;
-                            break;
-                        }
-                    }
-                    if (!pattern_valid) {
-                        continue; // Skip if pattern rows have wrong size
-                    }
-                    
-                    info_ss << "--- Tag " << (pattern_idx + 1) << " (ID: " << data.id << ") ---\n";
-                    
-                    // Show 6x6 Pattern (data cells only, no border)
-                    // Tag36h11 structure: 8x8 cells total, 1-cell black border, 6x6 data region
-                    info_ss << "6x6 Data Pattern (border excluded):\n";
-                    info_ss << "    0 1 2 3 4 5\n";
-                    info_ss << "  ┌─────────────┐\n";
-                    // Defensive bounds checking (pattern should already be validated above)
-                    for (int row = 0; row < 6 && row < (int)pattern.size(); row++) {
-                        if (row >= (int)pattern.size() || pattern[row].size() != 6) continue;
-                        info_ss << row << " │";
-                        for (int col = 0; col < 6 && col < (int)pattern[row].size(); col++) {
-                            int val = pattern[row][col];
-                            info_ss << ((val < 128) ? "1" : "0") << " ";
-                        }
-                        info_ss << "│\n";
-                    }
-                    info_ss << "  └─────────────┘\n";
-                    info_ss << "Note: This 6x6 pattern contains ONLY data cells.\n";
-                    info_ss << "      The 1-cell black border is excluded (Tag36h11: 8x8 total, 6x6 data).\n\n";
-                    
-                    // Then show hamming code info
-                    uint64_t code = extractCodeFromPattern(pattern);
-                    info_ss << "Hamming Code:\n";
-                    info_ss << "  Decision Margin: " << fixed << setprecision(2) << data.decision_margin << "\n";
-                    info_ss << "  Hamming: " << data.hamming << "\n";
-                    info_ss << "  Decimal: " << code << "\n";
-                    info_ss << "  Hex: 0x" << hex << setfill('0') << setw(9) << code << dec << "\n";
-                    info_ss << "  Binary: ";
-                    for (int i = 35; i >= 0; i--) {
-                        info_ss << ((code >> i) & 1);
-                        if (i % 9 == 0 && i > 0) info_ss << " ";
-                    }
-                    info_ss << "\n\n";
-                    }
-                    
-                    capturePatternInfoText_->setPlainText(QString::fromStdString(info_ss.str()));
+                }
                 } // End of if (!gray_for_pattern.empty())
             } else if (capturePatternLabel_ && capturePatternInfoText_) {
                 // No detections
@@ -5548,86 +6131,9 @@ private:
         }
     }
 
-    // Tab widget
-    QTabWidget *tabWidget_;
+    // All member variables declared above - duplicates removed (UI elements declared earlier in private section)
     
-    // UI elements (Processing tab)
-    QPushButton *loadBtn1_, *loadBtn2_;
-    QComboBox *preprocessCombo_, *edgeCombo_, *detectionCombo_, *advancedCombo_;
-    QComboBox *quadCombo1_, *quadCombo2_;  // Independent quad selection for each image
-    QCheckBox *mirrorCheckbox1_, *mirrorCheckbox2_;  // Independent mirror for each image
-    QLabel *label1_, *label2_;
-    QTextEdit *infoText_;
-    QTextEdit *qualityText1_, *qualityText2_;  // Quality metrics for each image
-    
-    // UI elements (Capture tab)
-    QComboBox *cameraCombo_;
-    QComboBox *modeCombo_;  // Resolution/FPS selection
-    QComboBox *captureAlgorithmCombo_;  // Algorithm selection for Capture tab
-    QCheckBox *captureMirrorCheckbox_;  // Mirror checkbox for Capture tab
-    QLabel *previewLabel_;
-    QLabel *capturePatternLabel_;  // Pattern visualization for Capture tab
-    QTextEdit *capturePatternInfoText_;  // Pattern info text for Capture tab
-    QPushButton *savePatternsBtn_;  // Button to save pattern visualizations
-    QPushButton *loadImageBtn_;
-    QPushButton *captureBtn_;
-    QPushButton *saveSettingsBtn_;
-    
-    // Stored pattern data for saving
-    struct StoredPatternData {
-        int tag_id;
-        Mat warped_image;
-        vector<vector<int>> pattern;
-    };
-    vector<StoredPatternData> storedPatterns_;
-    mutex storedPatternsMutex_;
-    // previewTimer_ and calibrationPreviewTimer_ already declared at line 159-160
-    
-    // UI elements (Fisheye tab)
-    QLineEdit *calibPathEdit_;
-    QLabel *fisheyeStatusLabel_;  // Status label in Fisheye tab
-    // fisheyeStatusIndicator_ already declared at line 231
-    QPushButton *loadTestImageBtn_;
-    QLabel *fisheyeOriginalLabel_;
-    QLabel *fisheyeCorrectedLabel_;
-    QRadioButton *fisheyeUseOriginalRadio_;
-    QRadioButton *fisheyeUseCorrectedRadio_;
-    
-    // UI elements (Algorithms tab) - duplicates removed, already declared at line 233-246
-    
-    // Calibration process UI
-    QPushButton *resetCalibBtn_;
-    QLabel *calibrationPreviewLabel_;
-    QLabel *calibrationStatusLabel_;
-    QLabel *calibrationProgressLabel_;
-    QPushButton *saveCalibBtn_;
-    
-    // Calibration data
-    bool calibrationInProgress_ = false;
-    vector<vector<Point3f>> objectPoints_;  // 3D points in real world space
-    vector<vector<Point2f>> imagePoints_;   // 2D points in image plane
-    Size checkerboardSize_ = Size(6, 6);     // Inner corners (6x6)
-    vector<Mat> calibrationImages_;
-    vector<bool> gridCaptured_;             // Track which grid positions are captured (6x6 = 36 positions)
-    Mat lastStableFrame_;                    // Last frame with stable checkerboard detection
-    int stableFrameCount_ = 0;               // Count of consecutive stable detections
-    static const int STABLE_THRESHOLD = 10;  // Frames needed for stable detection
-    
-    // Camera settings
-    QSlider *exposureSlider_;
-    QSlider *gainSlider_;
-    QSlider *brightnessSlider_;
-    QSlider *contrastSlider_;
-    QSlider *saturationSlider_;
-    QSlider *sharpnessSlider_;
-    QSpinBox *exposureSpin_;
-    QSpinBox *gainSpin_;
-    QSpinBox *brightnessSpin_;
-    QSpinBox *contrastSpin_;
-    QSpinBox *saturationSpin_;
-    QSpinBox *sharpnessSpin_;
-    
-    // All member variables declared above - duplicates removed (UI elements declared later in file at line 4635+)
+    // All member variables declared above - duplicates removed (calibration data and camera settings declared earlier in private section)
     
     // Helper function to generate capture filename
     QString generateCaptureFilename() {
@@ -5812,6 +6318,231 @@ private:
         }
     }
     
+    void onSettingsCameraChanged(int index) {
+        if (index < 0 || !settingsCameraCombo_) return;
+        
+        // Map settings camera index to actual camera list index (skip "None" at index 0)
+        int actualCameraIndex = index + 1;  // +1 to skip "None"
+        if (actualCameraIndex < 0 || actualCameraIndex >= (int)cameraList_.size()) {
+            return;
+        }
+        
+        // Load camera settings from config file
+        loadCameraSettingsForSettingsTab(actualCameraIndex);
+    }
+    
+    void loadCameraSettingsForSettingsTab(int cameraIndex) {
+        if (cameraIndex < 0 || cameraIndex >= (int)cameraList_.size()) return;
+        
+        QString configPath = "camera_settings.txt";
+        QFile file(configPath);
+        if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            // Config file doesn't exist, use default values
+            return;
+        }
+        
+        QTextStream in(&file);
+        QString cameraName = QString::fromStdString(cameraList_[cameraIndex]);
+        bool isMindVision = isMindVision_[cameraIndex];
+        QString currentType = isMindVision ? "MindVision" : "V4L2";
+        
+        QString section;
+        bool settingsSection = false;
+        bool cameraMatches = false;
+        
+        while (!in.atEnd()) {
+            QString line = in.readLine().trimmed();
+            
+            // Skip comments and empty lines
+            if (line.startsWith("#") || line.isEmpty()) continue;
+            
+            // Check for section headers
+            if (line.startsWith("[") && line.endsWith("]")) {
+                section = line.mid(1, line.length() - 2);
+                settingsSection = (section == "Settings");
+                if (section == "Camera") {
+                    cameraMatches = false;
+                }
+                continue;
+            }
+            
+            // Parse Camera section
+            if (section == "Camera") {
+                if (line.startsWith("name=")) {
+                    QString savedName = line.mid(5).trimmed();
+                    if (savedName == cameraName) {
+                        cameraMatches = true;
+                    }
+                } else if (line.startsWith("type=")) {
+                    QString savedType = line.mid(5).trimmed();
+                    if (savedType != currentType) {
+                        cameraMatches = false;  // Type mismatch
+                    }
+                }
+            }
+            
+            // Parse Settings section (only if camera matches)
+            if (settingsSection && cameraMatches) {
+                if (line.contains("=")) {
+                    QStringList parts = line.split("=");
+                    if (parts.size() == 2) {
+                        QString key = parts[0].trimmed();
+                        QString value = parts[1].trimmed();
+                        bool ok;
+                        int intValue = value.toInt(&ok);
+                        
+                        if (!ok) continue;
+                        
+                        // Block signals while setting values
+                        if (key == "exposure" && settingsExposureSlider_ && settingsExposureSpin_) {
+                            settingsExposureSlider_->blockSignals(true);
+                            settingsExposureSlider_->setValue(intValue);
+                            settingsExposureSpin_->setValue(intValue);
+                            settingsExposureSlider_->blockSignals(false);
+                        } else if (key == "gain" && settingsGainSlider_ && settingsGainSpin_) {
+                            settingsGainSlider_->blockSignals(true);
+                            settingsGainSlider_->setValue(intValue);
+                            settingsGainSpin_->setValue(intValue);
+                            settingsGainSlider_->blockSignals(false);
+                        } else if (key == "brightness" && settingsBrightnessSlider_ && settingsBrightnessSpin_) {
+                            settingsBrightnessSlider_->blockSignals(true);
+                            settingsBrightnessSlider_->setValue(intValue);
+                            settingsBrightnessSpin_->setValue(intValue);
+                            settingsBrightnessSlider_->blockSignals(false);
+                        } else if (key == "contrast" && settingsContrastSlider_ && settingsContrastSpin_) {
+                            settingsContrastSlider_->blockSignals(true);
+                            settingsContrastSlider_->setValue(intValue);
+                            settingsContrastSpin_->setValue(intValue);
+                            settingsContrastSlider_->blockSignals(false);
+                        } else if (key == "saturation" && settingsSaturationSlider_ && settingsSaturationSpin_) {
+                            settingsSaturationSlider_->blockSignals(true);
+                            settingsSaturationSlider_->setValue(intValue);
+                            settingsSaturationSpin_->setValue(intValue);
+                            settingsSaturationSlider_->blockSignals(false);
+                        } else if (key == "sharpness" && settingsSharpnessSlider_ && settingsSharpnessSpin_) {
+                            settingsSharpnessSlider_->blockSignals(true);
+                            settingsSharpnessSlider_->setValue(intValue);
+                            settingsSharpnessSpin_->setValue(intValue);
+                            settingsSharpnessSlider_->blockSignals(false);
+                        } else if (key == "mode_index" && settingsModeCombo_) {
+                            if (intValue >= 0 && intValue < settingsModeCombo_->count()) {
+                                settingsModeCombo_->blockSignals(true);
+                                settingsModeCombo_->setCurrentIndex(intValue);
+                                settingsModeCombo_->blockSignals(false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        file.close();
+    }
+    
+    void saveCameraSettingsFromSettingsTab() {
+        if (!settingsCameraCombo_ || settingsCameraCombo_->currentIndex() < 0) return;
+        
+        // Map settings camera index to actual camera list index (skip "None" at index 0)
+        int actualCameraIndex = settingsCameraCombo_->currentIndex() + 1;  // +1 to skip "None"
+        if (actualCameraIndex < 0 || actualCameraIndex >= (int)cameraList_.size()) {
+            return;
+        }
+        
+        QString configPath = "camera_settings.txt";
+        QFile file(configPath);
+        
+        // Read existing settings to preserve other cameras
+        QMap<QString, QStringList> cameraSections;
+        QString currentCamera;
+        QStringList currentSection;
+        bool inCameraSection = false;
+        bool inSettingsSection = false;
+        
+        if (file.exists() && file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream in(&file);
+            while (!in.atEnd()) {
+                QString line = in.readLine();
+                
+                QString trimmed = line.trimmed();
+                if (trimmed.startsWith("[Camera]")) {
+                    if (!currentCamera.isEmpty() && !currentSection.isEmpty()) {
+                        cameraSections[currentCamera] = currentSection;
+                    }
+                    currentCamera = "";
+                    currentSection.clear();
+                    inCameraSection = true;
+                    inSettingsSection = false;
+                } else if (trimmed.startsWith("[Settings]")) {
+                    inSettingsSection = true;
+                } else if (trimmed.startsWith("name=") && inCameraSection) {
+                    currentCamera = trimmed.mid(5).trimmed();
+                } else if (inSettingsSection && !currentCamera.isEmpty()) {
+                    currentSection.append(line);
+                }
+            }
+            file.close();
+            
+            // Save current camera section
+            if (!currentCamera.isEmpty() && !currentSection.isEmpty()) {
+                cameraSections[currentCamera] = currentSection;
+            }
+        }
+        
+        // Update settings for selected camera
+        QString cameraName = QString::fromStdString(cameraList_[actualCameraIndex]);
+        bool isMindVision = isMindVision_[actualCameraIndex];
+        
+        QStringList newSettings;
+        newSettings.append("exposure=" + QString::number(settingsExposureSlider_ ? settingsExposureSlider_->value() : 50));
+        newSettings.append("gain=" + QString::number(settingsGainSlider_ ? settingsGainSlider_->value() : 50));
+        newSettings.append("brightness=" + QString::number(settingsBrightnessSlider_ ? settingsBrightnessSlider_->value() : 50));
+        newSettings.append("contrast=" + QString::number(settingsContrastSlider_ ? settingsContrastSlider_->value() : 50));
+        newSettings.append("saturation=" + QString::number(settingsSaturationSlider_ ? settingsSaturationSlider_->value() : 50));
+        newSettings.append("sharpness=" + QString::number(settingsSharpnessSlider_ ? settingsSharpnessSlider_->value() : 50));
+        if (settingsModeCombo_ && settingsModeCombo_->currentIndex() >= 0) {
+            newSettings.append("mode_index=" + QString::number(settingsModeCombo_->currentIndex()));
+        }
+        cameraSections[cameraName] = newSettings;
+        
+        // Write all settings back to file
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::warning(this, "Error", "Failed to save camera settings to " + configPath);
+            return;
+        }
+        
+        QTextStream out(&file);
+        out << "# Camera Settings Configuration\n";
+        out << "# Format: camera_name=setting_name=value\n";
+        out << "\n";
+        
+        // Write all camera sections
+        for (auto it = cameraSections.begin(); it != cameraSections.end(); ++it) {
+            QString camName = it.key();
+            QStringList settings = it.value();
+            
+            // Find camera type
+            QString camType = "V4L2";
+            for (size_t i = 0; i < cameraList_.size(); i++) {
+                if (QString::fromStdString(cameraList_[i]) == camName) {
+                    camType = isMindVision_[i] ? "MindVision" : "V4L2";
+                    break;
+                }
+            }
+            
+            out << "[Camera]\n";
+            out << "name=" << camName << "\n";
+            out << "type=" << camType << "\n";
+            out << "\n";
+            out << "[Settings]\n";
+            for (const QString& setting : settings) {
+                out << setting << "\n";
+            }
+            out << "\n";
+        }
+        
+        file.close();
+    }
+    
     void loadCameraSettingsForAlgorithm() {
         QString configPath = "camera_settings.txt";
         QFile file(configPath);
@@ -5822,12 +6553,19 @@ private:
         
         QTextStream in(&file);
         int cameraIndex = algorithmCameraCombo_->currentIndex();
-        if (cameraIndex < 0 || cameraIndex >= (int)cameraList_.size()) {
+        if (cameraIndex < 0 || cameraIndex >= (int)algorithmCameraCombo_->count()) {
             file.close();
             return;
         }
         
-        QString cameraName = QString::fromStdString(cameraList_[cameraIndex]);
+        // Map algorithm camera index to actual camera list index (skip "None" at index 0)
+        int actualCameraIndex = cameraIndex + 1;  // +1 to skip "None"
+        if (actualCameraIndex < 0 || actualCameraIndex >= (int)cameraList_.size()) {
+            file.close();
+            return;
+        }
+        
+        QString cameraName = QString::fromStdString(cameraList_[actualCameraIndex]);
         QString currentType = algorithmUseMindVision_ ? "MindVision" : "V4L2";
         
         QString section;
@@ -5972,6 +6710,17 @@ private:
 #include "apriltag_debug_gui.moc"
 
 int main(int argc, char *argv[]) {
+    // CRITICAL: Disable OpenGL/GPU rendering to prevent interference with CUDA
+    // Force Qt to use software rendering instead of OpenGL
+    // These attributes MUST be set BEFORE creating QApplication
+    QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL, true);
+    QCoreApplication::setAttribute(Qt::AA_DisableShaderDiskCache, true);
+    
+    // Also set environment variables to force software rendering
+    setenv("QT_XCB_FORCE_SOFTWARE_OPENGL", "1", 1);
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    setenv("QT_QUICK_BACKEND", "software", 1);
+    
     QApplication app(argc, argv);
     
     AprilTagDebugGUI window;
