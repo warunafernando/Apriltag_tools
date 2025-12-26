@@ -318,14 +318,55 @@ private slots:
 #endif
         } else {
             // Open V4L2 camera - extract device number from camera name
-            // Camera name format: "V4L2 Camera X" where X is the device number
+            // Camera name format: "V4L2 Camera X" or "Arducam: ... (/dev/videoX)"
             string cameraName = cameraList_[cameraIndex];
-            size_t pos = cameraName.find_last_of(" ");
-            if (pos != string::npos) {
-                string deviceNumStr = cameraName.substr(pos + 1);
-                int deviceNum = stoi(deviceNumStr);
+            int deviceNum = -1;
+            
+            // Try to extract from name like "Arducam: ... (/dev/videoX)" or "Name (/dev/videoX)"
+            size_t devPos = cameraName.find("(/dev/video");
+            if (devPos != string::npos) {
+                size_t start = devPos + 10;  // Skip "(/dev/video"
+                size_t end = cameraName.find(")", start);
+                if (end != string::npos) {
+                    string deviceNumStr = cameraName.substr(start, end - start);
+                    try {
+                        deviceNum = stoi(deviceNumStr);
+                    } catch (...) {
+                        deviceNum = -1;
+                    }
+                }
+            }
+            
+            // Fallback: if extraction failed, try to find device number from "V4L2 Camera X" format
+            if (deviceNum < 0) {
+                size_t pos = cameraName.find_last_of(" ");
+                if (pos != string::npos) {
+                    string deviceNumStr = cameraName.substr(pos + 1);
+                    try {
+                        deviceNum = stoi(deviceNumStr);
+                    } catch (...) {
+                        // If stoi fails, use counting method as last resort
+                        deviceNum = 0;
+                        for (int i = 0; i < cameraIndex; i++) {
+                            if (!isMindVision_[i]) deviceNum++;
+                        }
+                    }
+                } else {
+                    // Last resort: count non-MindVision cameras
+                    deviceNum = 0;
+                    for (int i = 0; i < cameraIndex; i++) {
+                        if (!isMindVision_[i]) deviceNum++;
+                    }
+                }
+            }
+            
+            if (deviceNum >= 0) {
                 // Open with V4L2 backend for better performance
                 algorithmCamera_.open(deviceNum, CAP_V4L2);
+                if (!algorithmCamera_.isOpened()) {
+                    // Try with default backend
+                    algorithmCamera_.open(deviceNum);
+                }
                 if (algorithmCamera_.isOpened()) {
                     // Optimize for fast reading: set buffer size to 1 to minimize latency
                     algorithmCamera_.set(CAP_PROP_BUFFERSIZE, 1);
@@ -338,7 +379,7 @@ private slots:
                     // Load and apply saved camera settings
                     loadCameraSettingsForAlgorithm();
                 }
-        }
+            }
         }
         
         if (!cameraOpened) {

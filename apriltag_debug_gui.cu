@@ -5353,17 +5353,98 @@ private:
 #endif
         } else {
             // Open V4L2 camera
-            // Find the actual V4L2 index
-            int v4l2Index = 0;
-            for (int i = 0; i < index; i++) {
-                if (!isMindVision_[i]) v4l2Index++;
+            // Extract device number from camera name (e.g., "Arducam: ... (/dev/video2)" or "V4L2 Camera 2")
+            int v4l2Index = -1;
+            string cameraNameStr = cameraList_[index];
+            qDebug() << "=== EXTRACTING DEVICE NUMBER ===";
+            qDebug() << "Camera name string:" << QString::fromStdString(cameraNameStr);
+            qDebug() << "Camera name length:" << cameraNameStr.length();
+            qDebug() << "Camera name bytes:" << cameraNameStr.c_str();
+            
+            // Try to extract from name like "Arducam: ... (/dev/videoX)" or "Name (/dev/videoX)"
+            string searchPattern = "(/dev/video";
+            size_t devPos = cameraNameStr.find(searchPattern);
+            qDebug() << "Searching for pattern:" << QString::fromStdString(searchPattern);
+            qDebug() << "Pattern found at position:" << (devPos != string::npos ? (int)devPos : -1);
+            if (devPos != string::npos) {
+                // Pattern "(/dev/video" is 11 characters: ( / d e v / v i d e o
+                // So device number starts at devPos + 11 (right after "video")
+                size_t start = devPos + 11;
+                size_t end = cameraNameStr.find(")", start);
+                qDebug() << "Found pattern, start position:" << (int)start << ", looking for closing ')' at position:" << (end != string::npos ? (int)end : -1);
+                if (end != string::npos && end > start) {
+                    string deviceNumStr = cameraNameStr.substr(start, end - start);
+                    qDebug() << "Extracted device number string (length" << deviceNumStr.length() << "): '" << QString::fromStdString(deviceNumStr) << "'";
+                    
+                    // Trim any whitespace (shouldn't be needed, but just in case)
+                    while (!deviceNumStr.empty() && (deviceNumStr[0] == ' ' || deviceNumStr[0] == '\t')) {
+                        deviceNumStr = deviceNumStr.substr(1);
+                    }
+                    while (!deviceNumStr.empty() && (deviceNumStr.back() == ' ' || deviceNumStr.back() == '\t')) {
+                        deviceNumStr.pop_back();
+                    }
+                    qDebug() << "Final device number string:" << QString::fromStdString(deviceNumStr);
+                    if (!deviceNumStr.empty()) {
+                        try {
+                            v4l2Index = stoi(deviceNumStr);
+                            qDebug() << "Successfully extracted device number" << v4l2Index << "from camera name";
+                        } catch (const std::exception& e) {
+                            qDebug() << "Failed to parse device number:" << e.what();
+                            v4l2Index = -1;
+                        } catch (...) {
+                            qDebug() << "Failed to parse device number (unknown error)";
+                            v4l2Index = -1;
+                        }
+                    } else {
+                        qDebug() << "Device number string is empty after trimming";
+                        v4l2Index = -1;
+                    }
+                } else {
+                    qDebug() << "Could not find closing parenthesis after /dev/video or invalid range";
+                }
+            } else {
+                qDebug() << "Could not find (/dev/video pattern in camera name";
             }
             
+            // Fallback: if extraction failed, try to find device number from "V4L2 Camera X" format
+            if (v4l2Index < 0) {
+                size_t pos = cameraNameStr.find_last_of(" ");
+                if (pos != string::npos) {
+                    string deviceNumStr = cameraNameStr.substr(pos + 1);
+                    try {
+                        v4l2Index = stoi(deviceNumStr);
+                        qDebug() << "Extracted device number" << v4l2Index << "from camera name (fallback):" << QString::fromStdString(cameraNameStr);
+                    } catch (...) {
+                        // If stoi fails, use counting method as last resort
+                        v4l2Index = 0;
+                        for (int i = 0; i < index; i++) {
+                            if (!isMindVision_[i]) v4l2Index++;
+                        }
+                        qDebug() << "Using calculated device index" << v4l2Index << "as fallback";
+                    }
+                } else {
+                    // Last resort: count non-MindVision cameras
+                    v4l2Index = 0;
+                    for (int i = 0; i < index; i++) {
+                        if (!isMindVision_[i]) v4l2Index++;
+                    }
+                    qDebug() << "Using calculated device index" << v4l2Index << "as last resort";
+                }
+            }
+            
+            qDebug() << "Opening V4L2 camera with device index:" << v4l2Index;
             cameraCap_.open(v4l2Index);
             if (!cameraCap_.isOpened()) {
-                previewLabel_->setText(QString("Failed to open V4L2 camera %1").arg(v4l2Index));
+                // Try with CAP_V4L2 explicitly
+                qDebug() << "Failed to open with default backend, trying CAP_V4L2";
+                cameraCap_.open(v4l2Index, CAP_V4L2);
+            }
+            if (!cameraCap_.isOpened()) {
+                previewLabel_->setText(QString("Failed to open V4L2 camera %1 (device /dev/video%1)").arg(v4l2Index));
+                qDebug() << "Failed to open V4L2 camera" << v4l2Index << "for camera:" << QString::fromStdString(cameraNameStr);
                 return;
             }
+            qDebug() << "Successfully opened V4L2 camera" << v4l2Index;
             
             // Check if this is an Arducam camera
             bool isArducam = false;
@@ -5394,28 +5475,34 @@ private:
             if (isArducam) {
                 // For Arducam: Read available resolutions from the camera
                 QString devicePath = QString("/dev/video%1").arg(v4l2Index);
+                qDebug() << "Querying Arducam resolutions from:" << devicePath;
                 QProcess v4l2Process;
                 v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath << "--list-formats-ext");
                 v4l2Process.waitForFinished(3000);  // Wait up to 3 seconds
                 
+                qDebug() << "v4l2-ctl exit code:" << v4l2Process.exitCode();
                 if (v4l2Process.exitCode() == 0) {
                     QString output = v4l2Process.readAllStandardOutput();
+                    qDebug() << "v4l2-ctl output length:" << output.length();
                     QTextStream stream(&output);
                     QString line;
                     int currentWidth = 0, currentHeight = 0;
                     QSet<QString> seenResolutions;  // To avoid duplicates
+                    int linesProcessed = 0;
                     
                     while (stream.readLineInto(&line)) {
+                        linesProcessed++;
                         // Look for "Size: Discrete WxH" lines
                         QRegularExpression sizeRegex(R"(Size: Discrete (\d+)x(\d+))");
                         if (!sizeRegex.isValid()) {
-                            qDebug() << "Invalid regex pattern for size matching";
+                            qDebug() << "Invalid regex pattern for size matching:" << sizeRegex.errorString();
                             continue;
                         }
                         QRegularExpressionMatch match = sizeRegex.match(line);
                         if (match.hasMatch()) {
                             currentWidth = match.captured(1).toInt();
                             currentHeight = match.captured(2).toInt();
+                            qDebug() << "Found resolution:" << currentWidth << "x" << currentHeight;
                         }
                         
                         // Look for "Interval: Discrete X.XXXs (YYY.YYY fps)" lines
@@ -5450,6 +5537,9 @@ private:
                         }
                     }
                     
+                    qDebug() << "Processed" << linesProcessed << "lines from v4l2-ctl output";
+                    qDebug() << "Found" << v4l2_modes_.size() << "resolutions";
+                    
                     // Sort by resolution (width*height) descending, then by FPS descending
                     std::sort(v4l2_modes_.begin(), v4l2_modes_.end(), 
                         [](const Mode& a, const Mode& b) {
@@ -5458,10 +5548,17 @@ private:
                             if (areaA != areaB) return areaA > areaB;
                             return a.fps > b.fps;
                         });
+                } else {
+                    qDebug() << "v4l2-ctl process failed with exit code:" << v4l2Process.exitCode();
+                    QString errorOutput = v4l2Process.readAllStandardError();
+                    if (!errorOutput.isEmpty()) {
+                        qDebug() << "v4l2-ctl error output:" << errorOutput;
+                    }
                 }
                 
                 // Fallback to default modes if v4l2-ctl failed or no modes found
                 if (v4l2_modes_.empty()) {
+                    qDebug() << "No resolutions found, using default Arducam modes";
                     v4l2_modes_.push_back(Mode{1920, 1200, 50.0, "1920x1200 @50 FPS"});
                     v4l2_modes_.push_back(Mode{1920, 1200, 30.0, "1920x1200 @30 FPS"});
                     v4l2_modes_.push_back(Mode{960, 600, 80.0, "960x600 @80 FPS"});
