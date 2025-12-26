@@ -24,9 +24,15 @@ CpuAprilTagAlgorithm::CpuAprilTagAlgorithm()
         td_->quad_decimate = 1.0;
         td_->quad_sigma = 0.0;
         td_->refine_edges = 1;
-        td_->decode_sharpening = 0.25;
+        td_->decode_sharpening = 0.5;  // Increased from 0.25 for better decoding sensitivity
         td_->nthreads = 4;
         td_->wp = workerpool_create(4);
+        
+        // Set more sensitive default quad threshold parameters
+        td_->qtp.min_cluster_pixels = 4;  // More sensitive
+        td_->qtp.max_line_fit_mse = 12.0;  // More lenient
+        td_->qtp.cos_critical_rad = cos(10.0 * M_PI / 180.0);  // More angle tolerance
+        td_->qtp.min_white_black_diff = 4;  // More sensitive
     }
 }
 
@@ -211,5 +217,39 @@ std::string CpuAprilTagAlgorithm::getTimingReport() const {
     oss << "  Last Frame Detections: " << last_frame.num_detections << "\n";
     
     return oss.str();
+}
+
+void CpuAprilTagAlgorithm::updateDetectorParameters(
+    double quad_decimate,
+    double quad_sigma,
+    bool refine_edges,
+    double decode_sharpening,
+    int nthreads,
+    int min_cluster_pixels,
+    double max_line_fit_mse,
+    double critical_angle_degrees,
+    int min_white_black_diff) {
+    
+    if (!td_) {
+        return;
+    }
+    
+    td_->quad_decimate = static_cast<float>(quad_decimate);
+    td_->quad_sigma = static_cast<float>(quad_sigma);
+    td_->refine_edges = refine_edges ? 1 : 0;
+    td_->decode_sharpening = decode_sharpening;
+    td_->nthreads = nthreads;
+    
+    // Update quad threshold parameters
+    td_->qtp.min_cluster_pixels = min_cluster_pixels;
+    td_->qtp.max_line_fit_mse = static_cast<float>(max_line_fit_mse);
+    td_->qtp.cos_critical_rad = cos(critical_angle_degrees * M_PI / 180.0);
+    td_->qtp.min_white_black_diff = min_white_black_diff;
+    
+    // Recreate worker pool if thread count changed
+    if (td_->wp) {
+        workerpool_destroy(td_->wp);
+    }
+    td_->wp = workerpool_create(nthreads);
 }
 

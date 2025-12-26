@@ -53,6 +53,32 @@ public:
      * Check if this algorithm requires CUDA/GPU support.
      */
     virtual bool requiresCuda() const = 0;
+    
+    /**
+     * Update detector parameters from algorithm tuning settings.
+     * Called when user applies algorithm settings in the GUI.
+     * 
+     * @param quad_decimate Quad decimation factor
+     * @param quad_sigma Gaussian blur sigma for quad detection
+     * @param refine_edges Whether to refine edges
+     * @param decode_sharpening Decode sharpening amount
+     * @param nthreads Number of threads
+     * @param min_cluster_pixels Minimum cluster pixels for quad threshold
+     * @param max_line_fit_mse Maximum line fit MSE
+     * @param critical_angle_degrees Critical angle in degrees
+     * @param min_white_black_diff Minimum white-black difference
+     */
+    virtual void updateDetectorParameters(
+        double quad_decimate,
+        double quad_sigma,
+        bool refine_edges,
+        double decode_sharpening,
+        int nthreads,
+        int min_cluster_pixels,
+        double max_line_fit_mse,
+        double critical_angle_degrees,
+        int min_white_black_diff
+    ) {}
 };
 
 #endif // APRILTAG_ALGORITHM_H

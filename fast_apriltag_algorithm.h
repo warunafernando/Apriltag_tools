@@ -90,11 +90,27 @@ public:
     std::string getName() const override { return "Fast AprilTag"; }
     bool requiresCuda() const override { return true; }
     
+    // Update detector parameters from algorithm tuning settings
+    void updateDetectorParameters(
+        double quad_decimate,
+        double quad_sigma,
+        bool refine_edges,
+        double decode_sharpening,
+        int nthreads,
+        int min_cluster_pixels,
+        double max_line_fit_mse,
+        double critical_angle_degrees,
+        int min_white_black_diff
+    ) override;
+    
     // Timing analysis methods
     TimingStats getLastFrameTiming() const { return last_frame_timing_; }
     TimingStats getAverageTiming() const;
     void resetTimingStats() const;
     std::string getTimingReport() const;
+    
+    // Debug: Get quads before filtering (for visualization)
+    std::vector<frc971::apriltag::QuadCorners> getLastFrameQuads() const { return last_frame_quads_; }
     
 private:
     // Dimensions
@@ -151,6 +167,9 @@ private:
     mutable TimingStats last_frame_timing_;      // Last frame's timing
     mutable TimingStats accumulated_stats_;      // Accumulated stats for averaging
     mutable int frame_count_;                    // Number of frames processed
+    
+    // Debug: Store quads before filtering for visualization
+    mutable std::vector<frc971::apriltag::QuadCorners> last_frame_quads_;
     
     // Helper functions ported from video_visualize_fixed.cu
     bool isValidDetection(apriltag_detection_t* det, int width, int height);

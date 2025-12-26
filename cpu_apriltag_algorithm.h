@@ -44,6 +44,18 @@ public:
     std::string getName() const override { return "OpenCV CPU (AprilTag)"; }
     bool requiresCuda() const override { return false; }
     
+    void updateDetectorParameters(
+        double quad_decimate,
+        double quad_sigma,
+        bool refine_edges,
+        double decode_sharpening,
+        int nthreads,
+        int min_cluster_pixels,
+        double max_line_fit_mse,
+        double critical_angle_degrees,
+        int min_white_black_diff
+    ) override;
+    
     // Timing analysis methods
     TimingStats getLastFrameTiming() const;
     TimingStats getAverageTiming() const;

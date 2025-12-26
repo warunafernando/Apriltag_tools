@@ -51,6 +51,10 @@ namespace apriltag_gpu = frc971::apriltag;
 #include <QFile>
 #include <QTextStream>
 #include <QIODevice>
+#include <cstdio>  // For popen/pclose
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
 
 // MindVision SDK (optional)
 #ifdef HAVE_MINDVISION_SDK
@@ -70,6 +74,10 @@ extern "C" {
 #include <mutex>
 #include <condition_variable>
 #include <cstdlib>  // For setenv
+#include <cstdio>  // For popen/pclose
+#include <stdexcept>
+#include <cctype>  // For isdigit
+#include <fstream>  // For reading camera names from /sys
 
 using namespace cv;
 using namespace std;
@@ -316,15 +324,20 @@ private slots:
             if (pos != string::npos) {
                 string deviceNumStr = cameraName.substr(pos + 1);
                 int deviceNum = stoi(deviceNumStr);
-                algorithmCamera_.open(deviceNum);
+                // Open with V4L2 backend for better performance
+                algorithmCamera_.open(deviceNum, CAP_V4L2);
                 if (algorithmCamera_.isOpened()) {
-                algorithmCamera_.set(CAP_PROP_FRAME_WIDTH, 1280);
-                algorithmCamera_.set(CAP_PROP_FRAME_HEIGHT, 1024);
-                cameraOpened = true;
-                
-                // Load and apply saved camera settings
-                loadCameraSettingsForAlgorithm();
-            }
+                    // Optimize for fast reading: set buffer size to 1 to minimize latency
+                    algorithmCamera_.set(CAP_PROP_BUFFERSIZE, 1);
+                    // Set default to 1920x1200 @ 50fps for Arducam B0495
+                    algorithmCamera_.set(CAP_PROP_FRAME_WIDTH, 1920);
+                    algorithmCamera_.set(CAP_PROP_FRAME_HEIGHT, 1200);
+                    algorithmCamera_.set(CAP_PROP_FPS, 50.0);
+                    cameraOpened = true;
+                    
+                    // Load and apply saved camera settings
+                    loadCameraSettingsForAlgorithm();
+                }
         }
         }
         
@@ -1113,6 +1126,54 @@ private:
         QVBoxLayout *algorithmsLayout = new QVBoxLayout(algorithmsTab);
         setupAlgorithmsTab(algorithmsLayout);
         tabWidget_->addTab(algorithmsTab, "Algorithms");
+        
+        // Camera selection (outside tabs, always visible)
+        QGroupBox *cameraGroup = new QGroupBox("Camera Selection", this);
+        QHBoxLayout *cameraLayout = new QHBoxLayout();
+        QLabel *cameraLabel = new QLabel("Camera:", this);
+        cameraCombo_ = new QComboBox(this);
+        connect(cameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::openCamera);
+        cameraLayout->addWidget(cameraLabel);
+        cameraLayout->addWidget(cameraCombo_);
+        cameraLayout->addStretch();
+        cameraGroup->setLayout(cameraLayout);
+        mainLayout->addWidget(cameraGroup);
+        
+        // Initialize camera enumeration
+        enumerateCameras();
+        
+        // DEBUG: Auto-select first camera (or Arducam if available) on startup
+        qDebug() << "=== AUTO-SELECTING CAMERA FOR DEBUG ===";
+        qDebug() << "Total cameras found:" << cameraCombo_->count();
+        int arducamIndex = -1;
+        for (int i = 0; i < cameraCombo_->count(); i++) {
+            QString name = cameraCombo_->itemText(i);
+            qDebug() << "  Camera" << i << ":" << name;
+            if (name.contains("Arducam", Qt::CaseInsensitive) || name.contains("B0459", Qt::CaseInsensitive)) {
+                arducamIndex = i;
+                qDebug() << "  Found Arducam at index" << i;
+                break;
+            }
+        }
+        if (arducamIndex >= 0) {
+            qDebug() << "Auto-selecting Arducam camera at index" << arducamIndex;
+            cameraCombo_->setCurrentIndex(arducamIndex);
+            // Manually call openCamera() to ensure it's triggered (use longer delay to ensure UI is ready)
+            QTimer::singleShot(500, this, [this]() {
+                qDebug() << "Calling openCamera() manually after auto-selection";
+                openCamera();
+            });
+        } else if (cameraCombo_->count() > 0) {
+            // Select first camera (index 0)
+            qDebug() << "Auto-selecting first camera at index 0";
+            cameraCombo_->setCurrentIndex(0);
+            // Manually call openCamera() to ensure it's triggered
+            QTimer::singleShot(500, this, [this]() {
+                qDebug() << "Calling openCamera() manually after auto-selection";
+                openCamera();
+            });
+        }
         
         // Fisheye correction status indicator (at the top, outside tabs)
         QGroupBox *fisheyeStatusGroup = new QGroupBox("Fisheye Correction Status", this);
@@ -2484,18 +2545,7 @@ private:
     }
     
     void setupCaptureTab(QVBoxLayout *layout) {
-        // Camera selection
-        QGroupBox *cameraGroup = new QGroupBox("Camera Selection", this);
-        QHBoxLayout *cameraLayout = new QHBoxLayout();
-        QLabel *cameraLabel = new QLabel("Camera:", this);
-        cameraCombo_ = new QComboBox(this);
-        connect(cameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
-                this, &AprilTagDebugGUI::openCamera);
-        cameraLayout->addWidget(cameraLabel);
-        cameraLayout->addWidget(cameraCombo_);
-        cameraLayout->addStretch();
-        cameraGroup->setLayout(cameraLayout);
-        layout->addWidget(cameraGroup);
+        // Note: Camera selection is now outside tabs in setupUI()
         
         // Resolution/FPS selection
         QGroupBox *modeGroup = new QGroupBox("Resolution & FPS", this);
@@ -2643,8 +2693,7 @@ private:
         previewLayout->addLayout(controlLayout);
         layout->addLayout(previewLayout);
         
-        // Initialize camera enumeration
-        enumerateCameras();
+        // Note: Camera enumeration is now in setupUI() (outside tabs)
         
         // Setup preview timer
         previewTimer_ = new QTimer(this);
@@ -3605,13 +3654,30 @@ private:
         cameraList_.clear();
         isMindVision_.clear();
         
-        // Enumerate V4L2 cameras
+        // Enumerate V4L2 cameras - try both with and without CAP_V4L2 (same as opening)
         for (int i = 0; i < 10; i++) {
-            VideoCapture testCap(i);
+            VideoCapture testCap;
+            // Try with CAP_V4L2 first (same method as opening)
+            testCap.open(i, CAP_V4L2);
+            if (!testCap.isOpened()) {
+                // Fallback: try without specifying backend
+                testCap.open(i);
+            }
             if (testCap.isOpened()) {
-                cameraList_.push_back("V4L2 Camera " + to_string(i));
+                // Try to read camera name from /sys/class/video4linux
+                string cameraName = "V4L2 Camera " + to_string(i);
+                string sysPath = "/sys/class/video4linux/video" + to_string(i) + "/name";
+                ifstream nameFile(sysPath);
+                if (nameFile.is_open()) {
+                    string line;
+                    if (getline(nameFile, line) && !line.empty()) {
+                        cameraName = "Arducam: " + line + " (/dev/video" + to_string(i) + ")";
+                    }
+                    nameFile.close();
+                }
+                cameraList_.push_back(cameraName);
                 isMindVision_.push_back(false);
-                cameraCombo_->addItem(QString("V4L2 Camera %1").arg(i));
+                cameraCombo_->addItem(QString::fromStdString(cameraName));
                 testCap.release();
             }
         }
@@ -3636,15 +3702,21 @@ private:
     }
     
     void openCamera() {
+        qDebug() << "=== openCamera() CALLED ===";
         closeCamera();
         
         int index = cameraCombo_->currentIndex();
+        qDebug() << "Camera combo current index:" << index;
+        qDebug() << "cameraList_ size:" << cameraList_.size();
         if (index < 0 || index >= (int)cameraList_.size()) {
+            qDebug() << "ERROR: Invalid camera index!";
             return;
         }
+        qDebug() << "Camera name from list:" << QString::fromStdString(cameraList_[index]);
         
         selectedCameraIndex_ = index;
         useMindVision_ = isMindVision_[index];
+        qDebug() << "useMindVision_:" << (useMindVision_ ? "true" : "false");
         
         if (useMindVision_) {
 #ifdef HAVE_MINDVISION_SDK
@@ -3765,36 +3837,153 @@ private:
             return;
 #endif
         } else {
-            // Open V4L2 camera
-            // Find the actual V4L2 index
-            int v4l2Index = 0;
-            for (int i = 0; i < index; i++) {
-                if (!isMindVision_[i]) v4l2Index++;
+            // Open V4L2 camera - extract device number from camera name
+            // Camera name format: "V4L2 Camera X" or "Arducam: ... (/dev/videoX)"
+            string cameraName = cameraList_[index];
+            std::cerr << "=== OPENING V4L2 CAMERA ===" << std::endl;
+            std::cerr << "Camera name: " << cameraName << std::endl;
+            std::cerr << "Camera index: " << index << std::endl;
+            qDebug() << "=== OPENING V4L2 CAMERA ===";
+            qDebug() << "Camera name:" << QString::fromStdString(cameraName);
+            qDebug() << "Camera index:" << index;
+            int v4l2Index = -1;
+            
+            // Try to extract from "/dev/videoX" format first (for Arducam cameras)
+            size_t devPos = cameraName.find("/dev/video");
+            if (devPos != string::npos) {
+                size_t numStart = devPos + 10;  // "/dev/video" is 10 chars
+                size_t numEnd = numStart;
+                while (numEnd < cameraName.length() && isdigit(cameraName[numEnd])) {
+                    numEnd++;
+                }
+                if (numEnd > numStart) {
+                    try {
+                        string deviceNumStr = cameraName.substr(numStart, numEnd - numStart);
+                        v4l2Index = stoi(deviceNumStr);
+                        qDebug() << "Extracted device index" << v4l2Index << "from /dev/video format";
+                    } catch (...) {
+                        qDebug() << "Failed to parse device number from /dev/video format";
+                    }
+                }
             }
             
-            cameraCap_.open(v4l2Index);
+            // Fallback: try "V4L2 Camera X" format
+            if (v4l2Index == -1) {
+                size_t pos = cameraName.find_last_of(" ");
+                if (pos != string::npos) {
+                    string deviceNumStr = cameraName.substr(pos + 1);
+                    try {
+                        v4l2Index = stoi(deviceNumStr);
+                        qDebug() << "Extracted device index" << v4l2Index << "from V4L2 Camera format";
+                    } catch (...) {
+                        qDebug() << "Failed to parse device number from camera name:" << QString::fromStdString(cameraName);
+                        previewLabel_->setText("Failed to parse camera device number");
+                        return;
+                    }
+                } else {
+                    qDebug() << "Invalid camera name format:" << QString::fromStdString(cameraName);
+                    previewLabel_->setText("Invalid camera name format");
+                    return;
+                }
+            }
+            
+            qDebug() << "Opening V4L2 camera device" << v4l2Index << "from camera name:" << QString::fromStdString(cameraName);
+            
+            // Try opening with V4L2 backend first
+            cameraCap_.open(v4l2Index, CAP_V4L2);
             if (!cameraCap_.isOpened()) {
-                previewLabel_->setText(QString("Failed to open V4L2 camera %1").arg(v4l2Index));
+                qDebug() << "Failed to open with CAP_V4L2, trying default backend...";
+                // Fallback: try without specifying backend (OpenCV will auto-detect)
+                cameraCap_.open(v4l2Index);
+            }
+            if (!cameraCap_.isOpened()) {
+                previewLabel_->setText(QString("Failed to open V4L2 camera device %1\n\nTry:\n- Check camera permissions\n- Ensure camera is not in use by another application").arg(v4l2Index));
+                qDebug() << "Failed to open camera device" << v4l2Index << "with both CAP_V4L2 and default backend";
                 return;
             }
             
-            // Initialize V4L2 modes
-            v4l2_modes_.clear();
-            v4l2_modes_.push_back(Mode{640, 480, 30.0, "640x480 @30 FPS"});
-            v4l2_modes_.push_back(Mode{1280, 720, 30.0, "1280x720 @30 FPS"});
-            v4l2_modes_.push_back(Mode{1920, 1080, 30.0, "1920x1080 @30 FPS"});
-            v4l2_modes_.push_back(Mode{640, 480, 60.0, "640x480 @60 FPS"});
+            qDebug() << "Successfully opened V4L2 camera device" << v4l2Index;
             
-            // Populate mode combo
-            modeCombo_->blockSignals(true);
-            modeCombo_->clear();
-            for (const auto &m : v4l2_modes_) {
-                modeCombo_->addItem(QString::fromStdString(m.label));
+            // Optimize for fast reading: set buffer size to 1 to minimize latency
+            cameraCap_.set(CAP_PROP_BUFFERSIZE, 1);
+            
+            // Always add Arducam B0459 12MP camera resolutions as defaults for ALL V4L2 cameras
+            // (These will be available regardless of v4l2-ctl parsing)
+            std::cerr << "=== ADDING ARDUCAM B0459 RESOLUTIONS ===" << std::endl;
+            std::cerr << "Camera name: " << cameraName << std::endl;
+            qDebug() << "=== ADDING ARDUCAM B0459 RESOLUTIONS ===";
+            v4l2_modes_.clear();
+            // Arducam B0459 12MP camera resolutions
+            v4l2_modes_.push_back(Mode{4056, 3040, 10.0, "4056x3040 @10 FPS"});
+            v4l2_modes_.push_back(Mode{4056, 3040, 5.0, "4056x3040 @5 FPS"});
+            v4l2_modes_.push_back(Mode{3840, 2160, 20.0, "3840x2160 @20 FPS"});
+            v4l2_modes_.push_back(Mode{3840, 2160, 15.0, "3840x2160 @15 FPS"});
+            v4l2_modes_.push_back(Mode{3840, 2160, 10.0, "3840x2160 @10 FPS"});
+            v4l2_modes_.push_back(Mode{3840, 2160, 5.0, "3840x2160 @5 FPS"});
+            v4l2_modes_.push_back(Mode{2016, 1520, 50.0, "2016x1520 @50 FPS"});
+            v4l2_modes_.push_back(Mode{2016, 1520, 30.0, "2016x1520 @30 FPS"});
+            v4l2_modes_.push_back(Mode{2016, 1520, 15.0, "2016x1520 @15 FPS"});
+            v4l2_modes_.push_back(Mode{2016, 1520, 10.0, "2016x1520 @10 FPS"});
+            v4l2_modes_.push_back(Mode{2016, 1520, 5.0, "2016x1520 @5 FPS"});
+            v4l2_modes_.push_back(Mode{1920, 1080, 60.0, "1920x1080 @60 FPS"});
+            v4l2_modes_.push_back(Mode{1920, 1080, 30.0, "1920x1080 @30 FPS"});
+            v4l2_modes_.push_back(Mode{1920, 1080, 15.0, "1920x1080 @15 FPS"});
+            v4l2_modes_.push_back(Mode{1920, 1080, 10.0, "1920x1080 @10 FPS"});
+            v4l2_modes_.push_back(Mode{1920, 1080, 5.0, "1920x1080 @5 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 120.0, "1280x720 @120 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 60.0, "1280x720 @60 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 30.0, "1280x720 @30 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 15.0, "1280x720 @15 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 10.0, "1280x720 @10 FPS"});
+            v4l2_modes_.push_back(Mode{1280, 720, 5.0, "1280x720 @5 FPS"});
+            // Common defaults
+            v4l2_modes_.push_back(Mode{640, 480, 30.0, "640x480 @30 FPS"});
+            qDebug() << "Added" << v4l2_modes_.size() << "modes to v4l2_modes_ vector";
+            
+            // Sort modes by resolution (largest first), then by FPS (highest first)
+            sort(v4l2_modes_.begin(), v4l2_modes_.end(), 
+                 [](const Mode& a, const Mode& b) {
+                     if (a.width * a.height != b.width * b.height) {
+                         return a.width * a.height > b.width * b.height;
+                     }
+                     return a.fps > b.fps;
+                 });
+            
+            qDebug() << "Total modes available:" << v4l2_modes_.size();
+            for (const auto& m : v4l2_modes_) {
+                qDebug() << "  Mode:" << QString::fromStdString(m.label);
             }
-            modeCombo_->setCurrentIndex(0);
-            modeCombo_->setEnabled(true);
-            modeCombo_->blockSignals(false);
-            applyMode(0);
+            
+            // Populate mode combo BEFORE loading camera settings (so settings don't clear it)
+            qDebug() << "=== POPULATING MODE COMBO ===";
+            qDebug() << "v4l2_modes_ size:" << v4l2_modes_.size();
+            qDebug() << "modeCombo_ pointer:" << (void*)modeCombo_;
+            if (!modeCombo_) {
+                qDebug() << "ERROR: modeCombo_ is NULL!";
+            } else {
+                modeCombo_->blockSignals(true);
+                modeCombo_->clear();
+                qDebug() << "Cleared mode combo. Now populating with" << v4l2_modes_.size() << "modes";
+                for (size_t i = 0; i < v4l2_modes_.size(); i++) {
+                    const auto &m = v4l2_modes_[i];
+                    modeCombo_->addItem(QString::fromStdString(m.label));
+                    qDebug() << "  Added mode" << i << ":" << QString::fromStdString(m.label);
+                }
+                qDebug() << "Mode combo now has" << modeCombo_->count() << "items";
+                // Default to first mode (usually highest resolution/FPS)
+                if (modeCombo_->count() > 0) {
+                    modeCombo_->setCurrentIndex(0);
+                    qDebug() << "Set current index to 0";
+                }
+                modeCombo_->setEnabled(true);
+                qDebug() << "Mode combo enabled:" << modeCombo_->isEnabled();
+                modeCombo_->blockSignals(false);
+                if (modeCombo_->count() > 0) {
+                    applyMode(0);
+                    qDebug() << "Called applyMode(0)";
+                }
+                qDebug() << "=== MODE COMBO POPULATION COMPLETE ===";
+            }
             
             cameraOpen_ = true;
         }
@@ -3803,8 +3992,23 @@ private:
         saveSettingsBtn_->setEnabled(true);
         previewTimer_->start(33);  // ~30 FPS
         
-        // Load camera settings from config file
+        // Load camera settings from config file (AFTER modes are populated)
         loadCameraSettings();
+        
+        // Verify modes are still there after loading settings
+        qDebug() << "After loadCameraSettings: mode combo has" << modeCombo_->count() << "items";
+        if (modeCombo_->count() == 0 && v4l2_modes_.size() > 0) {
+            qDebug() << "WARNING: Mode combo was cleared! Repopulating...";
+            modeCombo_->blockSignals(true);
+            for (const auto &m : v4l2_modes_) {
+                modeCombo_->addItem(QString::fromStdString(m.label));
+            }
+            if (modeCombo_->count() > 0) {
+                modeCombo_->setCurrentIndex(0);
+            }
+            modeCombo_->setEnabled(true);
+            modeCombo_->blockSignals(false);
+        }
         
         // Generate initial capture filename
         suggestedCaptureFilename_ = generateCaptureFilename().toStdString();
@@ -3883,6 +4087,185 @@ private:
         }
     }
     
+    void queryV4L2CameraModes(int deviceIndex) {
+        // Use v4l2-ctl to query available formats and frame sizes
+        QString devicePath = QString("/dev/video%1").arg(deviceIndex);
+        QString command = QString("v4l2-ctl --device=%1 --list-formats-ext 2>&1").arg(devicePath);
+        
+        qDebug() << "Querying camera modes with command:" << command;
+        
+        FILE* pipe = popen(command.toStdString().c_str(), "r");
+        if (!pipe) {
+            qDebug() << "Failed to open pipe for v4l2-ctl";
+            return;
+        }
+        
+        char buffer[2048];
+        string currentFormat;
+        int currentWidth = 0, currentHeight = 0;
+        vector<double> currentFpsList;
+        string fullOutput;
+        
+        // Read all output first for debugging
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            fullOutput += string(buffer);
+        }
+        pclose(pipe);
+        
+        qDebug() << "v4l2-ctl output:\n" << QString::fromStdString(fullOutput);
+        
+        // Parse the output line by line
+        istringstream iss(fullOutput);
+        string line;
+        
+        while (getline(iss, line)) {
+            // Parse format line: "[0]: 'YUYV' (YUYV 4:2:2)" or "Pixel Format  : 'YUYV'"
+            if ((line.find("'") != string::npos && line.find(":") != string::npos) || 
+                (line.find("Pixel Format") != string::npos)) {
+                size_t start = line.find("'");
+                if (start != string::npos) {
+                    size_t end = line.find("'", start + 1);
+                    if (end != string::npos) {
+                        currentFormat = line.substr(start + 1, end - start - 1);
+                        currentWidth = 0;
+                        currentHeight = 0;
+                        currentFpsList.clear();
+                        qDebug() << "Found format:" << QString::fromStdString(currentFormat);
+                    }
+                }
+            }
+            // Parse size line: "Size: Discrete 1920x1200" or "Size: Stepwise 0x0 - 4056x3040 with step 8/8"
+            else if (line.find("Size:") != string::npos) {
+                size_t xPos = line.find("x");
+                if (xPos != string::npos && xPos > 0 && xPos < line.length() - 1) {
+                    try {
+                        // Extract width - look backwards from 'x' for digits
+                        string widthStr;
+                        for (int i = static_cast<int>(xPos) - 1; i >= 0; i--) {
+                            if (isdigit(line[i])) {
+                                widthStr = line[i] + widthStr;
+                            } else if (!widthStr.empty()) {
+                                break;  // Stop when we hit non-digit after finding digits
+                            }
+                        }
+                        
+                        // Extract height - look forwards from 'x' for digits
+                        string heightStr;
+                        for (size_t i = xPos + 1; i < line.length(); i++) {
+                            if (isdigit(line[i])) {
+                                heightStr += line[i];
+                            } else if (!heightStr.empty()) {
+                                break;  // Stop when we hit non-digit after finding digits
+                            }
+                        }
+                        
+                        if (!widthStr.empty() && !heightStr.empty()) {
+                            currentWidth = stoi(widthStr);
+                            currentHeight = stoi(heightStr);
+                            currentFpsList.clear();
+                            qDebug() << "Found size:" << currentWidth << "x" << currentHeight << "from line:" << QString::fromStdString(line);
+                        }
+                    } catch (const exception& e) {
+                        qDebug() << "Error parsing size:" << e.what() << "from line:" << QString::fromStdString(line);
+                    }
+                }
+            }
+            // Parse FPS line: "Interval: Discrete 0.020s (50.000 fps)" or "\t\t\tInterval: Discrete 0.008s (120.000 fps)"
+            else if (line.find("Interval:") != string::npos && currentWidth > 0 && currentHeight > 0) {
+                // Handle "Interval: Discrete 0.020s (50.000 fps)" format
+                size_t fpsPos = line.find("fps");
+                if (fpsPos != string::npos) {
+                    // Look for the number in parentheses before "fps" - format is "(50.000 fps)"
+                    size_t parenStart = line.rfind("(", fpsPos);
+                    if (parenStart != string::npos && parenStart < fpsPos) {
+                        try {
+                            // Extract FPS value from between '(' and 'fps'
+                            string fpsStr;
+                            for (size_t i = parenStart + 1; i < fpsPos; i++) {
+                                if (isdigit(line[i]) || line[i] == '.') {
+                                    fpsStr += line[i];
+                                } else if (!fpsStr.empty() && line[i] == ' ') {
+                                    break;  // Stop at space after number
+                                }
+                            }
+                            if (!fpsStr.empty()) {
+                                double fps = stod(fpsStr);
+                                // Only add unique modes (avoid duplicates)
+                                bool exists = false;
+                                for (const auto& m : v4l2_modes_) {
+                                    if (m.width == currentWidth && m.height == currentHeight && 
+                                        abs(m.fps - fps) < 0.1) {
+                                        exists = true;
+                                        break;
+                                    }
+                                }
+                                if (!exists) {
+                                    stringstream label;
+                                    label << currentWidth << "x" << currentHeight << " @" << fixed << setprecision(0) << fps << " FPS";
+                                    v4l2_modes_.push_back(Mode{currentWidth, currentHeight, fps, label.str()});
+                                    qDebug() << "Found mode:" << QString::fromStdString(label.str()) << "from line:" << QString::fromStdString(line);
+                                }
+                            }
+                        } catch (const exception& e) {
+                            qDebug() << "Error parsing FPS:" << e.what() << "from line:" << QString::fromStdString(line);
+                        }
+                    }
+                }
+            }
+                // Handle "Frame rates: 30.000, 25.000, 20.000" format
+                else if (line.find("Frame rates:") != string::npos) {
+                    size_t ratesPos = line.find("Frame rates:");
+                    if (ratesPos != string::npos) {
+                        string ratesStr = line.substr(ratesPos + 12);
+                        istringstream ratesStream(ratesStr);
+                        string rate;
+                        while (getline(ratesStream, rate, ',')) {
+                            try {
+                                // Trim whitespace
+                                rate.erase(0, rate.find_first_not_of(" \t"));
+                                rate.erase(rate.find_last_not_of(" \t") + 1);
+                                if (!rate.empty()) {
+                                    double fps = stod(rate);
+                                    // Only add unique modes (avoid duplicates)
+                                    bool exists = false;
+                                    for (const auto& m : v4l2_modes_) {
+                                        if (m.width == currentWidth && m.height == currentHeight && 
+                                            abs(m.fps - fps) < 0.1) {
+                                            exists = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!exists) {
+                                        stringstream label;
+                                        label << currentWidth << "x" << currentHeight << " @" << fixed << setprecision(0) << fps << " FPS";
+                                        v4l2_modes_.push_back(Mode{currentWidth, currentHeight, fps, label.str()});
+                                        qDebug() << "Found mode:" << QString::fromStdString(label.str());
+                                    }
+                                }
+                            } catch (const exception& e) {
+                                qDebug() << "Error parsing frame rate:" << e.what();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort modes by resolution (largest first), then by FPS (highest first)
+        sort(v4l2_modes_.begin(), v4l2_modes_.end(), 
+             [](const Mode& a, const Mode& b) {
+                 if (a.width * a.height != b.width * b.height) {
+                     return a.width * a.height > b.width * b.height;
+                 }
+                 return a.fps > b.fps;
+             });
+        
+        qDebug() << "Found" << v4l2_modes_.size() << "camera modes";
+        for (const auto& m : v4l2_modes_) {
+            qDebug() << "  -" << QString::fromStdString(m.label);
+        }
+    }
+    
     void applyMode(int mode_index) {
         if (mode_index < 0 || mode_index >= static_cast<int>(v4l2_modes_.size())) return;
         if (!cameraCap_.isOpened()) return;
@@ -3891,6 +4274,13 @@ private:
         cameraCap_.set(CAP_PROP_FRAME_WIDTH, m.width);
         cameraCap_.set(CAP_PROP_FRAME_HEIGHT, m.height);
         cameraCap_.set(CAP_PROP_FPS, m.fps);
+        
+        // Verify the settings were applied
+        double actualWidth = cameraCap_.get(CAP_PROP_FRAME_WIDTH);
+        double actualHeight = cameraCap_.get(CAP_PROP_FRAME_HEIGHT);
+        double actualFps = cameraCap_.get(CAP_PROP_FPS);
+        qDebug() << "Set mode:" << m.width << "x" << m.height << "@" << m.fps << "fps";
+        qDebug() << "Actual mode:" << actualWidth << "x" << actualHeight << "@" << actualFps << "fps";
     }
     
     void applyMVMode(int mode_index) {

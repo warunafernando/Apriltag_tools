@@ -23,7 +23,7 @@ FastAprilTagAlgorithm::FastAprilTagAlgorithm()
     : width_(0), height_(0), initialized_(false),
       gpu_detector_(nullptr),
       tf_gpu_(nullptr), td_gpu_(nullptr), td_for_gpu_(nullptr),
-      min_distance_(50.0),
+      min_distance_(10.0),  // Reduced to 10.0 pixels - only filter extremely close duplicates (same physical tag)
       frame_count_(0),
       frames_seen_(0),
       worker_running_(false) {
@@ -54,39 +54,63 @@ std::vector<apriltag_detection_t*> FastAprilTagAlgorithm::filterDuplicates(
     const zarray_t* detections, int width, int height, double min_distance) {
     
     std::vector<apriltag_detection_t*> filtered;
-    std::vector<apriltag_detection_t*> all_dets;
+    std::vector<apriltag_detection_t*> valid_dets;
     
-    // Extract all detections
+    // First, collect valid detections (within image bounds)
     for (int i = 0; i < zarray_size(detections); i++) {
         apriltag_detection_t* det;
         zarray_get(const_cast<zarray_t*>(detections), i, &det);
-        all_dets.push_back(det);
+        if (isValidDetection(det, width, height)) {
+            valid_dets.push_back(det);
+        }
     }
     
-    // Group by tag ID and keep only the best VALID one per ID
-    std::map<int, apriltag_detection_t*> best_by_id;
+    if (valid_dets.empty()) {
+        return filtered;
+    }
     
-    for (auto* det : all_dets) {
-        // Only consider valid detections (within image bounds)
-        if (!isValidDetection(det, width, height)) {
-            continue;
-        }
+    // Sort by decision_margin (best first) so we keep the best detection when filtering
+    std::sort(valid_dets.begin(), valid_dets.end(),
+              [](apriltag_detection_t* a, apriltag_detection_t* b) {
+                  return a->decision_margin > b->decision_margin;
+              });
+    
+    // Filter duplicates: for detections with same ID, only remove if they are within min_distance
+    // This allows multiple detections with the same ID if they are far enough apart
+    // Made less strict: only filter if very close (within min_distance threshold)
+    for (auto* det : valid_dets) {
+        bool is_duplicate = false;
         
-        auto it = best_by_id.find(det->id);
-        if (it == best_by_id.end()) {
-            // First valid detection with this ID
-            best_by_id[det->id] = det;
-        } else {
-            // Compare decision margins - keep the one with higher margin
-            if (det->decision_margin > it->second->decision_margin) {
-                best_by_id[det->id] = det;
+        // Check against already filtered detections
+        for (auto* existing : filtered) {
+            // Only filter if same ID AND within min_distance
+            if (existing->id == det->id && existing->family == det->family) {
+                // Calculate center-to-center distance
+                double dx = det->c[0] - existing->c[0];
+                double dy = det->c[1] - existing->c[1];
+                double distance = std::sqrt(dx * dx + dy * dy);
+                
+                // Only filter if they're very close (within min_distance threshold)
+                // This allows multiple detections of the same tag if they're far apart
+                if (distance < min_distance) {
+                    is_duplicate = true;
+                    std::cerr << "[DEBUG] Filtering duplicate: ID=" << det->id 
+                              << ", distance=" << std::fixed << std::setprecision(1) << distance 
+                              << "px (min_distance=" << min_distance << "px)"
+                              << ", existing_margin=" << std::fixed << std::setprecision(1) << existing->decision_margin 
+                              << ", new_margin=" << std::fixed << std::setprecision(1) << det->decision_margin 
+                              << ", existing_center=(" << std::fixed << std::setprecision(1) << existing->c[0] 
+                              << "," << existing->c[1] << ")"
+                              << ", new_center=(" << std::fixed << std::setprecision(1) << det->c[0] 
+                              << "," << det->c[1] << ")" << std::endl;
+                    break;
+                }
             }
         }
-    }
-    
-    // Convert map to vector
-    for (auto& pair : best_by_id) {
-        filtered.push_back(pair.second);
+        
+        if (!is_duplicate) {
+            filtered.push_back(det);
+        }
     }
     
     return filtered;
@@ -187,6 +211,7 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
     td_for_gpu_->quad_decimate = 2.0;  // CUDA requires 2.0
     td_for_gpu_->quad_sigma = 0.0;  // Match video_visualize_fixed.cu
     td_for_gpu_->refine_edges = 1;  // Match video_visualize_fixed.cu (true)
+    td_for_gpu_->decode_sharpening = 0.5;  // Increased from 0.25 for better decoding sensitivity
     td_for_gpu_->debug = false;  // Match video_visualize_fixed.cu
     td_for_gpu_->nthreads = 1;  // Match video_visualize_fixed.cu default
     td_for_gpu_->wp = workerpool_create(td_for_gpu_->nthreads);
@@ -208,6 +233,17 @@ bool FastAprilTagAlgorithm::initialize(int width, int height) {
     td_gpu_->debug = td_for_gpu_->debug;
     td_gpu_->nthreads = td_for_gpu_->nthreads;
     td_gpu_->wp = workerpool_create(td_gpu_->nthreads);
+    
+    // Set default quad threshold parameters (more sensitive defaults for better detection)
+    // These will be updated by updateDetectorParameters when user applies settings
+    td_for_gpu_->qtp.min_cluster_pixels = 4;  // More sensitive (lower = detects smaller clusters)
+    td_for_gpu_->qtp.max_line_fit_mse = 12.0;  // More lenient (higher = allows more imperfect quads)
+    td_for_gpu_->qtp.cos_critical_rad = cos(10.0 * M_PI / 180.0);  // More angle tolerance
+    td_for_gpu_->qtp.min_white_black_diff = 4;  // More sensitive (lower = detects lower contrast tags)
+    td_gpu_->qtp.min_cluster_pixels = td_for_gpu_->qtp.min_cluster_pixels;
+    td_gpu_->qtp.max_line_fit_mse = td_for_gpu_->qtp.max_line_fit_mse;
+    td_gpu_->qtp.cos_critical_rad = td_for_gpu_->qtp.cos_critical_rad;
+    td_gpu_->qtp.min_white_black_diff = td_for_gpu_->qtp.min_white_black_diff;
     
     // Load calibration
     double fx, fy, cx, cy, k1, k2, p1, p2, k3;
@@ -452,6 +488,9 @@ zarray_t* FastAprilTagAlgorithm::processFrameDirect(const cv::Mat& gray_frame, b
     last_frame_timing_.fit_quads_ms = duration<double, std::milli>(stage2_end - stage2_start).count();
     last_frame_timing_.num_quads = static_cast<int>(quads_fullres.size());
     
+    // Store quads for debug visualization (before filtering)
+    last_frame_quads_ = quads_fullres;
+    
     // Stage 3: Mirror handling
     auto stage3_start = high_resolution_clock::now();
     if (mirror) {
@@ -497,6 +536,19 @@ zarray_t* FastAprilTagAlgorithm::processFrameDirect(const cv::Mat& gray_frame, b
     last_frame_timing_.decode_tags_ms = duration<double, std::milli>(stage5_end - stage5_start).count();
     last_frame_timing_.num_detections_before_filter = zarray_size(detections);
     
+    // Debug output (comprehensive, not tag-specific)
+    int num_quads = static_cast<int>(quads_fullres.size());
+    int num_detections = zarray_size(detections);
+    double decode_rate = (num_quads > 0) ? (100.0 * num_detections / num_quads) : 0.0;
+    std::cerr << "[DEBUG] Decode stage: " << num_quads << " quads -> " << num_detections 
+              << " detections (decode_rate=" << std::fixed << std::setprecision(1) << decode_rate << "%)" << std::endl;
+    
+    if (num_quads > num_detections) {
+        int failed_quads = num_quads - num_detections;
+        std::cerr << "[DEBUG] WARNING: " << failed_quads 
+                  << " quads failed to decode (decode_rate=" << decode_rate << "%)" << std::endl;
+    }
+    
     // Stage 6: Scale coordinates (if decimation was used)
     auto stage6_start = high_resolution_clock::now();
     if (td_gpu_ && td_gpu_->quad_decimate > 1.0) {
@@ -511,7 +563,56 @@ zarray_t* FastAprilTagAlgorithm::processFrameDirect(const cv::Mat& gray_frame, b
     
     // Stage 7: Filter duplicates
     auto stage7_start = high_resolution_clock::now();
+    
+    // Debug: Log all detections before filtering
+    std::vector<int> detected_ids;
+    std::vector<double> detected_margins;
+    std::vector<Point2f> detected_centers;
+    for (int i = 0; i < zarray_size(detections); i++) {
+        apriltag_detection_t* det;
+        zarray_get(detections, i, &det);
+        detected_ids.push_back(det->id);
+        detected_margins.push_back(det->decision_margin);
+        detected_centers.push_back(Point2f(det->c[0], det->c[1]));
+    }
+    std::cerr << "[DEBUG] Before filtering: " << zarray_size(detections) << " detections";
+    if (!detected_ids.empty()) {
+        std::cerr << " - IDs=[";
+        for (size_t i = 0; i < detected_ids.size(); i++) {
+            std::cerr << detected_ids[i] << "(m=" << std::fixed << std::setprecision(1) << detected_margins[i] 
+                      << ", c=(" << std::fixed << std::setprecision(1) << detected_centers[i].x 
+                      << "," << detected_centers[i].y << "))";
+            if (i < detected_ids.size() - 1) std::cerr << ", ";
+        }
+        std::cerr << "]";
+    }
+    std::cerr << std::endl;
+    
     std::vector<apriltag_detection_t*> filtered = filterDuplicates(detections, width_, height_, min_distance_);
+    
+    // Debug: Log filtered detections
+    std::vector<int> filtered_ids;
+    std::vector<double> filtered_margins;
+    for (auto* det : filtered) {
+        filtered_ids.push_back(det->id);
+        filtered_margins.push_back(det->decision_margin);
+    }
+    std::cerr << "[DEBUG] After filtering: " << filtered.size() << " detections";
+    if (!filtered_ids.empty()) {
+        std::cerr << " - IDs=[";
+        for (size_t i = 0; i < filtered_ids.size(); i++) {
+            std::cerr << filtered_ids[i] << "(m=" << std::fixed << std::setprecision(1) << filtered_margins[i] << ")";
+            if (i < filtered_ids.size() - 1) std::cerr << ", ";
+        }
+        std::cerr << "]";
+    }
+    std::cerr << std::endl;
+    
+    // Check if any detections were lost during filtering
+    if (zarray_size(detections) > filtered.size()) {
+        std::cerr << "[DEBUG] Filtering removed " << (zarray_size(detections) - filtered.size()) 
+                  << " duplicate detections" << std::endl;
+    }
     
     // Destroy detections that are NOT in the filtered list
     for (int i = 0; i < zarray_size(detections); i++) {
@@ -806,6 +907,71 @@ void FastAprilTagAlgorithm::cudaWorkerThread() {
         }
     }
     
+}
+
+void FastAprilTagAlgorithm::updateDetectorParameters(
+    double quad_decimate,
+    double quad_sigma,
+    bool refine_edges,
+    double decode_sharpening,
+    int nthreads,
+    int min_cluster_pixels,
+    double max_line_fit_mse,
+    double critical_angle_degrees,
+    int min_white_black_diff) {
+    
+    // Note: quad_decimate must be 2.0 for CUDA, so we ignore the parameter
+    // but we can update other parameters
+    
+    if (td_for_gpu_) {
+        td_for_gpu_->quad_sigma = static_cast<float>(quad_sigma);
+        td_for_gpu_->refine_edges = refine_edges ? 1 : 0;
+        td_for_gpu_->decode_sharpening = decode_sharpening;
+        td_for_gpu_->nthreads = nthreads;
+        
+        // Update quad threshold parameters
+        td_for_gpu_->qtp.min_cluster_pixels = min_cluster_pixels;
+        td_for_gpu_->qtp.max_line_fit_mse = static_cast<float>(max_line_fit_mse);
+        td_for_gpu_->qtp.cos_critical_rad = cos(critical_angle_degrees * M_PI / 180.0);
+        td_for_gpu_->qtp.min_white_black_diff = min_white_black_diff;
+        
+        // Recreate worker pool if thread count changed
+        if (td_for_gpu_->wp) {
+            workerpool_destroy(td_for_gpu_->wp);
+        }
+        td_for_gpu_->wp = workerpool_create(td_for_gpu_->nthreads);
+    }
+    
+    if (td_gpu_) {
+        // Sync parameters with GPU detector (for CPU decode stage)
+        td_gpu_->quad_decimate = td_for_gpu_->quad_decimate;  // Keep 2.0 for CUDA
+        td_gpu_->quad_sigma = td_for_gpu_->quad_sigma;
+        td_gpu_->refine_edges = td_for_gpu_->refine_edges;
+        td_gpu_->decode_sharpening = td_for_gpu_->decode_sharpening;
+        td_gpu_->nthreads = td_for_gpu_->nthreads;
+        
+        // Update quad threshold parameters
+        td_gpu_->qtp.min_cluster_pixels = td_for_gpu_->qtp.min_cluster_pixels;
+        td_gpu_->qtp.max_line_fit_mse = td_for_gpu_->qtp.max_line_fit_mse;
+        td_gpu_->qtp.cos_critical_rad = td_for_gpu_->qtp.cos_critical_rad;
+        td_gpu_->qtp.min_white_black_diff = td_for_gpu_->qtp.min_white_black_diff;
+        
+        // Recreate worker pool if thread count changed
+        if (td_gpu_->wp) {
+            workerpool_destroy(td_gpu_->wp);
+        }
+        td_gpu_->wp = workerpool_create(td_gpu_->nthreads);
+    }
+    
+    std::cerr << "Fast AprilTag: Updated detector parameters - "
+              << "quad_sigma=" << quad_sigma
+              << ", refine_edges=" << refine_edges
+              << ", decode_sharpening=" << decode_sharpening
+              << ", nthreads=" << nthreads
+              << ", min_cluster_pixels=" << min_cluster_pixels
+              << ", max_line_fit_mse=" << max_line_fit_mse
+              << ", critical_angle=" << critical_angle_degrees
+              << ", min_white_black_diff=" << min_white_black_diff << std::endl;
 }
 
 void FastAprilTagAlgorithm::cleanup() {

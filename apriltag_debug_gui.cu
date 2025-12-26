@@ -81,6 +81,9 @@ using std::endl;
 #include <QFile>
 #include <QTextStream>
 #include <QIODevice>
+#include <QProcess>
+#include <QRegularExpression>
+#include <QSet>
 
 // MindVision SDK (optional)
 #ifdef HAVE_MINDVISION_SDK
@@ -99,6 +102,7 @@ extern "C" {
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <map>
 
 using namespace cv;
 using namespace std;
@@ -116,6 +120,34 @@ struct MVMode {
     int height;
     int frame_speed_index;
     string label;
+};
+
+// Camera setting definition structure
+enum SettingType {
+    SETTING_INT,
+    SETTING_BOOL,
+    SETTING_MENU,
+    SETTING_DOUBLE
+};
+
+struct CameraSetting {
+    string name;           // Setting name (e.g., "exposure", "brightness")
+    string display_name;   // Display name (e.g., "Exposure", "Brightness")
+    SettingType type;      // Type of setting
+    int min_value;         // Minimum value
+    int max_value;         // Maximum value
+    int default_value;     // Default value
+    int current_value;     // Current value
+    string v4l2_id;        // V4L2 control ID (for Arducam) or empty for MindVision
+    vector<string> menu_options;  // For menu type settings
+};
+
+struct CameraSettingsProfile {
+    string camera_name;    // Camera identifier
+    string camera_type;    // "MindVision" or "Arducam" or "V4L2"
+    vector<CameraSetting> settings;  // Available settings for this camera
+    map<string, int> saved_values;   // Saved values keyed by setting name
+    map<string, double> algorithm_settings;  // Algorithm tuning settings (doubles) keyed by setting name
 };
 
 // Tag36h11 bit positions (1-indexed, from tag36h11.c)
@@ -153,6 +185,11 @@ private:
     vector<bool> isMindVision_;
     vector<Mode> v4l2_modes_;
     vector<MVMode> mv_modes_;
+    
+    // Camera settings profiles (per camera)
+    map<string, CameraSettingsProfile> cameraSettingsProfiles_;
+    CameraSettingsProfile currentCameraSettings_;
+    
     Mat currentFrame_;
     mutex frameMutex_;
     string suggestedCaptureFilename_;
@@ -227,6 +264,7 @@ private:
     QPushButton *algorithmStartBtn_;
     QPushButton *algorithmStopBtn_;
     QCheckBox *algorithmMirrorCheckbox_;
+    QCheckBox *algorithmDebugCheckbox_;  // Debug mode: show quads before filtering
     QLabel *algorithmDisplayLabel_;
     QTextEdit *algorithmTimingText_;
     QLabel *algorithmFPSLabel_;
@@ -286,6 +324,16 @@ private:
     QSpinBox *saturationSpin_;
     QSpinBox *sharpnessSpin_;
     
+    // Dynamic camera controls (for V4L2/Arducam - stores all controls)
+    map<string, QWidget*> dynamicControlWidgets_;  // Maps setting name to widget (QSlider, QCheckBox, QComboBox)
+    map<string, QSlider*> dynamicSliders_;  // Maps setting name to QSlider
+    map<string, QSpinBox*> dynamicSpinBoxes_;  // Maps setting name to QSpinBox
+    map<string, QCheckBox*> dynamicCheckBoxes_;  // Maps setting name to QCheckBox
+    map<string, QComboBox*> dynamicComboBoxes_;  // Maps setting name to QComboBox
+    QHBoxLayout *dynamicSettingsLayout_;  // Layout for dynamic controls
+    QScrollArea *dynamicSettingsScrollArea_;  // Scroll area for dynamic controls
+    QWidget *dynamicSettingsWidget_;  // Widget containing dynamic controls
+    
     // UI elements (Fisheye tab)
     QLineEdit *calibPathEdit_;
     QLabel *fisheyeStatusLabel_;  // Status label in Fisheye tab
@@ -301,6 +349,39 @@ private:
     QComboBox *settingsCameraCombo_;
     QSlider *settingsExposureSlider_;
     QSlider *settingsGainSlider_;
+    
+    // Algorithm tuning settings UI elements
+    // Preprocessing
+    QDoubleSpinBox *preprocessClaheClipSpin_;
+    QDoubleSpinBox *preprocessGammaSpin_;
+    QDoubleSpinBox *preprocessContrastSpin_;
+    QCheckBox *preprocessHistEqCheck_;
+    
+    // Edge Detection
+    QSpinBox *cannyLowSpin_;
+    QSpinBox *cannyHighSpin_;
+    QSpinBox *adaptiveThreshBlockSpin_;
+    QSpinBox *adaptiveThreshConstantSpin_;
+    
+    // Detection Parameters
+    QDoubleSpinBox *quadDecimateSpin_;
+    QDoubleSpinBox *quadSigmaSpin_;
+    QCheckBox *refineEdgesCheck_;
+    QDoubleSpinBox *decodeSharpeningSpin_;
+    QSpinBox *nthreadsSpin_;
+    
+    // Quad Threshold Parameters
+    QSpinBox *minClusterPixelsSpin_;
+    QDoubleSpinBox *maxLineFitMseSpin_;
+    QDoubleSpinBox *criticalAngleSpin_;
+    QSpinBox *minWhiteBlackDiffSpin_;
+    
+    // Advanced Parameters
+    QSpinBox *cornerRefineWinSizeSpin_;
+    QSpinBox *cornerRefineMaxIterSpin_;
+    QSpinBox *patternBorderSizeSpin_;
+    QSpinBox *tagMinAreaSpin_;
+    QSpinBox *tagMaxAreaSpin_;
     QSlider *settingsBrightnessSlider_;
     QSlider *settingsContrastSlider_;
     QSlider *settingsSaturationSlider_;
@@ -365,7 +446,10 @@ public:
         settingsContrastSpin_(nullptr),
         settingsSaturationSpin_(nullptr),
         settingsSharpnessSpin_(nullptr),
-        settingsModeCombo_(nullptr)
+        settingsModeCombo_(nullptr),
+        dynamicSettingsLayout_(nullptr),
+        dynamicSettingsScrollArea_(nullptr),
+        dynamicSettingsWidget_(nullptr)
     {
         setupUI();
         
@@ -468,6 +552,8 @@ private slots:
             currentAlgorithm_.reset();
         } else {
             qDebug() << "Fast AprilTag algorithm initialized successfully with dimensions:" << width << "x" << height;
+            // Immediately apply current algorithm settings to ensure consistency
+            applyAlgorithmSettingsToAlgorithm(currentAlgorithm_.get());
         }
 #endif
     }
@@ -576,8 +662,6 @@ private slots:
             }
         }
         QString defaultDir = workspaceRoot + "/output/pattern_visualizations";
-        qDebug() << "Workspace root:" << workspaceRoot;
-        qDebug() << "Saving to directory:" << defaultDir;
         
         // Convert to absolute path
         QDir defaultDirObj(defaultDir);
@@ -585,7 +669,6 @@ private slots:
         
         // Create directory if it doesn't exist
         bool dirCreated = QDir().mkpath(dir);
-        qDebug() << "Directory creation result:" << dirCreated;
         
         if (!dirCreated) {
             QMessageBox::warning(this, "Error", QString("Failed to create directory: %1").arg(dir));
@@ -603,8 +686,6 @@ private slots:
             return;
         }
         
-        std::cerr << "Saving patterns to: " << std::string(dir.toLocal8Bit().constData()) << std::endl;
-        std::cerr.flush();
         
         // Generate timestamp for filenames
         QDateTime now = QDateTime::currentDateTime();
@@ -614,96 +695,190 @@ private slots:
         for (size_t i = 0; i < storedPatterns_.size(); i++) {
             const StoredPatternData& sp = storedPatterns_[i];
             
-            // Create visualization image: warped image on left, pattern on right
-            int tagSize = 36;
-            int displaySize = 200;  // Size for each part (warped + pattern)
-            int spacing = 10;
+            // Use same dimensions as display: warped (left) + gray (middle) + digitized (right)
+            // Match the display layout exactly
             int padding = 20;
-            int totalWidth = displaySize * 2 + spacing + padding * 2;
-            int totalHeight = displaySize + padding * 2 + 40;  // Extra space for header
+            int spacing = 15;
+            int header_height = 30;
             
-            Mat vis = Mat::ones(totalHeight, totalWidth, CV_8UC3) * 240;
+            // Calculate box size to match display (same calculation as in display code)
+            int estimated_width = 1200;
+            int available_width_per_row = estimated_width - 2 * padding;
+            int box_size = (available_width_per_row - 2 * spacing) / 3;
+            if (box_size < 50) box_size = 50;
+            if (box_size > 200) box_size = 200;
+            
+            int warped_image_size = box_size;
+            int gray_box_size = box_size;
+            int grid_size = box_size;
+            int cell_size = box_size / 8;  // 8x8 grid
+            
+            int cell_total_width = warped_image_size + spacing + gray_box_size + spacing + grid_size;
+            int total_width = cell_total_width + padding * 2;
+            int total_height = grid_size + padding * 2 + header_height;
+            
+            Mat vis = Mat::ones(total_height, total_width, CV_8UC3) * 240;
             
             // Header
             stringstream header;
-            header << "Tag ID: " << sp.tag_id;
-            putText(vis, header.str(), Point(padding, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 0), 2);
+            header << "ID:" << sp.tag_id;
+            putText(vis, header.str(), Point(padding, 20), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
             
-            // Draw warped image (left side)
+            int x_offset = padding;
+            int y_offset = header_height + padding;
+            
+            // 1. Draw warped image (left side)
             if (!sp.warped_image.empty()) {
                 Mat warped_resized;
-                cv::resize(sp.warped_image, warped_resized, Size(displaySize, displaySize), 0, 0, INTER_NEAREST);
+                cv::resize(sp.warped_image, warped_resized, Size(warped_image_size, warped_image_size), 0, 0, INTER_NEAREST);
                 Mat warped_bgr;
                 if (warped_resized.channels() == 1) {
                     cvtColor(warped_resized, warped_bgr, COLOR_GRAY2BGR);
                 } else {
                     warped_bgr = warped_resized;
                 }
-                warped_bgr.copyTo(vis(Rect(padding, padding + 40, displaySize, displaySize)));
-                rectangle(vis, Rect(padding, padding + 40, displaySize, displaySize), Scalar(0, 0, 255), 2);
-                putText(vis, "Warped", Point(padding, padding + 35), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 255), 1);
+                
+                // Draw border extraction lines (same as display)
+                int debug_tagSize = sp.warped_image.rows;
+                int debug_borderSize = (debug_tagSize <= 0) ? 4 : debug_tagSize / 8;
+                int debug_borderMargin = max(1, debug_borderSize / 4);
+                int debug_effectiveBorderSize = debug_borderSize + debug_borderMargin;
+                double scale = (double)warped_image_size / debug_tagSize;
+                
+                // Draw actual border boundary (green)
+                int actual_border_x1 = (int)(debug_borderSize * scale);
+                int actual_border_y1 = (int)(debug_borderSize * scale);
+                int actual_border_x2 = (int)((debug_tagSize - debug_borderSize) * scale);
+                int actual_border_y2 = (int)((debug_tagSize - debug_borderSize) * scale);
+                line(warped_bgr, Point(0, actual_border_y1), Point(warped_image_size - 1, actual_border_y1), Scalar(0, 255, 0), 1);
+                line(warped_bgr, Point(0, actual_border_y2), Point(warped_image_size - 1, actual_border_y2), Scalar(0, 255, 0), 1);
+                line(warped_bgr, Point(actual_border_x1, 0), Point(actual_border_x1, warped_image_size - 1), Scalar(0, 255, 0), 1);
+                line(warped_bgr, Point(actual_border_x2, 0), Point(actual_border_x2, warped_image_size - 1), Scalar(0, 255, 0), 1);
+                
+                // Draw effective extraction boundary (red)
+                int effective_border_x1 = (int)(debug_effectiveBorderSize * scale);
+                int effective_border_y1 = (int)(debug_effectiveBorderSize * scale);
+                int effective_border_x2 = (int)((debug_tagSize - debug_effectiveBorderSize) * scale);
+                int effective_border_y2 = (int)((debug_tagSize - debug_effectiveBorderSize) * scale);
+                line(warped_bgr, Point(0, effective_border_y1), Point(warped_image_size - 1, effective_border_y1), Scalar(0, 0, 255), 1);
+                line(warped_bgr, Point(0, effective_border_y2), Point(warped_image_size - 1, effective_border_y2), Scalar(0, 0, 255), 1);
+                line(warped_bgr, Point(effective_border_x1, 0), Point(effective_border_x1, warped_image_size - 1), Scalar(0, 0, 255), 1);
+                line(warped_bgr, Point(effective_border_x2, 0), Point(effective_border_x2, warped_image_size - 1), Scalar(0, 0, 255), 1);
+                
+                warped_bgr.copyTo(vis(Rect(x_offset, y_offset, warped_image_size, warped_image_size)));
+                rectangle(vis, Rect(x_offset, y_offset, warped_image_size, warped_image_size), Scalar(0, 0, 255), 2);
+                putText(vis, "Warped (green=border, red=extraction)", Point(x_offset, y_offset - 5),
+                       FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
             }
             
-            // Draw digitized pattern (right side) - 8x8 grid with border
-            // Tag36h11: 8x8 cells total, 1-cell black border, 6x6 data region
-            // Scale to 75% to fit width better
-            int patternX = padding + displaySize + spacing;
-            int cellSize = (int)((displaySize / 8) * 0.75);  // 8x8 grid, 75% of original size
+            // 2. Draw gray color box (middle) - 8x8 grid with actual gray values
+            int gray_x_offset = x_offset + warped_image_size + spacing;
             if (sp.pattern.size() == 6 && sp.pattern[0].size() == 6) {
                 // Draw border cells (all black)
                 // Top row (row 0)
                 for (int c = 0; c < 8; c++) {
-                    int y_pos = padding + 40;
-                    int x_pos = patternX + c * cellSize;
-                    Rect cell(x_pos, y_pos, cellSize, cellSize);
-                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    int y_pos = y_offset;
+                    int x_pos = gray_x_offset + c * cell_size;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
                     rectangle(vis, cell, Scalar(128, 128, 128), 1);
                 }
                 // Bottom row (row 7)
                 for (int c = 0; c < 8; c++) {
-                    int y_pos = padding + 40 + 7 * cellSize;
-                    int x_pos = patternX + c * cellSize;
-                    Rect cell(x_pos, y_pos, cellSize, cellSize);
-                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    int y_pos = y_offset + 7 * cell_size;
+                    int x_pos = gray_x_offset + c * cell_size;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
                     rectangle(vis, cell, Scalar(128, 128, 128), 1);
                 }
                 // Left column (col 0, rows 1-6)
                 for (int r = 1; r < 7; r++) {
-                    int y_pos = padding + 40 + r * cellSize;
-                    int x_pos = patternX;
-                    Rect cell(x_pos, y_pos, cellSize, cellSize);
-                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    int y_pos = y_offset + r * cell_size;
+                    int x_pos = gray_x_offset;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
                     rectangle(vis, cell, Scalar(128, 128, 128), 1);
                 }
                 // Right column (col 7, rows 1-6)
                 for (int r = 1; r < 7; r++) {
-                    int y_pos = padding + 40 + r * cellSize;
-                    int x_pos = patternX + 7 * cellSize;
-                    Rect cell(x_pos, y_pos, cellSize, cellSize);
-                    rectangle(vis, cell, Scalar(0, 0, 0), -1);  // Black border
+                    int y_pos = y_offset + r * cell_size;
+                    int x_pos = gray_x_offset + 7 * cell_size;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
                     rectangle(vis, cell, Scalar(128, 128, 128), 1);
                 }
                 
-                // Draw 6x6 data pattern in center (rows 1-6, columns 1-6)
+                // Draw 6x6 data pattern with actual gray values
+                for (int r = 0; r < 6; r++) {
+                    for (int c = 0; c < 6; c++) {
+                        int val = sp.pattern[r][c];
+                        Scalar gray_color(val, val, val);
+                        int y_pos = y_offset + (r + 1) * cell_size;
+                        int x_pos = gray_x_offset + (c + 1) * cell_size;
+                        Rect gray_cell(x_pos, y_pos, cell_size, cell_size);
+                        rectangle(vis, gray_cell, gray_color, -1);
+                        rectangle(vis, gray_cell, Scalar(128, 128, 128), 1);
+                    }
+                }
+                putText(vis, "Gray Values (8x8: border + 6x6 data)", Point(gray_x_offset, y_offset - 5),
+                       FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
+            }
+            
+            // 3. Draw digitized pattern (right side) - 8x8 grid with black/white
+            int pattern_x_offset = gray_x_offset + gray_box_size + spacing;
+            if (sp.pattern.size() == 6 && sp.pattern[0].size() == 6) {
+                // Draw border cells (all black)
+                // Top row (row 0)
+                for (int c = 0; c < 8; c++) {
+                    int y_pos = y_offset;
+                    int x_pos = pattern_x_offset + c * cell_size;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                // Bottom row (row 7)
+                for (int c = 0; c < 8; c++) {
+                    int y_pos = y_offset + 7 * cell_size;
+                    int x_pos = pattern_x_offset + c * cell_size;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                // Left column (col 0, rows 1-6)
+                for (int r = 1; r < 7; r++) {
+                    int y_pos = y_offset + r * cell_size;
+                    int x_pos = pattern_x_offset;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                // Right column (col 7, rows 1-6)
+                for (int r = 1; r < 7; r++) {
+                    int y_pos = y_offset + r * cell_size;
+                    int x_pos = pattern_x_offset + 7 * cell_size;
+                    Rect cell(x_pos, y_pos, cell_size, cell_size);
+                    rectangle(vis, cell, Scalar(0, 0, 0), -1);
+                    rectangle(vis, cell, Scalar(128, 128, 128), 1);
+                }
+                
+                // Draw 6x6 data pattern (black/white)
                 for (int r = 0; r < 6; r++) {
                     for (int c = 0; c < 6; c++) {
                         int val = sp.pattern[r][c];
                         bool is_black = val < 128;
-                        
                         Scalar color = is_black ? Scalar(0, 0, 0) : Scalar(255, 255, 255);
-                        // Map 6x6 pattern (r,c) to 8x8 grid position (r+1, c+1)
-                        int y_pos = padding + 40 + (r + 1) * cellSize;
-                        int x_pos = patternX + (c + 1) * cellSize;
-                        Rect cell(x_pos, y_pos, cellSize, cellSize);
+                        int y_pos = y_offset + (r + 1) * cell_size;
+                        int x_pos = pattern_x_offset + (c + 1) * cell_size;
+                        Rect cell(x_pos, y_pos, cell_size, cell_size);
                         rectangle(vis, cell, color, -1);
                         rectangle(vis, cell, Scalar(128, 128, 128), 1);
                     }
                 }
-                rectangle(vis, Rect(patternX, padding + 40, displaySize, displaySize), Scalar(255, 0, 0), 2);
-                putText(vis, "Digitized (8x8: border + data)", Point(patternX, padding + 35), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 0, 0), 1);
+                putText(vis, "Digitized (8x8: border + 6x6 data)", Point(pattern_x_offset, y_offset - 5),
+                       FONT_HERSHEY_SIMPLEX, 0.3, Scalar(0, 0, 255), 1);
             }
             
-            // Save image
+            // Save image with same dimensions as display
             QString filename = QString("%1/tag_%2_%3.png").arg(dir).arg(sp.tag_id).arg(timestamp);
             string filename_std = filename.toStdString();
             std::cerr << "Attempting to save pattern to: " << filename_std << std::endl;
@@ -713,45 +888,24 @@ private slots:
             bool saved = imwrite(filename_std, vis);
             if (saved) {
                 savedCount++;
-                std::cerr << "Successfully saved: " << filename_std << std::endl;
-                std::cerr.flush();
-                qDebug() << "Successfully saved:" << filename;
-            } else {
-                std::cerr << "FAILED to save: " << filename_std << std::endl;
-                std::cerr.flush();
-                qDebug() << "Failed to save:" << filename;
             }
         }
         
-        std::cerr << "Save complete. savedCount=" << savedCount << std::endl;
-        std::cerr.flush();
         qDebug() << "Saved" << savedCount << "pattern visualization(s) to:" << dir;
         // Don't show message box - just log to console to avoid hanging the GUI
     }
     
     void startAlgorithm() {
-        cerr << "\n\n=== startAlgorithm() CALLED ===" << endl;
-        cerr.flush();
-        
         // If already running, stop first (clean restart)
         if (algorithmRunning_) {
-            cerr << "Algorithm already running, stopping first..." << endl;
             stopAlgorithm();
             // Give threads a moment to clean up
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         
-        // Require camera selection
-        int cameraIndex = algorithmCameraCombo_->currentIndex();
-        if (cameraIndex < 0 || cameraIndex >= (int)algorithmCameraCombo_->count()) {
-            QMessageBox::warning(this, "Error", "Please select a camera");
-            return;
-        }
-        
-        // Map algorithm camera index to actual camera list index (skip "None" at index 0)
-        int actualCameraIndex = cameraIndex + 1;  // +1 to skip "None"
-        if (actualCameraIndex < 0 || actualCameraIndex >= (int)cameraList_.size()) {
-            QMessageBox::warning(this, "Error", "Invalid camera selection");
+        // Check if a camera is selected and open (shared camera from top-level controls)
+        if (!cameraOpen_ || selectedCameraIndex_ < 0) {
+            QMessageBox::warning(this, "Error", "Please select and open a camera using the camera controls at the top of the application");
             return;
         }
         
@@ -764,11 +918,11 @@ private slots:
         detectionFPSStart_ = chrono::high_resolution_clock::now();
         displayFPSStart_ = chrono::high_resolution_clock::now();
         
-        // Open camera (use actual camera index, not algorithm combo index)
-        algorithmUseMindVision_ = isMindVision_[actualCameraIndex];
+        // Use the shared camera (already open from top-level controls)
+        algorithmUseMindVision_ = useMindVision_;
         
         // Set default settings for MindVision camera: fisheye correction enabled and mirror enabled
-        if (algorithmUseMindVision_ && actualCameraIndex >= 0) {
+        if (algorithmUseMindVision_) {
             // Enable fisheye correction for MindVision cameras if setting is enabled (if calibration is loaded)
             bool enableFisheyeForMV = true;  // Default to true
             if (settingsEnableFisheyeForMindVision_) {
@@ -785,131 +939,9 @@ private slots:
             }
         }
         
-        bool cameraOpened = false;
-        
-        if (algorithmUseMindVision_) {
-#ifdef HAVE_MINDVISION_SDK
-            // Check if camera is already open in Capture tab - if so, close it first
-            // Only close if previewTimer_ exists (it might not exist during GUI initialization)
-            if (cameraOpen_ && useMindVision_ && mvHandle_ != 0 && previewTimer_ != nullptr) {
-                QMessageBox::information(this, "Info", "Closing camera in Capture tab to use in Algorithms tab");
-                closeCamera();
-            }
-            
-            // Open MindVision camera - use same logic as Capture tab
-            CameraSdkStatus status = CameraSdkInit(1);
-            if (status != CAMERA_STATUS_SUCCESS) {
-                QMessageBox::warning(this, "Error", QString("Failed to initialize MindVision SDK (status: %1)").arg(status));
-                algorithmRunning_ = false;
-                return;
-            }
-            
-            tSdkCameraDevInfo list[16];
-            INT count = 16;
-            status = CameraEnumerateDevice(list, &count);
-            if (status != CAMERA_STATUS_SUCCESS || count == 0) {
-                QMessageBox::warning(this, "Error", QString("No MindVision cameras found (status: %1, count: %2)").arg(status).arg(count));
-                algorithmRunning_ = false;
-                return;
-            }
-            
-            // Find the correct camera index (skip V4L2 cameras)
-            int mvIndex = 0;
-            for (int i = 0; i < actualCameraIndex; i++) {
-                if (isMindVision_[i]) mvIndex++;
-            }
-            
-            if (mvIndex >= count) {
-                QMessageBox::warning(this, "Error", QString("Camera index out of range (mvIndex: %1, available: %2)").arg(mvIndex).arg(count));
-                algorithmRunning_ = false;
-                return;
-            }
-            
-            status = CameraInit(&list[mvIndex], -1, -1, &algorithmMvHandle_);
-            if (status != CAMERA_STATUS_SUCCESS) {
-                QString errorMsg = QString("Failed to open MindVision camera (status: %1)\n\n").arg(status);
-                if (status == -18) {
-                    errorMsg += "Error -18: Camera is already in use.\n";
-                    errorMsg += "Please close the camera in the Capture tab first, or close any other application using the camera.";
-                } else {
-                    errorMsg += "Please check:\n";
-                    errorMsg += "1. Camera is connected\n";
-                    errorMsg += "2. No other application is using the camera\n";
-                    errorMsg += "3. Camera permissions are correct";
-                }
-                QMessageBox::warning(this, "Error", errorMsg);
-                algorithmRunning_ = false;
-                return;
-            }
-            
-            tSdkCameraCapbility cap;
-            CameraGetCapability(algorithmMvHandle_, &cap);
-            CameraSetIspOutFormat(algorithmMvHandle_, CAMERA_MEDIA_TYPE_MONO8);
-            
-            // Disable auto exposure
-            BOOL ae_state = FALSE;
-            CameraGetAeState(algorithmMvHandle_, &ae_state);
-            if (ae_state) {
-                CameraSetAeState(algorithmMvHandle_, FALSE);
-            }
-            
-            CameraPlay(algorithmMvHandle_);
-            cameraOpened = true;
-            
-            // Load and apply saved camera settings
-            loadCameraSettingsForAlgorithm();
-#endif
-        } else if (actualCameraIndex >= 0) {
-            // Open V4L2 camera - extract device number from camera name
-            // Camera name format: "V4L2 Camera X" where X is the device number
-            string cameraName = cameraList_[actualCameraIndex];
-            size_t pos = cameraName.find_last_of(" ");
-            if (pos != string::npos) {
-                string deviceNumStr = cameraName.substr(pos + 1);
-                try {
-                    int deviceNum = stoi(deviceNumStr);
-                    algorithmCamera_.open(deviceNum);
-                    if (!algorithmCamera_.isOpened()) {
-                        // Try opening with CAP_V4L2 explicitly
-                        algorithmCamera_.open(deviceNum, CAP_V4L2);
-                    }
-                    if (algorithmCamera_.isOpened()) {
-                        algorithmCamera_.set(CAP_PROP_FRAME_WIDTH, 1280);
-                        algorithmCamera_.set(CAP_PROP_FRAME_HEIGHT, 1024);
-                        cameraOpened = true;
-                        
-                        // Load and apply saved camera settings
-                        loadCameraSettingsForAlgorithm();
-                    } else {
-                        qDebug() << "Failed to open V4L2 camera" << deviceNum << "- camera may be in use or not available";
-                    }
-                } catch (const std::exception& e) {
-                    qDebug() << "Error parsing camera device number:" << e.what();
-                    cameraOpened = false;
-                }
-            } else {
-                qDebug() << "Invalid camera name format:" << cameraName.c_str();
-                cameraOpened = false;
-            }
-        }
-        
-        if (!cameraOpened) {
-            QString errorMsg = "Failed to open camera";
-            if (algorithmUseMindVision_) {
-                errorMsg += "\n\nPossible causes:\n";
-                errorMsg += "- Camera is already in use (close Capture tab or other applications)\n";
-                errorMsg += "- Camera is not connected\n";
-                errorMsg += "- Camera driver issue";
-            } else {
-                errorMsg += "\n\nPossible causes:\n";
-                errorMsg += "- Camera is already in use\n";
-                errorMsg += "- Camera device not found\n";
-                errorMsg += "- Insufficient permissions (try: sudo chmod 666 /dev/video*)";
-            }
-            QMessageBox::warning(this, "Error", errorMsg);
-            algorithmRunning_ = false;
-            return;
-        }
+        // Camera is already open from top-level controls, use shared camera instance
+        // For MindVision: use mvHandle_ (shared)
+        // For V4L2: use cameraCap_ (shared)
         
         // Check which algorithm is selected
         int algorithmIndex = algorithmCombo_->currentIndex();
@@ -945,6 +977,8 @@ private slots:
                 return;
             }
             qDebug() << "CPU algorithm initialized successfully with dimensions:" << width << "x" << height;
+            // Immediately apply current algorithm settings to ensure consistency with other algorithms
+            applyAlgorithmSettingsToAlgorithm(currentAlgorithm_.get());
         } else if (algorithmIndex == 1) {
 #ifdef HAVE_CUDA_APRILTAG
             AprilTagAlgorithmFactory::AlgorithmType algoType = AprilTagAlgorithmFactory::FAST_APRILTAG;
@@ -985,13 +1019,8 @@ private slots:
         }
         
         // Start threads with error handling
-        cerr << "=== Starting threads ===" << endl;
         try {
-            cerr << "Creating capture thread..." << endl;
             captureThread_ = new std::thread(&AprilTagDebugGUI::captureThreadFunction, this);
-            cerr << "Capture thread created successfully" << endl;
-            
-            cerr << "Creating process thread..." << endl;
             processThread_ = new std::thread(&AprilTagDebugGUI::processThreadFunction, this);
             cerr << "Process thread created successfully" << endl;
             
@@ -1007,14 +1036,12 @@ private slots:
             
             cerr << "All threads started successfully!" << endl;
         } catch (const std::exception& e) {
-            cerr << "ERROR: Exception starting threads: " << e.what() << endl;
             QMessageBox::critical(this, "Thread Error", 
                 QString("Failed to start threads:\n%1").arg(e.what()));
             // Cleanup if threads failed
             stopAlgorithm();
             return;
         } catch (...) {
-            cerr << "ERROR: Unknown exception starting threads" << endl;
             QMessageBox::critical(this, "Thread Error", "Unknown error starting threads");
             stopAlgorithm();
             return;
@@ -1072,20 +1099,8 @@ private slots:
             currentAlgorithm_.reset();
         }
         
-        // Close camera
-        if (algorithmUseMindVision_) {
-#ifdef HAVE_MINDVISION_SDK
-            if (algorithmMvHandle_ != 0) {
-                CameraStop(algorithmMvHandle_);
-                CameraUnInit(algorithmMvHandle_);
-                algorithmMvHandle_ = 0;
-            }
-#endif
-        } else {
-            if (algorithmCamera_.isOpened()) {
-                algorithmCamera_.release();
-            }
-        }
+        // Don't close camera - it's shared with other tabs and managed by top-level controls
+        // Camera will be closed when user closes it from the top-level camera controls
         
         // Clean up stored detections
         {
@@ -1102,9 +1117,6 @@ private slots:
 private:
     // Thread functions for algorithm processing pipeline
     void captureThreadFunction() {
-        cerr << "=== Capture thread STARTED ===" << endl;
-        cerr.flush();
-        
         while (algorithmRunning_) {
             auto start = chrono::high_resolution_clock::now();
             Mat frame;
@@ -1113,15 +1125,21 @@ private:
 #ifdef HAVE_MINDVISION_SDK
                 tSdkFrameHead frameHead;
                 BYTE *pbyBuffer;
-                if (CameraGetImageBuffer(algorithmMvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
+                if (CameraGetImageBuffer(mvHandle_, &frameHead, &pbyBuffer, 1000) == CAMERA_STATUS_SUCCESS) {
                     Mat temp(frameHead.iHeight, frameHead.iWidth, CV_8UC1, pbyBuffer);
                     frame = temp.clone();
-                    CameraReleaseImageBuffer(algorithmMvHandle_, pbyBuffer);
+                    CameraReleaseImageBuffer(mvHandle_, pbyBuffer);
                 }
 #endif
             } else {
-                if (algorithmCamera_.isOpened()) {
-                    algorithmCamera_ >> frame;
+                if (cameraCap_.isOpened()) {
+                    cameraCap_ >> frame;
+                    // Convert color to grayscale immediately for faster processing (if color camera)
+                    if (frame.channels() == 3) {
+                        Mat gray;
+                        cvtColor(frame, gray, COLOR_BGR2GRAY);
+                        frame = gray;  // Use grayscale for detection (faster)
+                    }
                 }
             }
             
@@ -1332,38 +1350,9 @@ private:
                 }
             }
             
-            // DEBUG MODE: Skip Qt/OpenGL display, just log tags and timing
-            // Log detected tags
-            if (detections && zarray_size(detections) > 0) {
-                std::cerr << "Frame #" << detectionFrameCount_ << " - Detected " << zarray_size(detections) << " tags: ";
-                for (int i = 0; i < zarray_size(detections); i++) {
-                    apriltag_detection_t *det;
-                    zarray_get(detections, i, &det);
-                    if (det) {
-                        std::cerr << "ID:" << det->id << " ";
-                    }
-                }
-                std::cerr << std::endl;
-            } else {
-                std::cerr << "Frame #" << detectionFrameCount_ << " - No tags detected" << std::endl;
-            }
-            
             // Log timing
             auto end = chrono::high_resolution_clock::now();
             detectionTime_ = chrono::duration<double, milli>(end - start).count();
-            if (currentAlgorithm_) {
-#ifdef HAVE_CUDA_APRILTAG
-                FastAprilTagAlgorithm* fast_algo = dynamic_cast<FastAprilTagAlgorithm*>(currentAlgorithm_.get());
-                if (fast_algo) {
-                    auto timing = fast_algo->getLastFrameTiming();
-                    std::cerr << "  Timing - Total: " << std::fixed << std::setprecision(2) << timing.total_ms 
-                              << " ms, DetectGpuOnly: " << timing.detect_gpu_only_ms 
-                              << " ms, FitQuads: " << timing.fit_quads_ms 
-                              << " ms, DecodeTags: " << timing.decode_tags_ms 
-                              << " ms, Detections: " << timing.num_detections_after_filter << std::endl;
-                }
-#endif
-            }
             
             // Store detections for quality/pose analysis and draw on frame for preview
             Mat displayFrame;
@@ -1385,6 +1374,57 @@ private:
                 // This matches the behavior in the Capture tab
                 if (mirror) {
                     flip(displayFrame, displayFrame, 1);  // Horizontal flip
+                }
+                
+                // Debug: Draw numbered quads before filtering if debug mode is enabled
+                bool debug_enabled = algorithmDebugCheckbox_ && algorithmDebugCheckbox_->isChecked();
+                if (debug_enabled && currentAlgorithm_) {
+#ifdef HAVE_CUDA_APRILTAG
+                    FastAprilTagAlgorithm* fast_algo = dynamic_cast<FastAprilTagAlgorithm*>(currentAlgorithm_.get());
+                    if (fast_algo) {
+                        std::vector<frc971::apriltag::QuadCorners> quads = fast_algo->getLastFrameQuads();
+                        std::cerr << "[DEBUG] Drawing " << quads.size() << " quads on video display" << std::endl;
+                        
+                        // Draw each quad with a number
+                        for (size_t i = 0; i < quads.size(); i++) {
+                            const auto& quad = quads[i];
+                            Scalar quad_color(255, 255, 0);  // Yellow for quads
+                            int thickness = 2;
+                            
+                            // Draw quad outline
+                            for (int j = 0; j < 4; j++) {
+                                int next = (j + 1) % 4;
+                                Point2i p1(static_cast<int>(quad.corners[j][0]), static_cast<int>(quad.corners[j][1]));
+                                Point2i p2(static_cast<int>(quad.corners[next][0]), static_cast<int>(quad.corners[next][1]));
+                                
+                                // Clamp to frame bounds
+                                p1.x = std::max(0, std::min(displayFrame.cols - 1, p1.x));
+                                p1.y = std::max(0, std::min(displayFrame.rows - 1, p1.y));
+                                p2.x = std::max(0, std::min(displayFrame.cols - 1, p2.x));
+                                p2.y = std::max(0, std::min(displayFrame.rows - 1, p2.y));
+                                
+                                line(displayFrame, p1, p2, quad_color, thickness);
+                            }
+                            
+                            // Calculate center for number label
+                            Point2f center(0, 0);
+                            for (int j = 0; j < 4; j++) {
+                                center.x += quad.corners[j][0];
+                                center.y += quad.corners[j][1];
+                            }
+                            center.x /= 4.0f;
+                            center.y /= 4.0f;
+                            
+                            Point2i center_int(static_cast<int>(center.x), static_cast<int>(center.y));
+                            center_int.x = std::max(0, std::min(displayFrame.cols - 1, center_int.x));
+                            center_int.y = std::max(0, std::min(displayFrame.rows - 1, center_int.y));
+                            
+                            // Draw quad number
+                            putText(displayFrame, std::to_string(i), center_int,
+                                   FONT_HERSHEY_SIMPLEX, 0.6, quad_color, 2);
+                        }
+                    }
+#endif
                 }
                 
                 if (detections) {
@@ -1627,6 +1667,184 @@ private:
     void setupUI() {
         QVBoxLayout *mainLayout = new QVBoxLayout(this);
         
+        // ========== TOP-LEVEL CAMERA CONTROLS (OUTSIDE TABS) ==========
+        QGroupBox *topCameraGroup = new QGroupBox("Camera Controls", this);
+        QVBoxLayout *topCameraLayout = new QVBoxLayout();
+        
+        // First row: Camera selection and Resolution/FPS
+        QHBoxLayout *cameraRowLayout = new QHBoxLayout();
+        
+        // Camera selection
+        QLabel *cameraLabel = new QLabel("Camera:", this);
+        cameraCombo_ = new QComboBox(this);
+        connect(cameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::openCamera);
+        cameraRowLayout->addWidget(cameraLabel);
+        cameraRowLayout->addWidget(cameraCombo_);
+        cameraRowLayout->addSpacing(20);
+        
+        // Resolution/FPS selection
+        QLabel *modeLabel = new QLabel("Resolution & FPS:", this);
+        modeCombo_ = new QComboBox(this);
+        modeCombo_->setEnabled(false);  // Enabled when camera opens
+        connect(modeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                this, &AprilTagDebugGUI::onModeChanged);
+        cameraRowLayout->addWidget(modeLabel);
+        cameraRowLayout->addWidget(modeCombo_);
+        cameraRowLayout->addStretch();
+        
+        topCameraLayout->addLayout(cameraRowLayout);
+        
+        // Second row: Camera settings (Exposure, Gain, Brightness, Contrast, Saturation, Sharpness)
+        QHBoxLayout *settingsRowLayout = new QHBoxLayout();
+        
+        // Exposure
+        QLabel *exposureLabel = new QLabel("Exposure:", this);
+        exposureSlider_ = new QSlider(Qt::Horizontal, this);
+        exposureSlider_->setRange(0, 100);
+        exposureSlider_->setValue(50);
+        exposureSpin_ = new QSpinBox(this);
+        exposureSpin_->setRange(0, 100);
+        exposureSpin_->setValue(50);
+        connect(exposureSlider_, &QSlider::valueChanged, exposureSpin_, &QSpinBox::setValue);
+        connect(exposureSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                exposureSlider_, &QSlider::setValue);
+        connect(exposureSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        settingsRowLayout->addWidget(exposureLabel);
+        settingsRowLayout->addWidget(exposureSlider_);
+        settingsRowLayout->addWidget(exposureSpin_);
+        settingsRowLayout->addSpacing(10);
+        
+        // Gain
+        QLabel *gainLabel = new QLabel("Gain:", this);
+        gainSlider_ = new QSlider(Qt::Horizontal, this);
+        gainSlider_->setRange(0, 100);
+        gainSlider_->setValue(50);
+        gainSpin_ = new QSpinBox(this);
+        gainSpin_->setRange(0, 100);
+        gainSpin_->setValue(50);
+        connect(gainSlider_, &QSlider::valueChanged, gainSpin_, &QSpinBox::setValue);
+        connect(gainSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                gainSlider_, &QSlider::setValue);
+        connect(gainSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        settingsRowLayout->addWidget(gainLabel);
+        settingsRowLayout->addWidget(gainSlider_);
+        settingsRowLayout->addWidget(gainSpin_);
+        settingsRowLayout->addSpacing(10);
+        
+        // Brightness
+        QLabel *brightnessLabel = new QLabel("Brightness:", this);
+        brightnessSlider_ = new QSlider(Qt::Horizontal, this);
+        brightnessSlider_->setRange(0, 255);
+        brightnessSlider_->setValue(128);
+        brightnessSpin_ = new QSpinBox(this);
+        brightnessSpin_->setRange(0, 255);
+        brightnessSpin_->setValue(128);
+        connect(brightnessSlider_, &QSlider::valueChanged, brightnessSpin_, &QSpinBox::setValue);
+        connect(brightnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                brightnessSlider_, &QSlider::setValue);
+        connect(brightnessSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        settingsRowLayout->addWidget(brightnessLabel);
+        settingsRowLayout->addWidget(brightnessSlider_);
+        settingsRowLayout->addWidget(brightnessSpin_);
+        settingsRowLayout->addSpacing(10);
+        
+        // Contrast
+        QLabel *contrastLabel = new QLabel("Contrast:", this);
+        contrastSlider_ = new QSlider(Qt::Horizontal, this);
+        contrastSlider_->setRange(0, 100);
+        contrastSlider_->setValue(50);
+        contrastSpin_ = new QSpinBox(this);
+        contrastSpin_->setRange(0, 100);
+        contrastSpin_->setValue(50);
+        connect(contrastSlider_, &QSlider::valueChanged, contrastSpin_, &QSpinBox::setValue);
+        connect(contrastSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                contrastSlider_, &QSlider::setValue);
+        connect(contrastSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        settingsRowLayout->addWidget(contrastLabel);
+        settingsRowLayout->addWidget(contrastSlider_);
+        settingsRowLayout->addWidget(contrastSpin_);
+        settingsRowLayout->addSpacing(10);
+        
+        // Saturation
+        QLabel *saturationLabel = new QLabel("Saturation:", this);
+        saturationSlider_ = new QSlider(Qt::Horizontal, this);
+        saturationSlider_->setRange(0, 100);
+        saturationSlider_->setValue(50);
+        saturationSpin_ = new QSpinBox(this);
+        saturationSpin_->setRange(0, 100);
+        saturationSpin_->setValue(50);
+        connect(saturationSlider_, &QSlider::valueChanged, saturationSpin_, &QSpinBox::setValue);
+        connect(saturationSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                saturationSlider_, &QSlider::setValue);
+        connect(saturationSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        settingsRowLayout->addWidget(saturationLabel);
+        settingsRowLayout->addWidget(saturationSlider_);
+        settingsRowLayout->addWidget(saturationSpin_);
+        settingsRowLayout->addSpacing(10);
+        
+        // Sharpness
+        QLabel *sharpnessLabel = new QLabel("Sharpness:", this);
+        sharpnessSlider_ = new QSlider(Qt::Horizontal, this);
+        sharpnessSlider_->setRange(0, 100);
+        sharpnessSlider_->setValue(50);
+        sharpnessSpin_ = new QSpinBox(this);
+        sharpnessSpin_->setRange(0, 100);
+        sharpnessSpin_->setValue(50);
+        connect(sharpnessSlider_, &QSlider::valueChanged, sharpnessSpin_, &QSpinBox::setValue);
+        connect(sharpnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
+                sharpnessSlider_, &QSlider::setValue);
+        connect(sharpnessSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+        settingsRowLayout->addWidget(sharpnessLabel);
+        settingsRowLayout->addWidget(sharpnessSlider_);
+        settingsRowLayout->addWidget(sharpnessSpin_);
+        settingsRowLayout->addStretch();
+        
+        topCameraLayout->addLayout(settingsRowLayout);
+        
+        // Dynamic settings row (for V4L2/Arducam - will be populated when camera is selected)
+        // Use a scrollable area so all controls are visible
+        dynamicSettingsScrollArea_ = new QScrollArea(this);
+        dynamicSettingsScrollArea_->setWidgetResizable(true);
+        dynamicSettingsScrollArea_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        dynamicSettingsScrollArea_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        dynamicSettingsScrollArea_->setMinimumHeight(100);  // Minimum height for controls
+        dynamicSettingsScrollArea_->setMaximumHeight(200);  // Allow expansion but limit height
+        dynamicSettingsScrollArea_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        dynamicSettingsScrollArea_->setFrameShape(QFrame::Box);  // Add visible border
+        dynamicSettingsScrollArea_->setFrameShadow(QFrame::Sunken);
+        dynamicSettingsWidget_ = new QWidget(this);
+        dynamicSettingsLayout_ = new QHBoxLayout(dynamicSettingsWidget_);
+        dynamicSettingsLayout_->setContentsMargins(10, 10, 10, 10);
+        dynamicSettingsLayout_->setSpacing(10);
+        dynamicSettingsWidget_->setLayout(dynamicSettingsLayout_);
+        dynamicSettingsWidget_->setMinimumHeight(80);  // Ensure minimum height
+        dynamicSettingsScrollArea_->setWidget(dynamicSettingsWidget_);
+        topCameraLayout->addWidget(dynamicSettingsScrollArea_);
+        
+        // Third row: Save settings button
+        QHBoxLayout *buttonRowLayout = new QHBoxLayout();
+        saveSettingsBtn_ = new QPushButton("Save Camera Settings", this);
+        saveSettingsBtn_->setEnabled(false);
+        connect(saveSettingsBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::saveCameraSettings);
+        buttonRowLayout->addWidget(saveSettingsBtn_);
+        buttonRowLayout->addStretch();
+        topCameraLayout->addLayout(buttonRowLayout);
+        
+        topCameraGroup->setLayout(topCameraLayout);
+        mainLayout->addWidget(topCameraGroup);
+        
+        // Initialize camera enumeration (before tabs are created)
+        cameraCombo_->blockSignals(true);  // Block signals during enumeration
+        enumerateCameras();
+        // Set default to "None" (index 0)
+        cameraCombo_->setCurrentIndex(0);
+        cameraCombo_->blockSignals(false);  // Re-enable signals
+        
+        // Setup preview timer (needed for camera operations)
+        previewTimer_ = new QTimer(this);
+        connect(previewTimer_, &QTimer::timeout, this, &AprilTagDebugGUI::updatePreview);
+        
         // Create tab widget
         tabWidget_ = new QTabWidget(this);
         
@@ -1850,7 +2068,7 @@ private:
         // ========== PROCESSING TAB (FIFTH) ==========
         tabWidget_->addTab(processingTab, "Processing");
         
-        // Fisheye correction status indicator (at the top, outside tabs)
+        // Fisheye correction status indicator (below camera controls, outside tabs)
         QGroupBox *fisheyeStatusGroup = new QGroupBox("Fisheye Correction Status", this);
         QHBoxLayout *fisheyeStatusLayout = new QHBoxLayout();
         
@@ -1865,7 +2083,7 @@ private:
             "font-weight: bold; "
             "font-size: 12pt; "
             "}");
-        fisheyeStatusLabel_->setAlignment(Qt::AlignCenter);
+        fisheyeStatusIndicator_->setAlignment(Qt::AlignCenter);
         
         fisheyeStatusLayout->addWidget(fisheyeStatusIndicator_);
         fisheyeStatusGroup->setLayout(fisheyeStatusLayout);
@@ -1885,29 +2103,42 @@ private:
                 result = img.clone();
                 break;
             case 1: // Histogram Equalization
-                equalizeHist(img, result);
+                if (preprocessHistEqCheck_ && preprocessHistEqCheck_->isChecked()) {
+                    equalizeHist(img, result);
+                } else {
+                    equalizeHist(img, result);
+                }
                 break;
-            case 2: // CLAHE clip=2.0
+            case 2: // CLAHE clip=2.0 (or use tunable value)
+            case 3: // CLAHE clip=3.0 (or use tunable value)
+            case 4: // CLAHE clip=4.0 (or use tunable value)
                 {
-                    Ptr<CLAHE> clahe = createCLAHE(2.0, Size(8, 8));
+                    double claheClip = 3.0;  // Default
+                    if (preprocessClaheClipSpin_) {
+                        claheClip = preprocessClaheClipSpin_->value();
+                    } else {
+                        // Fallback to method-based values
+                        if (method == 2) claheClip = 2.0;
+                        else if (method == 3) claheClip = 3.0;
+                        else if (method == 4) claheClip = 4.0;
+                    }
+                    Ptr<CLAHE> clahe = createCLAHE(claheClip, Size(8, 8));
                     clahe->apply(img, result);
                 }
                 break;
-            case 3: // CLAHE clip=3.0
+            case 5: // Gamma 1.2 (or use tunable value)
+            case 6: // Gamma 1.5 (or use tunable value)
+            case 7: // Gamma 2.0 (or use tunable value)
                 {
-                    Ptr<CLAHE> clahe = createCLAHE(3.0, Size(8, 8));
-                    clahe->apply(img, result);
-                }
-                break;
-            case 4: // CLAHE clip=4.0
-                {
-                    Ptr<CLAHE> clahe = createCLAHE(4.0, Size(8, 8));
-                    clahe->apply(img, result);
-                }
-                break;
-            case 5: // Gamma 1.2
-                {
-                    double gamma = 1.2;
+                    double gamma = 1.5;  // Default
+                    if (preprocessGammaSpin_) {
+                        gamma = preprocessGammaSpin_->value();
+                    } else {
+                        // Fallback to method-based values
+                        if (method == 5) gamma = 1.2;
+                        else if (method == 6) gamma = 1.5;
+                        else if (method == 7) gamma = 2.0;
+                    }
                     double inv_gamma = 1.0 / gamma;
                     Mat table(1, 256, CV_8U);
                     uchar *p = table.ptr();
@@ -1917,32 +2148,14 @@ private:
                     LUT(img, table, result);
                 }
                 break;
-            case 6: // Gamma 1.5
+            case 8: // Contrast Enhancement (or use tunable value)
                 {
-                    double gamma = 1.5;
-                    double inv_gamma = 1.0 / gamma;
-                    Mat table(1, 256, CV_8U);
-                    uchar *p = table.ptr();
-                    for (int i = 0; i < 256; i++) {
-                        p[i] = saturate_cast<uchar>(pow(i / 255.0, inv_gamma) * 255.0);
+                    double contrast = 2.0;  // Default
+                    if (preprocessContrastSpin_) {
+                        contrast = preprocessContrastSpin_->value();
                     }
-                    LUT(img, table, result);
+                    img.convertTo(result, -1, contrast, 50);
                 }
-                break;
-            case 7: // Gamma 2.0
-                {
-                    double gamma = 2.0;
-                    double inv_gamma = 1.0 / gamma;
-                    Mat table(1, 256, CV_8U);
-                    uchar *p = table.ptr();
-                    for (int i = 0; i < 256; i++) {
-                        p[i] = saturate_cast<uchar>(pow(i / 255.0, inv_gamma) * 255.0);
-                    }
-                    LUT(img, table, result);
-                }
-                break;
-            case 8: // Contrast Enhancement
-                img.convertTo(result, -1, 2.0, 50);
                 break;
             default:
                 result = img.clone();
@@ -1958,14 +2171,23 @@ private:
             case 0: // None
                 result = img.clone();
                 break;
-            case 1: // Canny (50, 150)
-                Canny(img, result, 50, 150);
-                break;
-            case 2: // Canny (75, 200)
-                Canny(img, result, 75, 200);
-                break;
-            case 3: // Canny (100, 200)
-                Canny(img, result, 100, 200);
+            case 1: // Canny (50, 150) - or use tunable values
+            case 2: // Canny (75, 200) - or use tunable values
+            case 3: // Canny (100, 200) - or use tunable values
+                {
+                    int cannyLow = 50;  // Default
+                    int cannyHigh = 150;  // Default
+                    if (cannyLowSpin_ && cannyHighSpin_) {
+                        cannyLow = cannyLowSpin_->value();
+                        cannyHigh = cannyHighSpin_->value();
+                    } else {
+                        // Fallback to method-based values
+                        if (method == 1) { cannyLow = 50; cannyHigh = 150; }
+                        else if (method == 2) { cannyLow = 75; cannyHigh = 200; }
+                        else if (method == 3) { cannyLow = 100; cannyHigh = 200; }
+                    }
+                    Canny(img, result, cannyLow, cannyHigh);
+                }
                 break;
             case 4: // Sobel
                 {
@@ -1984,9 +2206,17 @@ private:
                     convertScaleAbs(laplacian, result);
                 }
                 break;
-            case 6: // Adaptive Threshold
-                adaptiveThreshold(img, result, 255, ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                THRESH_BINARY, 11, 2);
+            case 6: // Adaptive Threshold - use tunable values
+                {
+                    int blockSize = 11;  // Default
+                    int constant = 2;  // Default
+                    if (adaptiveThreshBlockSpin_ && adaptiveThreshConstantSpin_) {
+                        blockSize = adaptiveThreshBlockSpin_->value();
+                        constant = adaptiveThreshConstantSpin_->value();
+                    }
+                    adaptiveThreshold(img, result, 255, ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                    THRESH_BINARY, blockSize, constant);
+                }
                 break;
             default:
                 result = img.clone();
@@ -2021,6 +2251,7 @@ private:
         };
         
         zarray_t* detections = apriltag_detector_detect(td_, &im);
+        
         
         // Convert to color for drawing
         Mat color_result;
@@ -2124,14 +2355,23 @@ private:
         return color_result;
     }
     
-    // Helper function to refine corners
-    void refineCorners(const Mat& gray, vector<Point2f>& corners, int winSize = 5, int maxIter = 30) {
+    // Helper function to refine corners - uses tunable parameters
+    void refineCorners(const Mat& gray, vector<Point2f>& corners, int winSize = -1, int maxIter = -1) {
         if (corners.size() != 4) return;
+        
+        // Use tunable parameters if available, otherwise use defaults
+        if (winSize < 0) {
+            winSize = cornerRefineWinSizeSpin_ ? cornerRefineWinSizeSpin_->value() : 5;
+        }
+        if (maxIter < 0) {
+            maxIter = cornerRefineMaxIterSpin_ ? cornerRefineMaxIterSpin_->value() : 30;
+        }
+        
         TermCriteria criteria(TermCriteria::EPS + TermCriteria::COUNT, maxIter, 0.001);
         cornerSubPix(gray, corners, Size(winSize, winSize), Size(-1, -1), criteria);
     }
     
-    // Extract quadrilaterals from edge-detected image
+    // Extract quadrilaterals from edge-detected image - uses tunable parameters
     vector<vector<Point2f>> extractQuadrilaterals(const Mat& edges, const Mat& original) {
         vector<vector<Point2f>> quads;
         
@@ -2139,8 +2379,9 @@ private:
         vector<Vec4i> hierarchy;
         findContours(edges, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
         
-        double tag_min_area = 500;
-        double tag_max_area = 50000;
+        // Use tunable parameters if available
+        double tag_min_area = tagMinAreaSpin_ ? tagMinAreaSpin_->value() : 500;
+        double tag_max_area = tagMaxAreaSpin_ ? tagMaxAreaSpin_->value() : 50000;
         
         for (size_t i = 0; i < contours.size(); i++) {
             double area = contourArea(contours[i]);
@@ -2164,7 +2405,11 @@ private:
     // Extract 6x6 pattern from warped tag image
     // Tag36h11 is 8x8 cells: 1-cell black border on all sides, 6x6 data region in center
     // The extracted 6x6 pattern contains ONLY data cells (no border)
-    vector<vector<int>> extractPattern(const Mat& warped, int tagSize = 36, int borderSize = 4) {
+    vector<vector<int>> extractPattern(const Mat& warped, int tagSize = 36, int borderSize = -1) {
+        // Use tunable parameter if available
+        if (borderSize < 0) {
+            borderSize = patternBorderSizeSpin_ ? patternBorderSizeSpin_->value() : 4;
+        }
         // Calculate border size: Tag36h11 is 8x8 cells, so border = tagSize / 8
         // Use provided borderSize if it makes sense, otherwise calculate
         if (borderSize <= 0) {
@@ -2204,8 +2449,6 @@ private:
         // Use effectiveBorderSize to ensure we're well inside the data region
         int dataSize = tagSize - 2 * effectiveBorderSize;
         int cellSize = dataSize / 6;
-        
-        qDebug() << "dataSize:" << dataSize << "cellSize:" << cellSize << "borderMargin:" << borderMargin;
         
         vector<vector<int>> pattern(6, vector<int>(6));
         
@@ -3271,135 +3514,8 @@ private:
         // ========== LEFT HALF: Controls ==========
         QVBoxLayout *leftControlsLayout = new QVBoxLayout();
         
-        // Camera selection
-        QGroupBox *cameraGroup = new QGroupBox("Camera Selection", this);
-        QHBoxLayout *cameraLayout = new QHBoxLayout();
-        QLabel *cameraLabel = new QLabel("Camera:", this);
-        cameraCombo_ = new QComboBox(this);
-        connect(cameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
-                this, &AprilTagDebugGUI::openCamera);
-        cameraLayout->addWidget(cameraLabel);
-        cameraLayout->addWidget(cameraCombo_);
-        cameraLayout->addStretch();
-        cameraGroup->setLayout(cameraLayout);
-        leftControlsLayout->addWidget(cameraGroup);
-        
-        // Resolution/FPS selection
-        QGroupBox *modeGroup = new QGroupBox("Resolution & FPS", this);
-        QHBoxLayout *modeLayout = new QHBoxLayout();
-        QLabel *modeLabel = new QLabel("Mode:", this);
-        modeCombo_ = new QComboBox(this);
-        modeCombo_->setEnabled(false);  // Enabled when camera opens
-        connect(modeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), 
-                this, &AprilTagDebugGUI::onModeChanged);
-        modeLayout->addWidget(modeLabel);
-        modeLayout->addWidget(modeCombo_);
-        modeLayout->addStretch();
-        modeGroup->setLayout(modeLayout);
-        leftControlsLayout->addWidget(modeGroup);
-        
-        // Camera settings
-        QGroupBox *settingsGroup = new QGroupBox("Camera Settings", this);
-        QFormLayout *settingsLayout = new QFormLayout();
-        
-        // Exposure
-        exposureSlider_ = new QSlider(Qt::Horizontal, this);
-        exposureSlider_->setRange(0, 100);
-        exposureSlider_->setValue(50);
-        exposureSpin_ = new QSpinBox(this);
-        exposureSpin_->setRange(0, 100);
-        exposureSpin_->setValue(50);
-        connect(exposureSlider_, &QSlider::valueChanged, exposureSpin_, &QSpinBox::setValue);
-        connect(exposureSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
-                exposureSlider_, &QSlider::setValue);
-        connect(exposureSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
-        QHBoxLayout *exposureLayout = new QHBoxLayout();
-        exposureLayout->addWidget(exposureSlider_);
-        exposureLayout->addWidget(exposureSpin_);
-        settingsLayout->addRow("Exposure:", exposureLayout);
-        
-        // Gain
-        gainSlider_ = new QSlider(Qt::Horizontal, this);
-        gainSlider_->setRange(0, 100);
-        gainSlider_->setValue(50);
-        gainSpin_ = new QSpinBox(this);
-        gainSpin_->setRange(0, 100);
-        gainSpin_->setValue(50);
-        connect(gainSlider_, &QSlider::valueChanged, gainSpin_, &QSpinBox::setValue);
-        connect(gainSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
-                gainSlider_, &QSlider::setValue);
-        connect(gainSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
-        QHBoxLayout *gainLayout = new QHBoxLayout();
-        gainLayout->addWidget(gainSlider_);
-        gainLayout->addWidget(gainSpin_);
-        settingsLayout->addRow("Gain:", gainLayout);
-        
-        // Brightness
-        brightnessSlider_ = new QSlider(Qt::Horizontal, this);
-        brightnessSlider_->setRange(0, 255);
-        brightnessSlider_->setValue(128);
-        brightnessSpin_ = new QSpinBox(this);
-        brightnessSpin_->setRange(0, 255);
-        brightnessSpin_->setValue(128);
-        connect(brightnessSlider_, &QSlider::valueChanged, brightnessSpin_, &QSpinBox::setValue);
-        connect(brightnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
-                brightnessSlider_, &QSlider::setValue);
-        connect(brightnessSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
-        QHBoxLayout *brightnessLayout = new QHBoxLayout();
-        brightnessLayout->addWidget(brightnessSlider_);
-        brightnessLayout->addWidget(brightnessSpin_);
-        settingsLayout->addRow("Brightness:", brightnessLayout);
-        
-        // Contrast (MindVision and V4L2)
-        contrastSlider_ = new QSlider(Qt::Horizontal, this);
-        contrastSlider_->setRange(0, 100);
-        contrastSlider_->setValue(50);
-        contrastSpin_ = new QSpinBox(this);
-        contrastSpin_->setRange(0, 100);
-        contrastSpin_->setValue(50);
-        connect(contrastSlider_, &QSlider::valueChanged, contrastSpin_, &QSpinBox::setValue);
-        connect(contrastSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
-                contrastSlider_, &QSlider::setValue);
-        connect(contrastSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
-        QHBoxLayout *contrastLayout = new QHBoxLayout();
-        contrastLayout->addWidget(contrastSlider_);
-        contrastLayout->addWidget(contrastSpin_);
-        settingsLayout->addRow("Contrast:", contrastLayout);
-        
-        // Saturation (MindVision and V4L2)
-        saturationSlider_ = new QSlider(Qt::Horizontal, this);
-        saturationSlider_->setRange(0, 100);
-        saturationSlider_->setValue(50);
-        saturationSpin_ = new QSpinBox(this);
-        saturationSpin_->setRange(0, 100);
-        saturationSpin_->setValue(50);
-        connect(saturationSlider_, &QSlider::valueChanged, saturationSpin_, &QSpinBox::setValue);
-        connect(saturationSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
-                saturationSlider_, &QSlider::setValue);
-        connect(saturationSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
-        QHBoxLayout *saturationLayout = new QHBoxLayout();
-        saturationLayout->addWidget(saturationSlider_);
-        saturationLayout->addWidget(saturationSpin_);
-        settingsLayout->addRow("Saturation:", saturationLayout);
-        
-        // Sharpness (MindVision and V4L2)
-        sharpnessSlider_ = new QSlider(Qt::Horizontal, this);
-        sharpnessSlider_->setRange(0, 100);
-        sharpnessSlider_->setValue(50);
-        sharpnessSpin_ = new QSpinBox(this);
-        sharpnessSpin_->setRange(0, 100);
-        sharpnessSpin_->setValue(50);
-        connect(sharpnessSlider_, &QSlider::valueChanged, sharpnessSpin_, &QSpinBox::setValue);
-        connect(sharpnessSpin_, QOverload<int>::of(&QSpinBox::valueChanged), 
-                sharpnessSlider_, &QSlider::setValue);
-        connect(sharpnessSlider_, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
-        QHBoxLayout *sharpnessLayout = new QHBoxLayout();
-        sharpnessLayout->addWidget(sharpnessSlider_);
-        sharpnessLayout->addWidget(sharpnessSpin_);
-        settingsLayout->addRow("Sharpness:", sharpnessLayout);
-        
-        settingsGroup->setLayout(settingsLayout);
-        leftControlsLayout->addWidget(settingsGroup);
+        // Note: Camera selection, resolution/FPS, and settings are now at the top of the application
+        // (outside tabs) so they are shared across all tabs
         
         // Algorithm selection for preview
         QGroupBox *algorithmGroup = new QGroupBox("AprilTag Detection (Preview)", this);
@@ -3436,12 +3552,9 @@ private:
         connect(captureBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::captureFrame);
         leftControlsLayout->addWidget(captureBtn_);
         
-        saveSettingsBtn_ = new QPushButton("Save Camera Settings", this);
-        saveSettingsBtn_->setEnabled(false);
-        connect(saveSettingsBtn_, &QPushButton::clicked, this, &AprilTagDebugGUI::saveCameraSettings);
-        leftControlsLayout->addWidget(saveSettingsBtn_);
+        // Note: Save Camera Settings button is now at the top of the application (shared across all tabs)
         
-        // Video preview on left side (bottom)
+        // Video preview on left side
         previewLabel_ = new QLabel(this);
         previewLabel_->setMinimumSize(640, 480);
         previewLabel_->setAlignment(Qt::AlignCenter);
@@ -3449,6 +3562,204 @@ private:
         previewLabel_->setText("No camera selected");
         previewLabel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         leftControlsLayout->addWidget(previewLabel_);
+        
+        // ========== ALGORITHM TUNING SETTINGS (Below Preview) ==========
+        QGroupBox *algorithmTuningGroup = new QGroupBox("Algorithm Tuning (AprilTag Detection Performance)", this);
+        QVBoxLayout *algorithmTuningLayout = new QVBoxLayout();
+        
+        QLabel *algorithmTuningInfo = new QLabel(
+            "Tune preprocessing, edge detection, detection, and advanced parameters for optimal AprilTag detection performance.",
+            this);
+        algorithmTuningInfo->setWordWrap(true);
+        algorithmTuningInfo->setStyleSheet("color: #666; padding: 5px; font-size: 9pt;");
+        algorithmTuningLayout->addWidget(algorithmTuningInfo);
+        
+        // Buttons at the top (side by side)
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *loadDefaultsBtn = new QPushButton("Load Default Settings", this);
+        loadDefaultsBtn->setStyleSheet("font-weight: bold; padding: 5px;");
+        connect(loadDefaultsBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::loadDefaultAlgorithmSettings);
+        
+        QPushButton *applyAlgorithmSettingsBtn = new QPushButton("Apply Algorithm Settings", this);
+        applyAlgorithmSettingsBtn->setStyleSheet("font-weight: bold; padding: 5px;");
+        connect(applyAlgorithmSettingsBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::applyAlgorithmSettings);
+        
+        buttonLayout->addWidget(loadDefaultsBtn);
+        buttonLayout->addWidget(applyAlgorithmSettingsBtn);
+        algorithmTuningLayout->addLayout(buttonLayout);
+        
+        // Use tabs for different parameter categories
+        QTabWidget *tuningTabs = new QTabWidget(this);
+        tuningTabs->setMaximumHeight(400);  // Limit height to keep it compact
+        
+        // === PREPROCESSING TAB ===
+        QWidget *preprocessTab = new QWidget(this);
+        QFormLayout *preprocessLayout = new QFormLayout(preprocessTab);
+        
+        preprocessHistEqCheck_ = new QCheckBox("Enable Histogram Equalization", this);
+        preprocessHistEqCheck_->setChecked(false);
+        preprocessLayout->addRow("Histogram Equalization:", preprocessHistEqCheck_);
+        
+        preprocessClaheClipSpin_ = new QDoubleSpinBox(this);
+        preprocessClaheClipSpin_->setRange(1.0, 8.0);
+        preprocessClaheClipSpin_->setValue(3.0);
+        preprocessClaheClipSpin_->setSingleStep(0.5);
+        preprocessClaheClipSpin_->setDecimals(1);
+        preprocessLayout->addRow("CLAHE Clip Limit:", preprocessClaheClipSpin_);
+        
+        preprocessGammaSpin_ = new QDoubleSpinBox(this);
+        preprocessGammaSpin_->setRange(0.5, 3.0);
+        preprocessGammaSpin_->setValue(1.5);
+        preprocessGammaSpin_->setSingleStep(0.1);
+        preprocessGammaSpin_->setDecimals(1);
+        preprocessLayout->addRow("Gamma Correction:", preprocessGammaSpin_);
+        
+        preprocessContrastSpin_ = new QDoubleSpinBox(this);
+        preprocessContrastSpin_->setRange(0.5, 3.0);
+        preprocessContrastSpin_->setValue(1.5);
+        preprocessContrastSpin_->setSingleStep(0.1);
+        preprocessContrastSpin_->setDecimals(1);
+        preprocessLayout->addRow("Contrast Multiplier:", preprocessContrastSpin_);
+        
+        preprocessTab->setLayout(preprocessLayout);
+        tuningTabs->addTab(preprocessTab, "Preprocessing");
+        
+        // === EDGE DETECTION TAB ===
+        QWidget *edgeTab = new QWidget(this);
+        QFormLayout *edgeLayout = new QFormLayout(edgeTab);
+        
+        cannyLowSpin_ = new QSpinBox(this);
+        cannyLowSpin_->setRange(10, 200);
+        cannyLowSpin_->setValue(50);
+        edgeLayout->addRow("Canny Low Threshold:", cannyLowSpin_);
+        
+        cannyHighSpin_ = new QSpinBox(this);
+        cannyHighSpin_->setRange(50, 300);
+        cannyHighSpin_->setValue(150);
+        edgeLayout->addRow("Canny High Threshold:", cannyHighSpin_);
+        
+        adaptiveThreshBlockSpin_ = new QSpinBox(this);
+        adaptiveThreshBlockSpin_->setRange(3, 31);
+        adaptiveThreshBlockSpin_->setValue(11);
+        adaptiveThreshBlockSpin_->setSingleStep(2);
+        edgeLayout->addRow("Adaptive Threshold Block Size:", adaptiveThreshBlockSpin_);
+        
+        adaptiveThreshConstantSpin_ = new QSpinBox(this);
+        adaptiveThreshConstantSpin_->setRange(-10, 10);
+        adaptiveThreshConstantSpin_->setValue(2);
+        edgeLayout->addRow("Adaptive Threshold Constant:", adaptiveThreshConstantSpin_);
+        
+        edgeTab->setLayout(edgeLayout);
+        tuningTabs->addTab(edgeTab, "Edge Detection");
+        
+        // === DETECTION PARAMETERS TAB ===
+        QWidget *detectionTab = new QWidget(this);
+        QFormLayout *detectionLayout = new QFormLayout(detectionTab);
+        
+        quadDecimateSpin_ = new QDoubleSpinBox(this);
+        quadDecimateSpin_->setRange(1.0, 4.0);
+        quadDecimateSpin_->setValue(2.0);
+        quadDecimateSpin_->setSingleStep(0.5);
+        quadDecimateSpin_->setDecimals(1);
+        detectionLayout->addRow("Quad Decimate:", quadDecimateSpin_);
+        
+        quadSigmaSpin_ = new QDoubleSpinBox(this);
+        quadSigmaSpin_->setRange(0.0, 2.0);
+        quadSigmaSpin_->setValue(0.0);
+        quadSigmaSpin_->setSingleStep(0.1);
+        quadSigmaSpin_->setDecimals(1);
+        detectionLayout->addRow("Quad Sigma (Gaussian Blur):", quadSigmaSpin_);
+        
+        refineEdgesCheck_ = new QCheckBox("Refine Edges", this);
+        refineEdgesCheck_->setChecked(true);
+        detectionLayout->addRow("Refine Edges:", refineEdgesCheck_);
+        
+        decodeSharpeningSpin_ = new QDoubleSpinBox(this);
+        decodeSharpeningSpin_->setRange(0.0, 1.0);
+        decodeSharpeningSpin_->setValue(0.25);
+        decodeSharpeningSpin_->setSingleStep(0.05);
+        decodeSharpeningSpin_->setDecimals(2);
+        detectionLayout->addRow("Decode Sharpening:", decodeSharpeningSpin_);
+        
+        nthreadsSpin_ = new QSpinBox(this);
+        nthreadsSpin_->setRange(1, 16);
+        nthreadsSpin_->setValue(4);
+        detectionLayout->addRow("Number of Threads:", nthreadsSpin_);
+        
+        detectionTab->setLayout(detectionLayout);
+        tuningTabs->addTab(detectionTab, "Detection");
+        
+        // === QUAD THRESHOLD PARAMETERS TAB ===
+        QWidget *quadThreshTab = new QWidget(this);
+        QFormLayout *quadThreshLayout = new QFormLayout(quadThreshTab);
+        
+        minClusterPixelsSpin_ = new QSpinBox(this);
+        minClusterPixelsSpin_->setRange(1, 20);
+        minClusterPixelsSpin_->setValue(6);
+        quadThreshLayout->addRow("Min Cluster Pixels:", minClusterPixelsSpin_);
+        
+        maxLineFitMseSpin_ = new QDoubleSpinBox(this);
+        maxLineFitMseSpin_->setRange(1.0, 20.0);
+        maxLineFitMseSpin_->setValue(8.0);
+        maxLineFitMseSpin_->setSingleStep(0.5);
+        maxLineFitMseSpin_->setDecimals(1);
+        quadThreshLayout->addRow("Max Line Fit MSE:", maxLineFitMseSpin_);
+        
+        criticalAngleSpin_ = new QDoubleSpinBox(this);
+        criticalAngleSpin_->setRange(1.0, 20.0);
+        criticalAngleSpin_->setValue(7.0);
+        criticalAngleSpin_->setSingleStep(0.5);
+        criticalAngleSpin_->setDecimals(1);
+        quadThreshLayout->addRow("Critical Angle (degrees):", criticalAngleSpin_);
+        
+        minWhiteBlackDiffSpin_ = new QSpinBox(this);
+        minWhiteBlackDiffSpin_->setRange(1, 20);
+        minWhiteBlackDiffSpin_->setValue(6);
+        quadThreshLayout->addRow("Min White-Black Diff:", minWhiteBlackDiffSpin_);
+        
+        quadThreshTab->setLayout(quadThreshLayout);
+        tuningTabs->addTab(quadThreshTab, "Quad Threshold");
+        
+        // === ADVANCED PARAMETERS TAB ===
+        QWidget *advancedTab = new QWidget(this);
+        QFormLayout *advancedLayout = new QFormLayout(advancedTab);
+        
+        cornerRefineWinSizeSpin_ = new QSpinBox(this);
+        cornerRefineWinSizeSpin_->setRange(3, 21);
+        cornerRefineWinSizeSpin_->setValue(5);
+        cornerRefineWinSizeSpin_->setSingleStep(2);
+        advancedLayout->addRow("Corner Refinement Window Size:", cornerRefineWinSizeSpin_);
+        
+        cornerRefineMaxIterSpin_ = new QSpinBox(this);
+        cornerRefineMaxIterSpin_->setRange(10, 100);
+        cornerRefineMaxIterSpin_->setValue(30);
+        cornerRefineMaxIterSpin_->setSingleStep(5);
+        advancedLayout->addRow("Corner Refinement Max Iterations:", cornerRefineMaxIterSpin_);
+        
+        patternBorderSizeSpin_ = new QSpinBox(this);
+        patternBorderSizeSpin_->setRange(1, 10);
+        patternBorderSizeSpin_->setValue(4);
+        advancedLayout->addRow("Pattern Border Size:", patternBorderSizeSpin_);
+        
+        tagMinAreaSpin_ = new QSpinBox(this);
+        tagMinAreaSpin_->setRange(100, 10000);
+        tagMinAreaSpin_->setValue(500);
+        tagMinAreaSpin_->setSingleStep(100);
+        advancedLayout->addRow("Tag Min Area (pixels):", tagMinAreaSpin_);
+        
+        tagMaxAreaSpin_ = new QSpinBox(this);
+        tagMaxAreaSpin_->setRange(1000, 100000);
+        tagMaxAreaSpin_->setValue(50000);
+        tagMaxAreaSpin_->setSingleStep(1000);
+        advancedLayout->addRow("Tag Max Area (pixels):", tagMaxAreaSpin_);
+        
+        advancedTab->setLayout(advancedLayout);
+        tuningTabs->addTab(advancedTab, "Advanced");
+        
+        algorithmTuningLayout->addWidget(tuningTabs);
+        
+        algorithmTuningGroup->setLayout(algorithmTuningLayout);
+        leftControlsLayout->addWidget(algorithmTuningGroup);
         
         // ========== RIGHT HALF: Pattern Visualization Only ==========
         QVBoxLayout *rightPreviewLayout = new QVBoxLayout();
@@ -3574,7 +3885,7 @@ private:
         cameraSettingsInfo->setStyleSheet("color: #666; padding: 5px;");
         cameraSettingsLayout->addWidget(cameraSettingsInfo);
         
-        // Camera selector
+        // Camera selector with Save button
         QHBoxLayout *cameraSelectLayout = new QHBoxLayout();
         QLabel *cameraSelectLabel = new QLabel("Camera:", this);
         settingsCameraCombo_ = new QComboBox(this);
@@ -3584,8 +3895,11 @@ private:
         }
         connect(settingsCameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, &AprilTagDebugGUI::onSettingsCameraChanged);
+        QPushButton *saveCameraSettingsBtn = new QPushButton("Save Camera Settings", this);
+        connect(saveCameraSettingsBtn, &QPushButton::clicked, this, &AprilTagDebugGUI::saveCameraSettingsFromSettingsTab);
         cameraSelectLayout->addWidget(cameraSelectLabel);
         cameraSelectLayout->addWidget(settingsCameraCombo_);
+        cameraSelectLayout->addWidget(saveCameraSettingsBtn);
         cameraSelectLayout->addStretch();
         cameraSettingsLayout->addLayout(cameraSelectLayout);
         
@@ -3783,6 +4097,9 @@ private:
             saveCameraSettingsFromSettingsTab();
         }
         
+        // Algorithm settings are now saved per camera in camera_settings.txt
+        // No need to save globally here
+        
         fs.release();
         
         QMessageBox::information(this, "Settings", QString("Settings saved to:\n%1").arg(configPath));
@@ -3827,24 +4144,8 @@ private:
         algorithmGroup->setLayout(algorithmLayout);
         layout->addWidget(algorithmGroup);
         
-        // Camera selection (for algorithm processing)
-        QGroupBox *cameraGroup = new QGroupBox("Camera Selection", this);
-        QHBoxLayout *cameraLayout = new QHBoxLayout();
-        
-        QLabel *cameraLabel = new QLabel("Camera:", this);
-        algorithmCameraCombo_ = new QComboBox(this);
-        // Populate from already-enumerated cameras (Capture tab enumerates them first)
-        // Use the same cameraList_ that was populated in setupCaptureTab()
-        // Skip "None" option (index 0) for algorithm tab - algorithm requires a camera
-        for (size_t i = 1; i < cameraList_.size(); i++) {
-            algorithmCameraCombo_->addItem(QString::fromStdString(cameraList_[i]));
-        }
-        
-        cameraLayout->addWidget(cameraLabel);
-        cameraLayout->addWidget(algorithmCameraCombo_);
-        cameraLayout->addStretch();
-        cameraGroup->setLayout(cameraLayout);
-        layout->addWidget(cameraGroup);
+        // Note: Camera selection is now at the top of the application (shared across all tabs)
+        // The algorithm will use the camera selected in the top-level camera controls
         
         // Control buttons
         QHBoxLayout *buttonLayout = new QHBoxLayout();
@@ -3860,14 +4161,25 @@ private:
         algorithmMirrorCheckbox_ = new QCheckBox("Mirror (Horizontal Flip)", this);
         buttonLayout->addWidget(algorithmMirrorCheckbox_);
         
-        // Connect camera selection change to set mirror checkbox for MindVision cameras
-        // (after checkbox is created)
-        connect(algorithmCameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this, &AprilTagDebugGUI::onAlgorithmCameraChanged);
+        // Debug checkbox
+        algorithmDebugCheckbox_ = new QCheckBox("Debug Mode (Show Quads)", this);
+        algorithmDebugCheckbox_->setToolTip("Enable to show numbered quads before filtering on video display");
+        buttonLayout->addWidget(algorithmDebugCheckbox_);
         
-        // Set initial mirror checkbox state if a MindVision camera is selected
-        if (algorithmCameraCombo_->count() > 0) {
-            onAlgorithmCameraChanged(algorithmCameraCombo_->currentIndex());
+        // Note: Camera selection is now at the top of the application (shared across all tabs)
+        // Connect to top-level camera selection to update mirror checkbox when camera changes
+        if (cameraCombo_) {
+            connect(cameraCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this]() {
+                        if (cameraOpen_ && useMindVision_ && algorithmMirrorCheckbox_) {
+                            algorithmMirrorCheckbox_->setChecked(true);
+                        }
+                    });
+        }
+        
+        // Set initial mirror checkbox state based on current camera
+        if (cameraOpen_ && useMindVision_ && algorithmMirrorCheckbox_) {
+            algorithmMirrorCheckbox_->setChecked(true);
         }
         
         buttonLayout->addStretch();
@@ -4776,9 +5088,27 @@ private:
         for (int i = 0; i < 10; i++) {
             VideoCapture testCap(i);
             if (testCap.isOpened()) {
-                cameraList_.push_back("V4L2 Camera " + to_string(i));
+                // Try to get camera name from sysfs
+                string cameraName = "V4L2 Camera " + to_string(i);
+                string sysfsPath = "/sys/class/video4linux/video" + to_string(i) + "/name";
+                QFile nameFile(QString::fromStdString(sysfsPath));
+                if (nameFile.exists() && nameFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    QTextStream in(&nameFile);
+                    QString name = in.readLine().trimmed();
+                    if (!name.isEmpty()) {
+                        // Check if it's an Arducam camera
+                        if (name.contains("Arducam", Qt::CaseInsensitive)) {
+                            cameraName = "Arducam: " + name.toStdString() + " (/dev/video" + to_string(i) + ")";
+                        } else {
+                            cameraName = name.toStdString() + " (/dev/video" + to_string(i) + ")";
+                        }
+                    }
+                    nameFile.close();
+                }
+                
+                cameraList_.push_back(cameraName);
                 isMindVision_.push_back(false);
-                cameraCombo_->addItem(QString("V4L2 Camera %1").arg(i));
+                cameraCombo_->addItem(QString::fromStdString(cameraName));
                 testCap.release();
             }
         }
@@ -4811,6 +5141,30 @@ private:
     }
     
     void openCamera() {
+        // Refresh camera list before opening to ensure we have current connected cameras
+        int previousIndex = cameraCombo_->currentIndex();
+        QString previousCameraName;
+        if (previousIndex >= 0 && previousIndex < cameraCombo_->count()) {
+            previousCameraName = cameraCombo_->currentText();
+        }
+        
+        // Re-enumerate cameras to get current list
+        cameraCombo_->blockSignals(true);  // Prevent signal during enumeration
+        enumerateCameras();
+        
+        // Try to restore previous selection if camera still exists
+        int newIndex = 0;
+        if (!previousCameraName.isEmpty()) {
+            for (int i = 0; i < cameraCombo_->count(); i++) {
+                if (cameraCombo_->itemText(i) == previousCameraName) {
+                    newIndex = i;
+                    break;
+                }
+            }
+        }
+        cameraCombo_->setCurrentIndex(newIndex);
+        cameraCombo_->blockSignals(false);
+        
         // Only close camera if it's already open (previewTimer_ might not exist yet during initialization)
         if (cameraOpen_ && previewTimer_ != nullptr) {
             closeCamera();
@@ -4853,9 +5207,60 @@ private:
                 if (isMindVision_[i]) mvIndex++;
             }
             
+            // Check if camera is already opened by another application
+            BOOL isOpened = FALSE;
+            CameraIsOpened(&list[mvIndex], &isOpened);
+            if (isOpened) {
+                QString errorMsg = QString("Camera '%1' (SN: %2) is already in use by another application.\n\n"
+                                          "Please close other applications using this camera and try again.")
+                                          .arg(QString::fromLocal8Bit(list[mvIndex].acFriendlyName))
+                                          .arg(QString::fromLocal8Bit(list[mvIndex].acSn));
+                previewLabel_->setText(errorMsg);
+                QMessageBox::warning(this, "Camera Already in Use", errorMsg);
+                return;
+            }
+            
             status = CameraInit(&list[mvIndex], -1, -1, &mvHandle_);
             if (status != CAMERA_STATUS_SUCCESS) {
-                previewLabel_->setText("Failed to open MindVision camera");
+                QString errorMsg;
+                QString cameraName = QString::fromLocal8Bit(list[mvIndex].acFriendlyName);
+                QString cameraSN = QString::fromLocal8Bit(list[mvIndex].acSn);
+                
+                switch (status) {
+                    case CAMERA_STATUS_DEVICE_IS_OPENED:
+                        errorMsg = QString("Camera '%1' (SN: %2) is already in use.\n\n"
+                                          "Error code: %3 (CAMERA_STATUS_DEVICE_IS_OPENED)\n\n"
+                                          "Please close other applications using this camera and try again.")
+                                          .arg(cameraName).arg(cameraSN).arg(status);
+                        break;
+                    case CAMERA_STATUS_ACCESS_DENY:
+                        errorMsg = QString("Access denied to camera '%1' (SN: %2).\n\n"
+                                          "Error code: %3 (CAMERA_STATUS_ACCESS_DENY)\n\n"
+                                          "The camera may be locked by another process.")
+                                          .arg(cameraName).arg(cameraSN).arg(status);
+                        break;
+                    case CAMERA_STATUS_NO_DEVICE_FOUND:
+                        errorMsg = QString("Camera '%1' (SN: %2) not found.\n\n"
+                                          "Error code: %3 (CAMERA_STATUS_NO_DEVICE_FOUND)")
+                                          .arg(cameraName).arg(cameraSN).arg(status);
+                        break;
+                    case CAMERA_STATUS_COMM_ERROR:
+                        errorMsg = QString("Communication error with camera '%1' (SN: %2).\n\n"
+                                          "Error code: %3 (CAMERA_STATUS_COMM_ERROR)\n\n"
+                                          "Please check the USB connection.")
+                                          .arg(cameraName).arg(cameraSN).arg(status);
+                        break;
+                    default:
+                        errorMsg = QString("Failed to open MindVision camera '%1' (SN: %2).\n\n"
+                                          "Error code: %3\n\n"
+                                          "Please check the camera connection and try again.")
+                                          .arg(cameraName).arg(cameraSN).arg(status);
+                        break;
+                }
+                
+                previewLabel_->setText(errorMsg);
+                QMessageBox::warning(this, "Camera Open Failed", errorMsg);
+                qDebug() << "CameraInit failed with status:" << status << "for camera:" << cameraName;
                 return;
             }
             
@@ -4872,6 +5277,28 @@ private:
             
             CameraPlay(mvHandle_);
             
+            // Load camera settings profile for MindVision (with camera handle for capability query)
+            string cameraName = cameraList_[index];
+            // First, try to load from config file
+            map<string, CameraSettingsProfile> allProfiles = loadAllCameraSettingsProfiles();
+            if (allProfiles.find(cameraName) != allProfiles.end()) {
+                currentCameraSettings_ = allProfiles[cameraName];
+            } else {
+                // Create new profile using actual camera capabilities
+                currentCameraSettings_ = defineMindVisionSettings(cameraName, mvHandle_);
+            }
+            loadCameraSettingsProfileForCamera(cameraName, "MindVision");
+            applySavedValuesToProfile();
+            
+            // Apply saved settings to camera BEFORE reading current values
+            applyCameraSettingsFromProfile();
+            
+            // Load and apply algorithm settings for this camera
+            loadAlgorithmSettingsForCamera();
+            
+            // Populate dynamic camera controls (will hide scroll area for MindVision)
+            populateDynamicCameraControls();
+            
             // Initialize MindVision modes
             mv_modes_.clear();
             mv_modes_.push_back(MVMode{1280, 1024, FRAME_SPEED_SUPER, "1280x1024 @211 FPS"});
@@ -4884,64 +5311,29 @@ private:
             for (const auto &m : mv_modes_) {
                 modeCombo_->addItem(QString::fromStdString(m.label));
             }
-            modeCombo_->setCurrentIndex(0);
             modeCombo_->setEnabled(true);
             modeCombo_->blockSignals(false);
-            applyMVMode(0);
             
-            // Initialize slider values from camera
-            double current_exposure = 0.0;
-            if (CameraGetExposureTime(mvHandle_, &current_exposure) == CAMERA_STATUS_SUCCESS) {
-                double min_exposure = 1000.0;
-                double max_exposure = 100000.0;
-                int slider_value = static_cast<int>(((max_exposure - current_exposure) / (max_exposure - min_exposure)) * 100.0);
-                slider_value = std::max(0, std::min(100, slider_value));
-                exposureSlider_->blockSignals(true);
-                exposureSlider_->setValue(slider_value);
-                exposureSpin_->setValue(slider_value);
-                exposureSlider_->blockSignals(false);
+            // Load saved mode from Settings tab (will be applied after settings are loaded)
+            // Check if there's a saved mode_index in the profile
+            int savedModeIndex = 0;
+            if (currentCameraSettings_.saved_values.find("mode_index") != currentCameraSettings_.saved_values.end()) {
+                savedModeIndex = currentCameraSettings_.saved_values.at("mode_index");
+                if (savedModeIndex >= 0 && savedModeIndex < modeCombo_->count()) {
+                    modeCombo_->setCurrentIndex(savedModeIndex);
+                    applyMVMode(savedModeIndex);
+                } else {
+                    modeCombo_->setCurrentIndex(0);
+                    applyMVMode(0);
+                }
+            } else {
+                // Default to first mode if no saved setting
+                modeCombo_->setCurrentIndex(0);
+                applyMVMode(0);
             }
             
-            int current_gain_r = 0, current_gain_g = 0, current_gain_b = 0;
-            if (CameraGetGain(mvHandle_, &current_gain_r, &current_gain_g, &current_gain_b) == CAMERA_STATUS_SUCCESS) {
-                gainSlider_->blockSignals(true);
-                gainSlider_->setValue(current_gain_r);
-                gainSpin_->setValue(current_gain_r);
-                gainSlider_->blockSignals(false);
-            }
-            
-            INT current_analog_gain = 0;
-            if (CameraGetAnalogGain(mvHandle_, &current_analog_gain) == CAMERA_STATUS_SUCCESS) {
-                int brightness_value = (current_analog_gain * 255) / 100;
-                brightnessSlider_->blockSignals(true);
-                brightnessSlider_->setValue(brightness_value);
-                brightnessSpin_->setValue(brightness_value);
-                brightnessSlider_->blockSignals(false);
-            }
-            
-            int current_contrast = 0;
-            if (CameraGetContrast(mvHandle_, &current_contrast) == CAMERA_STATUS_SUCCESS) {
-                contrastSlider_->blockSignals(true);
-                contrastSlider_->setValue(current_contrast);
-                contrastSpin_->setValue(current_contrast);
-                contrastSlider_->blockSignals(false);
-            }
-            
-            int current_saturation = 0;
-            if (CameraGetSaturation(mvHandle_, &current_saturation) == CAMERA_STATUS_SUCCESS) {
-                saturationSlider_->blockSignals(true);
-                saturationSlider_->setValue(current_saturation);
-                saturationSpin_->setValue(current_saturation);
-                saturationSlider_->blockSignals(false);
-            }
-            
-            int current_sharpness = 0;
-            if (CameraGetSharpness(mvHandle_, &current_sharpness) == CAMERA_STATUS_SUCCESS) {
-                sharpnessSlider_->blockSignals(true);
-                sharpnessSlider_->setValue(current_sharpness);
-                sharpnessSpin_->setValue(current_sharpness);
-                sharpnessSlider_->blockSignals(false);
-            }
+            // Note: Settings are now applied from saved profile via applyCameraSettingsFromProfile()
+            // No need to read current values from camera as they will be overwritten by saved settings
             
             cameraOpen_ = true;
             
@@ -4973,12 +5365,116 @@ private:
                 return;
             }
             
+            // Check if this is an Arducam camera
+            bool isArducam = false;
+            QString cameraNameQStr = QString::fromStdString(cameraList_[index]);
+            string cameraName = cameraList_[index];
+            if (cameraNameQStr.contains("Arducam", Qt::CaseInsensitive)) {
+                isArducam = true;
+                // Load camera settings profile for Arducam
+                loadCameraSettingsProfileForCamera(cameraName, "Arducam", v4l2Index);
+            } else {
+                // Load camera settings profile for other V4L2 cameras
+                loadCameraSettingsProfileForCamera(cameraName, "V4L2", v4l2Index);
+            }
+            applySavedValuesToProfile();
+            
+            // Apply saved settings to camera and populate UI
+            applyCameraSettingsFromProfile();
+            
+            // Load and apply algorithm settings for this camera
+            loadAlgorithmSettingsForCamera();
+            
+            // Populate dynamic camera controls in the scroll area
+            populateDynamicCameraControls();
+            
             // Initialize V4L2 modes
             v4l2_modes_.clear();
+            
+            if (isArducam) {
+                // For Arducam: Read available resolutions from the camera
+                QString devicePath = QString("/dev/video%1").arg(v4l2Index);
+                QProcess v4l2Process;
+                v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath << "--list-formats-ext");
+                v4l2Process.waitForFinished(3000);  // Wait up to 3 seconds
+                
+                if (v4l2Process.exitCode() == 0) {
+                    QString output = v4l2Process.readAllStandardOutput();
+                    QTextStream stream(&output);
+                    QString line;
+                    int currentWidth = 0, currentHeight = 0;
+                    QSet<QString> seenResolutions;  // To avoid duplicates
+                    
+                    while (stream.readLineInto(&line)) {
+                        // Look for "Size: Discrete WxH" lines
+                        QRegularExpression sizeRegex(R"(Size: Discrete (\d+)x(\d+))");
+                        if (!sizeRegex.isValid()) {
+                            qDebug() << "Invalid regex pattern for size matching";
+                            continue;
+                        }
+                        QRegularExpressionMatch match = sizeRegex.match(line);
+                        if (match.hasMatch()) {
+                            currentWidth = match.captured(1).toInt();
+                            currentHeight = match.captured(2).toInt();
+                        }
+                        
+                        // Look for "Interval: Discrete X.XXXs (YYY.YYY fps)" lines
+                        QRegularExpression fpsRegex("Interval: Discrete [\\d.]+s \\(([\\d.]+) fps\\)");
+                        if (!fpsRegex.isValid()) {
+                            qDebug() << "Invalid regex pattern for FPS matching:" << fpsRegex.errorString();
+                            continue;
+                        }
+                        QRegularExpressionMatch fpsMatch = fpsRegex.match(line);
+                        if (fpsMatch.hasMatch() && currentWidth > 0 && currentHeight > 0) {
+                            double fps = fpsMatch.captured(1).toDouble();
+                            QString resolutionKey = QString("%1x%2").arg(currentWidth).arg(currentHeight);
+                            
+                            // Only add if we haven't seen this exact resolution yet
+                            // Or if we have, prefer higher FPS
+                            QString modeLabel = QString("%1x%2 @%3 FPS").arg(currentWidth).arg(currentHeight).arg(fps, 0, 'f', 1);
+                            if (!seenResolutions.contains(resolutionKey) || 
+                                (v4l2_modes_.size() > 0 && v4l2_modes_.back().width == currentWidth && 
+                                 v4l2_modes_.back().height == currentHeight && v4l2_modes_.back().fps < fps)) {
+                                // Remove previous entry for this resolution if it exists
+                                if (seenResolutions.contains(resolutionKey)) {
+                                    for (auto it = v4l2_modes_.begin(); it != v4l2_modes_.end(); ++it) {
+                                        if (it->width == currentWidth && it->height == currentHeight) {
+                                            v4l2_modes_.erase(it);
+                                            break;
+                                        }
+                                    }
+                                }
+                                v4l2_modes_.push_back(Mode{currentWidth, currentHeight, fps, modeLabel.toStdString()});
+                                seenResolutions.insert(resolutionKey);
+                            }
+                        }
+                    }
+                    
+                    // Sort by resolution (width*height) descending, then by FPS descending
+                    std::sort(v4l2_modes_.begin(), v4l2_modes_.end(), 
+                        [](const Mode& a, const Mode& b) {
+                            int areaA = a.width * a.height;
+                            int areaB = b.width * b.height;
+                            if (areaA != areaB) return areaA > areaB;
+                            return a.fps > b.fps;
+                        });
+                }
+                
+                // Fallback to default modes if v4l2-ctl failed or no modes found
+                if (v4l2_modes_.empty()) {
+                    v4l2_modes_.push_back(Mode{1920, 1200, 50.0, "1920x1200 @50 FPS"});
+                    v4l2_modes_.push_back(Mode{1920, 1200, 30.0, "1920x1200 @30 FPS"});
+                    v4l2_modes_.push_back(Mode{960, 600, 80.0, "960x600 @80 FPS"});
+                    v4l2_modes_.push_back(Mode{960, 600, 60.0, "960x600 @60 FPS"});
+                    v4l2_modes_.push_back(Mode{960, 600, 30.0, "960x600 @30 FPS"});
+                }
+            } else {
+                // For other V4L2 cameras: Use default modes
             v4l2_modes_.push_back(Mode{640, 480, 30.0, "640x480 @30 FPS"});
             v4l2_modes_.push_back(Mode{1280, 720, 30.0, "1280x720 @30 FPS"});
             v4l2_modes_.push_back(Mode{1920, 1080, 30.0, "1920x1080 @30 FPS"});
             v4l2_modes_.push_back(Mode{640, 480, 60.0, "640x480 @60 FPS"});
+            }
             
             // Populate mode combo
             modeCombo_->blockSignals(true);
@@ -4995,7 +5491,9 @@ private:
         }
         
         captureBtn_->setEnabled(true);
+        if (saveSettingsBtn_) {
         saveSettingsBtn_->setEnabled(true);
+        }
         previewTimer_->start(33);  // ~30 FPS
         
         // Initialize algorithm if one is selected
@@ -5006,8 +5504,11 @@ private:
             captureMirrorCheckbox_->setChecked(useMindVision_);
         }
         
-        // Load camera settings from config file
+        // Load camera settings from config file (legacy format)
         loadCameraSettings();
+        
+        // Also apply settings from the new profile structure
+        // This will be used to populate the Settings tab UI
         
         // Generate initial capture filename
         suggestedCaptureFilename_ = generateCaptureFilename().toStdString();
@@ -5035,6 +5536,9 @@ private:
         modeCombo_->setEnabled(false);
         modeCombo_->clear();
         previewLabel_->setText("Camera closed");
+        
+        // Clear dynamic controls when camera is closed
+        clearDynamicCameraControls();
         
         // Clean up capture algorithm
         if (captureAlgorithm_) {
@@ -5112,7 +5616,7 @@ private:
                 }
                 // Initialize Fast AprilTag immediately (matching standalone program pattern)
                 // The standalone creates GpuDetector in main thread and uses it from same thread
-                captureAlgorithm_->initialize(width, height);
+                    captureAlgorithm_->initialize(width, height);
             }
 #endif
         }
@@ -5148,13 +5652,73 @@ private:
             CameraSetSharpness(mvHandle_, sharpnessSlider_->value());
 #endif
         } else if (cameraCap_.isOpened()) {
-            // Update V4L2 camera settings
+            // Update V4L2 camera settings - standard controls
             cameraCap_.set(CAP_PROP_EXPOSURE, exposureSlider_->value());
             cameraCap_.set(CAP_PROP_GAIN, gainSlider_->value());
             cameraCap_.set(CAP_PROP_BRIGHTNESS, brightnessSlider_->value());
             cameraCap_.set(CAP_PROP_CONTRAST, contrastSlider_->value());
             cameraCap_.set(CAP_PROP_SATURATION, saturationSlider_->value());
             cameraCap_.set(CAP_PROP_SHARPNESS, sharpnessSlider_->value());
+            
+            // Update dynamic V4L2 controls using v4l2-ctl
+            int v4l2Index = -1;
+            for (int i = 0; i < selectedCameraIndex_; i++) {
+                if (!isMindVision_[i]) v4l2Index++;
+            }
+            
+            if (v4l2Index >= 0) {
+                QString devicePath = QString("/dev/video%1").arg(v4l2Index);
+                
+                // Update all dynamic controls
+                for (const auto& pair : dynamicSliders_) {
+                    const string& settingName = pair.first;
+                    QSlider* slider = pair.second;
+                    
+                    // Find the setting in the profile
+                    for (const auto& setting : currentCameraSettings_.settings) {
+                        if (setting.name == settingName && !setting.v4l2_id.empty()) {
+                            QProcess v4l2Process;
+                            v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath 
+                                             << "--set-ctrl" << QString("%1=%2").arg(QString::fromStdString(setting.v4l2_id)).arg(slider->value()));
+                            v4l2Process.waitForFinished(500);
+                            break;
+                        }
+                    }
+                }
+                
+                for (const auto& pair : dynamicCheckBoxes_) {
+                    const string& settingName = pair.first;
+                    QCheckBox* checkBox = pair.second;
+                    
+                    // Find the setting in the profile
+                    for (const auto& setting : currentCameraSettings_.settings) {
+                        if (setting.name == settingName && !setting.v4l2_id.empty()) {
+                            QProcess v4l2Process;
+                            v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath 
+                                             << "--set-ctrl" << QString("%1=%2").arg(QString::fromStdString(setting.v4l2_id)).arg(checkBox->isChecked() ? 1 : 0));
+                            v4l2Process.waitForFinished(500);
+                            break;
+                        }
+                    }
+                }
+                
+                for (const auto& pair : dynamicComboBoxes_) {
+                    const string& settingName = pair.first;
+                    QComboBox* comboBox = pair.second;
+                    
+                    // Find the setting in the profile
+                    for (const auto& setting : currentCameraSettings_.settings) {
+                        if (setting.name == settingName && !setting.v4l2_id.empty()) {
+                            int value = setting.min_value + comboBox->currentIndex();
+                            QProcess v4l2Process;
+                            v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath 
+                                             << "--set-ctrl" << QString("%1=%2").arg(QString::fromStdString(setting.v4l2_id)).arg(value));
+                            v4l2Process.waitForFinished(500);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -5267,51 +5831,27 @@ private:
                                 if (!captureAlgorithm_) {
                                     qDebug() << "captureAlgorithm_ is null!";
                                 } else {
-                                    qDebug() << "Calling processFrame for algorithm:" << QString::fromStdString(captureAlgorithm_->getName());
-                                    qDebug() << "Frame info: rows=" << frame_for_detection.rows << "cols=" << frame_for_detection.cols 
-                                             << "channels=" << frame_for_detection.channels() << "data=" << (void*)frame_for_detection.data
-                                             << "mirror=" << mirror;
-                                    qDebug() << "About to call processFrame...";
-                                    std::cerr << "About to call processFrame..." << std::endl;
-                                    std::cerr.flush();
-                                    
                                     // Verify algorithm object is valid before calling
                                     if (!captureAlgorithm_) {
-                                        qDebug() << "ERROR: captureAlgorithm_ is null!";
-                                        std::cerr << "ERROR: captureAlgorithm_ is null!" << std::endl;
-                                        std::cerr.flush();
+                                        detections = nullptr;
                                     } else {
-                                        std::cerr << "captureAlgorithm_ pointer is valid: " << (void*)captureAlgorithm_.get() << std::endl;
-                                        std::cerr.flush();
-                                        
                                         // Try to call with exception handling
                                         try {
-                                            std::cerr << "Attempting to call processFrame..." << std::endl;
-                                            std::cerr.flush();
                                             detections = captureAlgorithm_->processFrame(frame_for_detection, mirror);
-                                            std::cerr << "processFrame call succeeded" << std::endl;
-                                            std::cerr.flush();
+                                            
                                         } catch (const std::exception& e) {
                                             qDebug() << "Exception caught in processFrame call:" << e.what();
-                                            std::cerr << "Exception caught in processFrame call: " << e.what() << std::endl;
-                                            std::cerr.flush();
                                             detections = nullptr;
                                         } catch (...) {
                                             qDebug() << "Unknown exception caught in processFrame call";
-                                            std::cerr << "Unknown exception caught in processFrame call" << std::endl;
-                                            std::cerr.flush();
                                             detections = nullptr;
                                         }
                                     }
-                                    qDebug() << "processFrame call completed";
-                                    std::cerr << "processFrame call completed" << std::endl;
-                                    qDebug() << "processFrame returned, detections pointer:" << (void*)detections;
                                     // Validate returned detections pointer
                                     if (detections != nullptr) {
                                         // Try to get size to validate the array is valid
                                         try {
                                             int size = zarray_size(detections);
-                                            qDebug() << "Detections array size:" << size;
                                             if (size < 0) {
                                                 qDebug() << "Invalid detections size:" << size;
                                                 // Don't destroy here - let the cleanup code handle it
@@ -5935,7 +6475,6 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(storedPatternsMutex_);
                         storedPatterns_.clear();
-                        qDebug() << "Storing" << all_patterns.size() << "patterns for saving";
                         for (size_t i = 0; i < all_patterns.size(); i++) {
                             const PatternData& pdata = all_patterns[i];
                             if (pdata.detection_idx < all_detections_data.size()) {
@@ -5945,10 +6484,8 @@ private:
                                 sp.warped_image = pdata.warped_image.clone();
                                 sp.pattern = pdata.pattern;
                                 storedPatterns_.push_back(sp);
-                                qDebug() << "  - Stored pattern for tag ID:" << sp.tag_id << "warped empty:" << sp.warped_image.empty() << "pattern size:" << sp.pattern.size();
                             }
                         }
-                        qDebug() << "Total stored patterns:" << storedPatterns_.size();
                     }
                     
                     // Enable save button
@@ -5974,53 +6511,53 @@ private:
                 // Build info text: show patterns first, then hamming codes
                 stringstream info_ss;
                 try {
-                    info_ss << "=== DETECTED TAGS: " << num_tags << " ===\n";
-                    info_ss << "=== SUCCESSFULLY EXTRACTED PATTERNS: " << all_patterns.size() << " ===\n\n";
-                    
-                    for (size_t pattern_idx = 0; pattern_idx < all_patterns.size(); pattern_idx++) {
+                info_ss << "=== DETECTED TAGS: " << num_tags << " ===\n";
+                info_ss << "=== SUCCESSFULLY EXTRACTED PATTERNS: " << all_patterns.size() << " ===\n\n";
+                
+                for (size_t pattern_idx = 0; pattern_idx < all_patterns.size(); pattern_idx++) {
                         try {
-                            const PatternData& pdata = all_patterns[pattern_idx];
-                            // Safety check: ensure detection index is valid
-                            if (pdata.detection_idx >= all_detections_data.size()) {
+                    const PatternData& pdata = all_patterns[pattern_idx];
+                    // Safety check: ensure detection index is valid
+                    if (pdata.detection_idx >= all_detections_data.size()) {
                                 qDebug() << "Skipping pattern" << pattern_idx << "due to invalid detection_idx:" << pdata.detection_idx << ">= size:" << all_detections_data.size();
-                                continue; // Skip if detection index is out of bounds
-                            }
-                            const DetectionData& data = all_detections_data[pdata.detection_idx];
-                            const vector<vector<int>>& pattern = pdata.pattern;
-                            
-                            // Safety check: ensure pattern is valid (6x6)
-                            if (pattern.size() != 6) {
+                        continue; // Skip if detection index is out of bounds
+                    }
+                    const DetectionData& data = all_detections_data[pdata.detection_idx];
+                    const vector<vector<int>>& pattern = pdata.pattern;
+                    
+                    // Safety check: ensure pattern is valid (6x6)
+                    if (pattern.size() != 6) {
                                 qDebug() << "Skipping pattern" << pattern_idx << "due to invalid pattern size (rows):" << pattern.size();
-                                continue; // Skip if pattern has wrong number of rows
-                            }
-                            // Check all rows have correct size
-                            bool pattern_valid = true;
-                            for (size_t i = 0; i < pattern.size(); i++) {
-                                if (pattern[i].size() != 6) {
-                                    pattern_valid = false;
-                                    break;
-                                }
-                            }
-                            if (!pattern_valid) {
+                        continue; // Skip if pattern has wrong number of rows
+                    }
+                    // Check all rows have correct size
+                    bool pattern_valid = true;
+                    for (size_t i = 0; i < pattern.size(); i++) {
+                        if (pattern[i].size() != 6) {
+                            pattern_valid = false;
+                            break;
+                        }
+                    }
+                    if (!pattern_valid) {
                                 qDebug() << "Skipping pattern" << pattern_idx << "due to invalid pattern row sizes";
-                                continue; // Skip if pattern rows have wrong size
-                            }
-                            
-                            info_ss << "--- Tag " << (pattern_idx + 1) << " (ID: " << data.id << ") ---\n";
-                            
+                        continue; // Skip if pattern rows have wrong size
+                    }
+                    
+                    info_ss << "--- Tag " << (pattern_idx + 1) << " (ID: " << data.id << ") ---\n";
+                    
                             // Show hamming code info (pattern visualization is shown in the image above)
-                            uint64_t code = extractCodeFromPattern(pattern);
-                            info_ss << "Hamming Code:\n";
-                            info_ss << "  Decision Margin: " << fixed << setprecision(2) << data.decision_margin << "\n";
-                            info_ss << "  Hamming: " << data.hamming << "\n";
-                            info_ss << "  Decimal: " << code << "\n";
-                            info_ss << "  Hex: 0x" << hex << setfill('0') << setw(9) << code << dec << "\n";
-                            info_ss << "  Binary: ";
-                            for (int i = 35; i >= 0; i--) {
-                                info_ss << ((code >> i) & 1);
-                                if (i % 9 == 0 && i > 0) info_ss << " ";
-                            }
-                            info_ss << "\n\n";
+                    uint64_t code = extractCodeFromPattern(pattern);
+                    info_ss << "Hamming Code:\n";
+                    info_ss << "  Decision Margin: " << fixed << setprecision(2) << data.decision_margin << "\n";
+                    info_ss << "  Hamming: " << data.hamming << "\n";
+                    info_ss << "  Decimal: " << code << "\n";
+                    info_ss << "  Hex: 0x" << hex << setfill('0') << setw(9) << code << dec << "\n";
+                    info_ss << "  Binary: ";
+                    for (int i = 35; i >= 0; i--) {
+                        info_ss << ((code >> i) & 1);
+                        if (i % 9 == 0 && i > 0) info_ss << " ";
+                    }
+                    info_ss << "\n\n";
                         } catch (const std::exception& e) {
                             qDebug() << "Exception processing pattern" << pattern_idx << ":" << e.what();
                             continue;
@@ -6042,7 +6579,7 @@ private:
                 // Safety check before setting text
                 if (capturePatternInfoText_) {
                     try {
-                        capturePatternInfoText_->setPlainText(QString::fromStdString(info_ss.str()));
+                    capturePatternInfoText_->setPlainText(QString::fromStdString(info_ss.str()));
                     } catch (const std::exception& e) {
                         qDebug() << "Error setting pattern info text:" << e.what();
                     } catch (...) {
@@ -6171,11 +6708,406 @@ private:
         return filename;
     }
     
-    void saveCameraSettings() {
-        if (!cameraOpen_ || cameraList_.empty() || selectedCameraIndex_ < 0) return;
+    // ========== Camera Settings Profile Functions ==========
+    
+    // Query Arducam settings from v4l2-ctl
+    CameraSettingsProfile queryArducamSettings(int v4l2Index, const string& cameraName) {
+        CameraSettingsProfile profile;
+        profile.camera_name = cameraName;
+        profile.camera_type = "Arducam";
         
+        QString devicePath = QString("/dev/video%1").arg(v4l2Index);
+        QProcess v4l2Process;
+        v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath << "--list-ctrls");
+        v4l2Process.waitForFinished(3000);
+        
+        if (v4l2Process.exitCode() == 0) {
+            QString output = v4l2Process.readAllStandardOutput();
+            QTextStream stream(&output);
+            QString line;
+            
+            while (stream.readLineInto(&line)) {
+                line = line.trimmed();
+                if (line.isEmpty()) continue;
+                
+                // Skip section headers like "User Controls" and "Camera Controls"
+                if (line.contains("Controls") && !line.contains("0x")) {
+                    continue;
+                }
+                
+                // Parse V4L2 control line with improved regex to handle all formats:
+                // "brightness 0x00980900 (int)    : min=-64 max=64 step=1 default=0 value=64"
+                // "auto_exposure 0x009a0901 (menu)   : min=0 max=3 default=0 value=0 (Auto Mode)"
+                // "white_balance_automatic 0x0098090c (bool)   : default=1 value=1"
+                // "exposure_time_absolute 0x009a0902 (int)    : min=5 max=660 step=1 default=5 value=5 flags=inactive"
+                
+                // More flexible regex that handles optional flags and menu text
+                QRegularExpression ctrlRegex(R"((\w+)\s+0x[0-9a-fA-F]+\s+\((int|bool|menu)\)\s*:\s*(?:min=(-?\d+)\s+)?(?:max=(-?\d+)\s+)?(?:step=(\d+)\s+)?(?:default=(-?\d+)\s+)?value=(-?\d+)(?:\s+\([^)]+\))?(?:\s+flags=\w+)?)");
+                QRegularExpressionMatch match = ctrlRegex.match(line);
+                
+                if (match.hasMatch()) {
+                    CameraSetting setting;
+                    setting.name = match.captured(1).toStdString();
+                    
+                    // Create display name (capitalize first letter, replace underscores with spaces)
+                    QString displayName = QString::fromStdString(setting.name);
+                    displayName = displayName.replace("_", " ");
+                    if (!displayName.isEmpty()) {
+                        displayName[0] = displayName[0].toUpper();
+                    }
+                    setting.display_name = displayName.toStdString();
+                    setting.v4l2_id = match.captured(1).toStdString();
+                    
+                    QString typeStr = match.captured(2);
+                    if (typeStr == "int") {
+                        setting.type = SETTING_INT;
+                    } else if (typeStr == "bool") {
+                        setting.type = SETTING_BOOL;
+                    } else if (typeStr == "menu") {
+                        setting.type = SETTING_MENU;
+                    } else {
+                        setting.type = SETTING_INT;
+                    }
+                    
+                    // Parse values (some may be optional)
+                    QString minStr = match.captured(3);
+                    QString maxStr = match.captured(4);
+                    QString defaultStr = match.captured(6);
+                    QString valueStr = match.captured(7);
+                    
+                    setting.min_value = minStr.isEmpty() ? 0 : minStr.toInt();
+                    setting.max_value = maxStr.isEmpty() ? (typeStr == "bool" ? 1 : 100) : maxStr.toInt();
+                    setting.default_value = defaultStr.isEmpty() ? 0 : defaultStr.toInt();
+                    setting.current_value = valueStr.isEmpty() ? setting.default_value : valueStr.toInt();
+                    
+                    // For menu types, extract menu text if present
+                    if (setting.type == SETTING_MENU) {
+                        QRegularExpression menuTextRegex(R"(\(([^)]+)\)\s*$)");
+                        QRegularExpressionMatch menuMatch = menuTextRegex.match(line);
+                        if (menuMatch.hasMatch()) {
+                            QString menuText = menuMatch.captured(1);
+                            // Store menu text in display_name or add to menu_options
+                            setting.display_name = (displayName + " (" + menuText + ")").toStdString();
+                        }
+                    }
+                    
+                    profile.settings.push_back(setting);
+                    } else {
+                    // Try a simpler regex for controls without min/max (like bool with just default and value)
+                    // Also try pattern that matches controls with menu text before value
+                    QRegularExpression simpleRegex(R"((\w+)\s+0x[0-9a-fA-F]+\s+\((int|bool|menu)\)\s*:\s*(?:min=(-?\d+)\s+)?(?:max=(-?\d+)\s+)?(?:default=(-?\d+)\s+)?value=(-?\d+))");
+                    QRegularExpressionMatch simpleMatch = simpleRegex.match(line);
+                    if (simpleMatch.hasMatch()) {
+                        qDebug() << "Matched with simple regex:" << simpleMatch.captured(1);
+                        CameraSetting setting;
+                        setting.name = simpleMatch.captured(1).toStdString();
+                        
+                        QString displayName = QString::fromStdString(setting.name);
+                        displayName = displayName.replace("_", " ");
+                        if (!displayName.isEmpty()) {
+                            displayName[0] = displayName[0].toUpper();
+                        }
+                        setting.display_name = displayName.toStdString();
+                        setting.v4l2_id = simpleMatch.captured(1).toStdString();
+                        
+                        QString typeStr = simpleMatch.captured(2);
+                        if (typeStr == "int") {
+                            setting.type = SETTING_INT;
+                        } else if (typeStr == "bool") {
+                            setting.type = SETTING_BOOL;
+                        } else if (typeStr == "menu") {
+                            setting.type = SETTING_MENU;
+                        } else {
+                            setting.type = SETTING_INT;
+                        }
+                        
+                        QString defaultStr = simpleMatch.captured(3);
+                        QString valueStr = simpleMatch.captured(4);
+                        
+                        setting.min_value = (typeStr == "bool") ? 0 : 0;
+                        setting.max_value = (typeStr == "bool") ? 1 : 100;
+                        setting.default_value = defaultStr.isEmpty() ? 0 : defaultStr.toInt();
+                        setting.current_value = valueStr.isEmpty() ? setting.default_value : valueStr.toInt();
+                        
+                        profile.settings.push_back(setting);
+                    }
+                }
+            }
+        }
+        
+        return profile;
+    }
+    
+    // Define MindVision settings structure from actual camera capabilities
+    CameraSettingsProfile defineMindVisionSettings(const string& cameraName, CameraHandle handle = 0) {
+        CameraSettingsProfile profile;
+        profile.camera_name = cameraName;
+        profile.camera_type = "MindVision";
+        
+        // Query camera capabilities if handle is provided
+        tSdkCameraCapbility cap;
+        bool hasCapability = false;
+        if (handle != 0) {
+            CameraSdkStatus status = CameraGetCapability(handle, &cap);
+            if (status == CAMERA_STATUS_SUCCESS) {
+                hasCapability = true;
+            }
+        }
+        
+        if (hasCapability) {
+            // Exposure - use actual camera range
+            CameraSetting exposure;
+            exposure.name = "exposure";
+            exposure.display_name = "Exposure";
+            exposure.type = SETTING_INT;
+            // Map exposure time (microseconds) to slider (0-100)
+            // Use camera's actual exposure range
+            exposure.min_value = 0;
+            exposure.max_value = 100;
+            exposure.default_value = 50;
+            exposure.current_value = 50;
+            exposure.v4l2_id = "";
+            profile.settings.push_back(exposure);
+            
+            // Analog Gain - use actual camera range
+            CameraSetting analogGain;
+            analogGain.name = "analog_gain";
+            analogGain.display_name = "Analog Gain";
+            analogGain.type = SETTING_INT;
+            analogGain.min_value = cap.sExposeDesc.uiAnalogGainMin;
+            analogGain.max_value = cap.sExposeDesc.uiAnalogGainMax;
+            analogGain.default_value = (analogGain.min_value + analogGain.max_value) / 2;
+            analogGain.current_value = analogGain.default_value;
+            analogGain.v4l2_id = "";
+            profile.settings.push_back(analogGain);
+            
+            // Digital Gain (RGB) - use actual camera range
+            CameraSetting digitalGain;
+            digitalGain.name = "digital_gain";
+            digitalGain.display_name = "Digital Gain (RGB)";
+            digitalGain.type = SETTING_INT;
+            digitalGain.min_value = cap.sRgbGainRange.iRGainMin;
+            digitalGain.max_value = cap.sRgbGainRange.iRGainMax;
+            digitalGain.default_value = (digitalGain.min_value + digitalGain.max_value) / 2;
+            digitalGain.current_value = digitalGain.default_value;
+            digitalGain.v4l2_id = "";
+            profile.settings.push_back(digitalGain);
+            
+            // Gain (legacy, maps to digital gain for compatibility)
+            CameraSetting gain;
+            gain.name = "gain";
+            gain.display_name = "Gain";
+            gain.type = SETTING_INT;
+            gain.min_value = 0;
+            gain.max_value = 100;
+            gain.default_value = 50;
+            gain.current_value = 50;
+            gain.v4l2_id = "";
+            profile.settings.push_back(gain);
+            
+            // Brightness (maps to analog gain for compatibility)
+            CameraSetting brightness;
+            brightness.name = "brightness";
+            brightness.display_name = "Brightness";
+            brightness.type = SETTING_INT;
+            brightness.min_value = 0;
+            brightness.max_value = 255;
+            brightness.default_value = 128;
+            brightness.current_value = 128;
+            brightness.v4l2_id = "";
+            profile.settings.push_back(brightness);
+            
+            // Contrast - use actual camera range
+            CameraSetting contrast;
+            contrast.name = "contrast";
+            contrast.display_name = "Contrast";
+            contrast.type = SETTING_INT;
+            contrast.min_value = cap.sContrastRange.iMin;
+            contrast.max_value = cap.sContrastRange.iMax;
+            contrast.default_value = (contrast.min_value + contrast.max_value) / 2;
+            contrast.current_value = contrast.default_value;
+            contrast.v4l2_id = "";
+            profile.settings.push_back(contrast);
+            
+            // Gamma - use actual camera range
+            CameraSetting gamma;
+            gamma.name = "gamma";
+            gamma.display_name = "Gamma";
+            gamma.type = SETTING_INT;
+            gamma.min_value = cap.sGammaRange.iMin;
+            gamma.max_value = cap.sGammaRange.iMax;
+            gamma.default_value = (gamma.min_value + gamma.max_value) / 2;
+            gamma.current_value = gamma.default_value;
+            gamma.v4l2_id = "";
+            profile.settings.push_back(gamma);
+            
+            // Saturation - use actual camera range (only for color cameras)
+            if (!cap.sIspCapacity.bMonoSensor) {
+                CameraSetting saturation;
+                saturation.name = "saturation";
+                saturation.display_name = "Saturation";
+                saturation.type = SETTING_INT;
+                saturation.min_value = cap.sSaturationRange.iMin;
+                saturation.max_value = cap.sSaturationRange.iMax;
+                saturation.default_value = (saturation.min_value + saturation.max_value) / 2;
+                saturation.current_value = saturation.default_value;
+                saturation.v4l2_id = "";
+                profile.settings.push_back(saturation);
+            }
+            
+            // Sharpness - use actual camera range
+            CameraSetting sharpness;
+            sharpness.name = "sharpness";
+            sharpness.display_name = "Sharpness";
+            sharpness.type = SETTING_INT;
+            sharpness.min_value = cap.sSharpnessRange.iMin;
+            sharpness.max_value = cap.sSharpnessRange.iMax;
+            sharpness.default_value = (sharpness.min_value + sharpness.max_value) / 2;
+            sharpness.current_value = sharpness.default_value;
+            sharpness.v4l2_id = "";
+            profile.settings.push_back(sharpness);
+            
+            // Auto Exposure Target - if supported
+            if (cap.sIspCapacity.bAutoExposure) {
+                CameraSetting aeTarget;
+                aeTarget.name = "ae_target";
+                aeTarget.display_name = "AE Target";
+                aeTarget.type = SETTING_INT;
+                aeTarget.min_value = cap.sExposeDesc.uiTargetMin;
+                aeTarget.max_value = cap.sExposeDesc.uiTargetMax;
+                aeTarget.default_value = (aeTarget.min_value + aeTarget.max_value) / 2;
+                aeTarget.current_value = aeTarget.default_value;
+                aeTarget.v4l2_id = "";
+                profile.settings.push_back(aeTarget);
+            }
+            
+            // Frame Speed - use available frame speeds
+            if (cap.iFrameSpeedDesc > 0) {
+                CameraSetting frameSpeed;
+                frameSpeed.name = "frame_speed";
+                frameSpeed.display_name = "Frame Speed";
+                frameSpeed.type = SETTING_INT;
+                frameSpeed.min_value = 0;
+                frameSpeed.max_value = cap.iFrameSpeedDesc - 1;
+                frameSpeed.default_value = 0;
+                frameSpeed.current_value = 0;
+                frameSpeed.v4l2_id = "";
+                profile.settings.push_back(frameSpeed);
+            }
+            
+            // Mode (resolution/FPS) - stored as index
+            CameraSetting mode;
+            mode.name = "mode_index";
+            mode.display_name = "Mode";
+            mode.type = SETTING_INT;
+            mode.min_value = 0;
+            mode.max_value = (cap.iImageSizeDesc > 0) ? (cap.iImageSizeDesc - 1) : 10;
+            mode.default_value = 0;
+            mode.current_value = 0;
+            mode.v4l2_id = "";
+            profile.settings.push_back(mode);
+        } else {
+            // Fallback to default values if capability query failed
+            // Exposure (0-100 slider, maps to 1000-100000 microseconds)
+            CameraSetting exposure;
+            exposure.name = "exposure";
+            exposure.display_name = "Exposure";
+            exposure.type = SETTING_INT;
+            exposure.min_value = 0;
+            exposure.max_value = 100;
+            exposure.default_value = 50;
+            exposure.current_value = 50;
+            exposure.v4l2_id = "";
+            profile.settings.push_back(exposure);
+            
+            // Gain (0-100)
+            CameraSetting gain;
+            gain.name = "gain";
+            gain.display_name = "Gain";
+            gain.type = SETTING_INT;
+            gain.min_value = 0;
+            gain.max_value = 100;
+            gain.default_value = 50;
+            gain.current_value = 50;
+            gain.v4l2_id = "";
+            profile.settings.push_back(gain);
+            
+            // Brightness (0-255, maps to analog gain 0-100)
+            CameraSetting brightness;
+            brightness.name = "brightness";
+            brightness.display_name = "Brightness";
+            brightness.type = SETTING_INT;
+            brightness.min_value = 0;
+            brightness.max_value = 255;
+            brightness.default_value = 128;
+            brightness.current_value = 128;
+            brightness.v4l2_id = "";
+            profile.settings.push_back(brightness);
+            
+            // Contrast (0-100)
+            CameraSetting contrast;
+            contrast.name = "contrast";
+            contrast.display_name = "Contrast";
+            contrast.type = SETTING_INT;
+            contrast.min_value = 0;
+            contrast.max_value = 100;
+            contrast.default_value = 50;
+            contrast.current_value = 50;
+            contrast.v4l2_id = "";
+            profile.settings.push_back(contrast);
+            
+            // Saturation (0-100)
+            CameraSetting saturation;
+            saturation.name = "saturation";
+            saturation.display_name = "Saturation";
+            saturation.type = SETTING_INT;
+            saturation.min_value = 0;
+            saturation.max_value = 100;
+            saturation.default_value = 50;
+            saturation.current_value = 50;
+            saturation.v4l2_id = "";
+            profile.settings.push_back(saturation);
+            
+            // Sharpness (0-100)
+            CameraSetting sharpness;
+            sharpness.name = "sharpness";
+            sharpness.display_name = "Sharpness";
+            sharpness.type = SETTING_INT;
+            sharpness.min_value = 0;
+            sharpness.max_value = 100;
+            sharpness.default_value = 50;
+            sharpness.current_value = 50;
+            sharpness.v4l2_id = "";
+            profile.settings.push_back(sharpness);
+            
+            // Mode (resolution/FPS) - stored as index
+            CameraSetting mode;
+            mode.name = "mode_index";
+            mode.display_name = "Mode";
+            mode.type = SETTING_INT;
+            mode.min_value = 0;
+            mode.max_value = 10;
+            mode.default_value = 0;
+            mode.current_value = 0;
+            mode.v4l2_id = "";
+            profile.settings.push_back(mode);
+        }
+        
+        return profile;
+    }
+    
+    // Save camera settings profile to config file
+    void saveCameraSettingsProfile(const CameraSettingsProfile& profile) {
         QString configPath = "camera_settings.txt";
         QFile file(configPath);
+        
+        // Read existing file to preserve other cameras
+        map<string, CameraSettingsProfile> profiles = loadAllCameraSettingsProfiles();
+        
+        // Update or add this camera's profile
+        profiles[profile.camera_name] = profile;
+        
+        // Write all profiles back
         if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QMessageBox::warning(this, "Error", "Failed to save camera settings to " + configPath);
             return;
@@ -6183,28 +7115,644 @@ private:
         
         QTextStream out(&file);
         out << "# Camera Settings Configuration\n";
-        out << "# Format: camera_name=setting_name=value\n";
+        out << "# Format: Each camera has its own section with settings structure and values\n";
         out << "\n";
         
-        QString cameraName = QString::fromStdString(cameraList_[selectedCameraIndex_]);
-        out << "[Camera]\n";
-        out << "name=" << cameraName << "\n";
-        out << "type=" << (useMindVision_ ? "MindVision" : "V4L2") << "\n";
+        for (const auto& pair : profiles) {
+            const CameraSettingsProfile& prof = pair.second;
+            out << "[Camera:" << QString::fromStdString(prof.camera_name) << "]\n";
+            out << "type=" << QString::fromStdString(prof.camera_type) << "\n";
         out << "\n";
         
-        out << "[Settings]\n";
-        out << "exposure=" << exposureSlider_->value() << "\n";
-        out << "gain=" << gainSlider_->value() << "\n";
-        out << "brightness=" << brightnessSlider_->value() << "\n";
-        out << "contrast=" << contrastSlider_->value() << "\n";
-        out << "saturation=" << saturationSlider_->value() << "\n";
-        out << "sharpness=" << sharpnessSlider_->value() << "\n";
-        if (modeCombo_->currentIndex() >= 0) {
-            out << "mode_index=" << modeCombo_->currentIndex() << "\n";
+            out << "[Settings:" << QString::fromStdString(prof.camera_name) << "]\n";
+            // Save settings structure
+            out << "settings_count=" << prof.settings.size() << "\n";
+            for (size_t i = 0; i < prof.settings.size(); i++) {
+                const CameraSetting& s = prof.settings[i];
+                out << "setting_" << i << "_name=" << QString::fromStdString(s.name) << "\n";
+                out << "setting_" << i << "_display=" << QString::fromStdString(s.display_name) << "\n";
+                out << "setting_" << i << "_type=" << static_cast<int>(s.type) << "\n";
+                out << "setting_" << i << "_min=" << s.min_value << "\n";
+                out << "setting_" << i << "_max=" << s.max_value << "\n";
+                out << "setting_" << i << "_default=" << s.default_value << "\n";
+                out << "setting_" << i << "_v4l2_id=" << QString::fromStdString(s.v4l2_id) << "\n";
+            }
+            out << "\n";
+            
+            // Save values
+            out << "[Values:" << QString::fromStdString(prof.camera_name) << "]\n";
+            for (const auto& valPair : prof.saved_values) {
+                out << QString::fromStdString(valPair.first) << "=" << valPair.second << "\n";
+            }
+            out << "\n";
+            
+            // Save algorithm settings
+            if (!prof.algorithm_settings.empty()) {
+                out << "[Algorithm:" << QString::fromStdString(prof.camera_name) << "]\n";
+                for (const auto& algoPair : prof.algorithm_settings) {
+                    out << QString::fromStdString(algoPair.first) << "=" << algoPair.second << "\n";
+                }
+                out << "\n";
+            }
         }
         
         file.close();
-        QMessageBox::information(this, "Success", "Camera settings saved to " + configPath);
+    }
+    
+    // Load all camera settings profiles from config file
+    map<string, CameraSettingsProfile> loadAllCameraSettingsProfiles() {
+        map<string, CameraSettingsProfile> profiles;
+        QString configPath = "camera_settings.txt";
+        QFile file(configPath);
+        
+        if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            return profiles;  // Return empty map if file doesn't exist
+        }
+        
+        QTextStream in(&file);
+        QString currentCamera;
+        string currentSection;
+        CameraSettingsProfile currentProfile;
+        int settingsCount = 0;
+        map<int, CameraSetting> tempSettings;
+        
+        while (!in.atEnd()) {
+            QString line = in.readLine().trimmed();
+            
+            if (line.startsWith("#") || line.isEmpty()) continue;
+            
+            // Parse section headers: [Camera:name], [Settings:name], [Values:name], [Algorithm:name]
+            QRegularExpression sectionRegex(R"(\[(\w+):([^\]]+)\])");
+            QRegularExpressionMatch sectionMatch = sectionRegex.match(line);
+            if (sectionMatch.hasMatch()) {
+                string sectionType = sectionMatch.captured(1).toStdString();
+                currentCamera = sectionMatch.captured(2);
+                currentSection = sectionType;
+                
+                if (sectionType == "Camera") {
+                    // Start new camera profile
+                    if (!currentProfile.camera_name.empty()) {
+                        profiles[currentProfile.camera_name] = currentProfile;
+                    }
+                    currentProfile = CameraSettingsProfile();
+                    currentProfile.camera_name = currentCamera.toStdString();
+                    tempSettings.clear();
+                    settingsCount = 0;
+                } else if (sectionType == "Settings") {
+                    // Settings structure section
+                } else if (sectionType == "Values") {
+                    // Values section
+                } else if (sectionType == "Algorithm") {
+                    // Algorithm settings section
+                }
+                continue;
+            }
+            
+            // Parse key=value pairs
+            if (line.contains("=")) {
+                QStringList parts = line.split("=");
+                if (parts.size() == 2) {
+                    QString key = parts[0].trimmed();
+                    QString value = parts[1].trimmed();
+                    
+                    if (currentSection == "Camera") {
+                        if (key == "type") {
+                            currentProfile.camera_type = value.toStdString();
+                        }
+                    } else if (currentSection == "Settings") {
+                        // Parse settings structure
+                        if (key == "settings_count") {
+                            settingsCount = value.toInt();
+                        } else if (key.startsWith("setting_")) {
+                            QStringList keyParts = key.split("_");
+                            if (keyParts.size() >= 3) {
+                                int index = keyParts[1].toInt();
+                                QString field = keyParts[2];
+                                
+                                if (tempSettings.find(index) == tempSettings.end()) {
+                                    tempSettings[index] = CameraSetting();
+                                }
+                                
+                                if (field == "name") {
+                                    tempSettings[index].name = value.toStdString();
+                                } else if (field == "display") {
+                                    tempSettings[index].display_name = value.toStdString();
+                                } else if (field == "type") {
+                                    tempSettings[index].type = static_cast<SettingType>(value.toInt());
+                                } else if (field == "min") {
+                                    tempSettings[index].min_value = value.toInt();
+                                } else if (field == "max") {
+                                    tempSettings[index].max_value = value.toInt();
+                                } else if (field == "default") {
+                                    tempSettings[index].default_value = value.toInt();
+                                } else if (field == "v4l2_id") {
+                                    tempSettings[index].v4l2_id = value.toStdString();
+                                }
+                            }
+                        }
+                    } else if (currentSection == "Values") {
+                        // Parse saved values
+                        bool ok;
+                        int intValue = value.toInt(&ok);
+                        if (ok) {
+                            currentProfile.saved_values[key.toStdString()] = intValue;
+                        }
+                    } else if (currentSection == "Algorithm") {
+                        // Parse algorithm settings (doubles)
+                        bool ok;
+                        double doubleValue = value.toDouble(&ok);
+                        if (ok) {
+                            currentProfile.algorithm_settings[key.toStdString()] = doubleValue;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Add last profile and reconstruct settings vector
+        if (!currentProfile.camera_name.empty()) {
+            // Reconstruct settings vector from tempSettings map
+            for (int i = 0; i < settingsCount; i++) {
+                if (tempSettings.find(i) != tempSettings.end()) {
+                    // Apply saved value if available
+                    if (currentProfile.saved_values.find(tempSettings[i].name) != currentProfile.saved_values.end()) {
+                        tempSettings[i].current_value = currentProfile.saved_values[tempSettings[i].name];
+                    } else {
+                        tempSettings[i].current_value = tempSettings[i].default_value;
+                    }
+                    currentProfile.settings.push_back(tempSettings[i]);
+                }
+            }
+            profiles[currentProfile.camera_name] = currentProfile;
+        }
+        
+        file.close();
+        return profiles;
+    }
+    
+    // Load camera settings profile for a specific camera
+    void loadCameraSettingsProfileForCamera(const string& cameraName, const string& cameraType, int v4l2Index = -1) {
+        // First, try to load from saved profiles
+        map<string, CameraSettingsProfile> allProfiles = loadAllCameraSettingsProfiles();
+        
+        if (allProfiles.find(cameraName) != allProfiles.end()) {
+            // Load from saved profile
+            currentCameraSettings_ = allProfiles[cameraName];
+        } else {
+            // Create new profile based on camera type
+            if (cameraType == "MindVision") {
+                // Try to use camera handle if available
+                CameraHandle handle = 0;
+                if (useMindVision_ && mvHandle_ != 0 && cameraName == cameraList_[selectedCameraIndex_]) {
+                    handle = mvHandle_;
+                }
+                currentCameraSettings_ = defineMindVisionSettings(cameraName, handle);
+            } else if (cameraType == "Arducam" && v4l2Index >= 0) {
+                currentCameraSettings_ = queryArducamSettings(v4l2Index, cameraName);
+            } else {
+                // Default V4L2 camera (not Arducam)
+                currentCameraSettings_ = CameraSettingsProfile();
+                currentCameraSettings_.camera_name = cameraName;
+                currentCameraSettings_.camera_type = "V4L2";
+            }
+        }
+        
+        // Store in profiles map
+        cameraSettingsProfiles_[cameraName] = currentCameraSettings_;
+    }
+    
+    // Apply saved values to camera settings profile
+    void applySavedValuesToProfile() {
+        map<string, CameraSettingsProfile> allProfiles = loadAllCameraSettingsProfiles();
+        if (allProfiles.find(currentCameraSettings_.camera_name) != allProfiles.end()) {
+            const CameraSettingsProfile& savedProfile = allProfiles[currentCameraSettings_.camera_name];
+            // Apply saved values to current profile
+            for (size_t i = 0; i < currentCameraSettings_.settings.size(); i++) {
+                const string& settingName = currentCameraSettings_.settings[i].name;
+                if (savedProfile.saved_values.find(settingName) != savedProfile.saved_values.end()) {
+                    currentCameraSettings_.settings[i].current_value = savedProfile.saved_values.at(settingName);
+                    currentCameraSettings_.saved_values[settingName] = savedProfile.saved_values.at(settingName);
+                }
+            }
+        }
+    }
+    
+    // Clear dynamic camera controls
+    void clearDynamicCameraControls() {
+        // Remove all widgets from layout
+        if (dynamicSettingsLayout_) {
+            QLayoutItem* item;
+            while ((item = dynamicSettingsLayout_->takeAt(0)) != nullptr) {
+                if (item->widget()) {
+                    item->widget()->deleteLater();
+                }
+                delete item;
+            }
+        }
+        
+        // Clear maps
+        dynamicControlWidgets_.clear();
+        dynamicSliders_.clear();
+        dynamicSpinBoxes_.clear();
+        dynamicCheckBoxes_.clear();
+        dynamicComboBoxes_.clear();
+    }
+    
+    // Populate dynamic camera controls based on current camera settings profile
+    void populateDynamicCameraControls() {
+        // Clear existing dynamic controls
+        clearDynamicCameraControls();
+        
+        if (currentCameraSettings_.camera_name.empty() || !dynamicSettingsLayout_) {
+            return;
+        }
+        
+        // For MindVision cameras, show dynamic controls for additional settings
+        // (beyond the standard exposure, gain, brightness, contrast, saturation, sharpness, mode)
+        // Standard settings are handled by fixed controls in the top camera group
+        // Additional settings from SDK (analog_gain, digital_gain, gamma, ae_target, frame_speed) go here
+        
+        // List of standard settings that have fixed controls (don't show in dynamic area)
+        set<string> standardSettings = {"exposure", "gain", "brightness", "contrast", "saturation", "sharpness", "mode_index"};
+        
+        // Check if there are additional settings beyond standard ones
+        bool hasAdditionalSettings = false;
+        for (const auto& setting : currentCameraSettings_.settings) {
+            if (standardSettings.find(setting.name) == standardSettings.end()) {
+                hasAdditionalSettings = true;
+                break;
+            }
+        }
+        
+        // For MindVision: only show dynamic controls if there are additional settings
+        // For V4L2/Arducam: always show dynamic controls
+        if (useMindVision_ && !hasAdditionalSettings) {
+            if (dynamicSettingsScrollArea_) {
+                dynamicSettingsScrollArea_->setVisible(false);
+            }
+            return;
+        }
+        
+        // Show scroll area
+        if (dynamicSettingsScrollArea_) {
+            dynamicSettingsScrollArea_->setVisible(true);
+        }
+        
+        // Create controls for each setting in the profile
+        for (const auto& setting : currentCameraSettings_.settings) {
+            // Skip standard settings that already have fixed controls (for both MindVision and V4L2)
+            if (standardSettings.find(setting.name) != standardSettings.end()) {
+                continue;
+            }
+            
+            int value = setting.current_value;
+            if (currentCameraSettings_.saved_values.find(setting.name) != currentCameraSettings_.saved_values.end()) {
+                value = currentCameraSettings_.saved_values.at(setting.name);
+            }
+            
+            // Create label - parent must be dynamicSettingsWidget_ not this
+            QLabel* label = new QLabel(QString::fromStdString(setting.display_name) + ":", dynamicSettingsWidget_);
+            dynamicSettingsLayout_->addWidget(label);
+            
+            if (setting.type == SETTING_INT) {
+                // Create slider and spin box - parent must be dynamicSettingsWidget_
+                QSlider* slider = new QSlider(Qt::Horizontal, dynamicSettingsWidget_);
+                slider->setRange(setting.min_value, setting.max_value);
+                slider->setValue(value);
+                slider->setMinimumWidth(100);
+                
+                QSpinBox* spinBox = new QSpinBox(dynamicSettingsWidget_);
+                spinBox->setRange(setting.min_value, setting.max_value);
+                spinBox->setValue(value);
+                spinBox->setMinimumWidth(60);
+                
+                // Connect signals
+                connect(slider, &QSlider::valueChanged, spinBox, &QSpinBox::setValue);
+                connect(spinBox, QOverload<int>::of(&QSpinBox::valueChanged), slider, &QSlider::setValue);
+                connect(slider, &QSlider::valueChanged, this, &AprilTagDebugGUI::updateCameraSettings);
+                
+                // Store references
+                dynamicSliders_[setting.name] = slider;
+                dynamicSpinBoxes_[setting.name] = spinBox;
+                dynamicControlWidgets_[setting.name] = slider;
+                
+                // Add to layout
+                dynamicSettingsLayout_->addWidget(slider);
+                dynamicSettingsLayout_->addWidget(spinBox);
+                dynamicSettingsLayout_->addSpacing(15);
+                
+            } else if (setting.type == SETTING_BOOL) {
+                // Create checkbox with text - parent must be dynamicSettingsWidget_
+                QCheckBox* checkBox = new QCheckBox(QString::fromStdString(setting.display_name), dynamicSettingsWidget_);
+                checkBox->setChecked(value != 0);
+                connect(checkBox, &QCheckBox::toggled, this, &AprilTagDebugGUI::updateCameraSettings);
+                
+                // Store reference
+                dynamicCheckBoxes_[setting.name] = checkBox;
+                dynamicControlWidgets_[setting.name] = checkBox;
+                
+                // Add to layout
+                dynamicSettingsLayout_->addWidget(checkBox);
+                dynamicSettingsLayout_->addSpacing(15);
+                
+            } else if (setting.type == SETTING_MENU) {
+                // Create combo box - parent must be dynamicSettingsWidget_
+                QComboBox* comboBox = new QComboBox(dynamicSettingsWidget_);
+                // For menu types, add options from min to max
+                for (int i = setting.min_value; i <= setting.max_value; i++) {
+                    QString optionText = QString("Option %1").arg(i);
+                    // Try to get menu text if available (would need to query v4l2-ctl for menu items)
+                    comboBox->addItem(optionText, i);
+                }
+                comboBox->setCurrentIndex(value - setting.min_value);
+                comboBox->setMinimumWidth(120);
+                connect(comboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+                        this, &AprilTagDebugGUI::updateCameraSettings);
+                
+                // Store reference
+                dynamicComboBoxes_[setting.name] = comboBox;
+                dynamicControlWidgets_[setting.name] = comboBox;
+                
+                // Add to layout
+                dynamicSettingsLayout_->addWidget(comboBox);
+                dynamicSettingsLayout_->addSpacing(15);
+            }
+        }
+        
+        dynamicSettingsLayout_->addStretch();
+        
+        // Update widget size to ensure scroll area shows content
+        if (dynamicSettingsWidget_) {
+            dynamicSettingsWidget_->adjustSize();
+            dynamicSettingsWidget_->updateGeometry();
+            // Force minimum width so content is visible
+            dynamicSettingsWidget_->setMinimumWidth(dynamicSettingsLayout_->sizeHint().width());
+        }
+        
+        // Ensure scroll area is visible and shows content
+        if (dynamicSettingsScrollArea_) {
+            dynamicSettingsScrollArea_->updateGeometry();
+            dynamicSettingsScrollArea_->ensureWidgetVisible(dynamicSettingsWidget_);
+        }
+    }
+    
+    // Apply camera settings from profile to camera and UI
+    void applyCameraSettingsFromProfile() {
+        if (currentCameraSettings_.camera_name.empty()) return;
+        
+        if (useMindVision_ && mvHandle_ != 0) {
+#ifdef HAVE_MINDVISION_SDK
+            // Apply saved settings to MindVision camera
+            for (const auto& setting : currentCameraSettings_.settings) {
+                int value = setting.current_value;
+                if (currentCameraSettings_.saved_values.find(setting.name) != currentCameraSettings_.saved_values.end()) {
+                    value = currentCameraSettings_.saved_values.at(setting.name);
+                }
+                
+                if (setting.name == "exposure") {
+                    double min_exposure = 1000.0;
+                    double max_exposure = 100000.0;
+                    double exposure = max_exposure - (value / 100.0) * (max_exposure - min_exposure);
+                    CameraSetExposureTime(mvHandle_, exposure);
+                    
+                    // Update UI slider
+                    if (exposureSlider_ && exposureSpin_) {
+                        exposureSlider_->blockSignals(true);
+                        exposureSlider_->setValue(value);
+                        exposureSpin_->setValue(value);
+                        exposureSlider_->blockSignals(false);
+                    }
+                } else if (setting.name == "gain") {
+                    CameraSetGain(mvHandle_, value, value, value);
+                    
+                    // Update UI slider
+                    if (gainSlider_ && gainSpin_) {
+                        gainSlider_->blockSignals(true);
+                        gainSlider_->setValue(value);
+                        gainSpin_->setValue(value);
+                        gainSlider_->blockSignals(false);
+                    }
+                } else if (setting.name == "brightness") {
+                    INT analogGain = (value * 100) / 255;
+                    CameraSetAnalogGain(mvHandle_, analogGain);
+                    
+                    // Update UI slider
+                    if (brightnessSlider_ && brightnessSpin_) {
+                        brightnessSlider_->blockSignals(true);
+                        brightnessSlider_->setValue(value);
+                        brightnessSpin_->setValue(value);
+                        brightnessSlider_->blockSignals(false);
+                    }
+                } else if (setting.name == "contrast") {
+                    CameraSetContrast(mvHandle_, value);
+                    
+                    // Update UI slider
+                    if (contrastSlider_ && contrastSpin_) {
+                        contrastSlider_->blockSignals(true);
+                        contrastSlider_->setValue(value);
+                        contrastSpin_->setValue(value);
+                        contrastSlider_->blockSignals(false);
+                    }
+                } else if (setting.name == "saturation") {
+                    CameraSetSaturation(mvHandle_, value);
+                    
+                    // Update UI slider
+                    if (saturationSlider_ && saturationSpin_) {
+                        saturationSlider_->blockSignals(true);
+                        saturationSlider_->setValue(value);
+                        saturationSpin_->setValue(value);
+                        saturationSlider_->blockSignals(false);
+                    }
+                } else if (setting.name == "sharpness") {
+                    CameraSetSharpness(mvHandle_, value);
+                    
+                    // Update UI slider
+                    if (sharpnessSlider_ && sharpnessSpin_) {
+                        sharpnessSlider_->blockSignals(true);
+                        sharpnessSlider_->setValue(value);
+                        sharpnessSpin_->setValue(value);
+                        sharpnessSlider_->blockSignals(false);
+                    }
+                }
+            }
+#endif
+        } else if (cameraCap_.isOpened()) {
+            // Apply saved settings to V4L2/Arducam camera using v4l2-ctl
+            QString devicePath;
+            int v4l2Index = -1;
+            
+            // Find V4L2 index
+            for (int i = 0; i < selectedCameraIndex_; i++) {
+                if (!isMindVision_[i]) v4l2Index++;
+            }
+            
+            if (v4l2Index >= 0) {
+                devicePath = QString("/dev/video%1").arg(v4l2Index);
+                
+                // Apply each setting using v4l2-ctl
+                for (const auto& setting : currentCameraSettings_.settings) {
+                    int value = setting.current_value;
+                    if (currentCameraSettings_.saved_values.find(setting.name) != currentCameraSettings_.saved_values.end()) {
+                        value = currentCameraSettings_.saved_values.at(setting.name);
+                    }
+                    
+                    // Skip mode_index (handled separately)
+                    if (setting.name == "mode_index") continue;
+                    
+                    // Apply using v4l2-ctl
+                    if (!setting.v4l2_id.empty()) {
+                        QProcess v4l2Process;
+                        v4l2Process.start("v4l2-ctl", QStringList() << "--device" << devicePath 
+                                         << "--set-ctrl" << QString("%1=%2").arg(QString::fromStdString(setting.v4l2_id)).arg(value));
+                        v4l2Process.waitForFinished(1000);
+                    }
+                    
+                    // Update UI sliders for standard settings
+                    if (setting.name == "exposure" && exposureSlider_ && exposureSpin_) {
+                        exposureSlider_->blockSignals(true);
+                        exposureSlider_->setValue(value);
+                        exposureSpin_->setValue(value);
+                        exposureSlider_->blockSignals(false);
+                    } else if (setting.name == "gain" && gainSlider_ && gainSpin_) {
+                        gainSlider_->blockSignals(true);
+                        gainSlider_->setValue(value);
+                        gainSpin_->setValue(value);
+                        gainSlider_->blockSignals(false);
+                    } else if (setting.name == "brightness" && brightnessSlider_ && brightnessSpin_) {
+                        brightnessSlider_->blockSignals(true);
+                        brightnessSlider_->setValue(value);
+                        brightnessSpin_->setValue(value);
+                        brightnessSlider_->blockSignals(false);
+                    } else if (setting.name == "contrast" && contrastSlider_ && contrastSpin_) {
+                        contrastSlider_->blockSignals(true);
+                        contrastSlider_->setValue(value);
+                        contrastSpin_->setValue(value);
+                        contrastSlider_->blockSignals(false);
+                    } else if (setting.name == "saturation" && saturationSlider_ && saturationSpin_) {
+                        saturationSlider_->blockSignals(true);
+                        saturationSlider_->setValue(value);
+                        saturationSpin_->setValue(value);
+                        saturationSlider_->blockSignals(false);
+                    } else if (setting.name == "sharpness" && sharpnessSlider_ && sharpnessSpin_) {
+                        sharpnessSlider_->blockSignals(true);
+                        sharpnessSlider_->setValue(value);
+                        sharpnessSpin_->setValue(value);
+                        sharpnessSlider_->blockSignals(false);
+                    } else {
+                        // Handle dynamic controls
+                        if (dynamicSliders_.find(setting.name) != dynamicSliders_.end()) {
+                            QSlider* slider = dynamicSliders_[setting.name];
+                            QSpinBox* spinBox = dynamicSpinBoxes_[setting.name];
+                            if (slider && spinBox) {
+                                slider->blockSignals(true);
+                                slider->setRange(setting.min_value, setting.max_value);
+                                slider->setValue(value);
+                                spinBox->setRange(setting.min_value, setting.max_value);
+                                spinBox->setValue(value);
+                                slider->blockSignals(false);
+                            }
+                        } else if (dynamicCheckBoxes_.find(setting.name) != dynamicCheckBoxes_.end()) {
+                            QCheckBox* checkBox = dynamicCheckBoxes_[setting.name];
+                            if (checkBox) {
+                                checkBox->blockSignals(true);
+                                checkBox->setChecked(value != 0);
+                                checkBox->blockSignals(false);
+                            }
+                        } else if (dynamicComboBoxes_.find(setting.name) != dynamicComboBoxes_.end()) {
+                            QComboBox* comboBox = dynamicComboBoxes_[setting.name];
+                            if (comboBox) {
+                                comboBox->blockSignals(true);
+                                int index = value - setting.min_value;
+                                if (index >= 0 && index < comboBox->count()) {
+                                    comboBox->setCurrentIndex(index);
+                                }
+                                comboBox->blockSignals(false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    void saveCameraSettings() {
+        if (!cameraOpen_ || cameraList_.empty() || selectedCameraIndex_ < 0) return;
+        
+        string cameraName = cameraList_[selectedCameraIndex_];
+        bool isMindVision = useMindVision_;
+        
+        // Get or create camera settings profile
+        CameraSettingsProfile profile;
+        if (!currentCameraSettings_.camera_name.empty() && currentCameraSettings_.camera_name == cameraName) {
+            // Use current profile
+            profile = currentCameraSettings_;
+        } else {
+            // Load from config file first
+            map<string, CameraSettingsProfile> allProfiles = loadAllCameraSettingsProfiles();
+            if (allProfiles.find(cameraName) != allProfiles.end()) {
+                profile = allProfiles[cameraName];
+            } else {
+                // Create new profile based on camera type
+                if (isMindVision) {
+                    // Try to use camera handle if available
+                    CameraHandle handle = 0;
+                    if (useMindVision_ && mvHandle_ != 0 && cameraName == cameraList_[selectedCameraIndex_]) {
+                        handle = mvHandle_;
+                    }
+                    profile = defineMindVisionSettings(cameraName, handle);
+                } else {
+                    profile.camera_name = cameraName;
+                    profile.camera_type = "V4L2";
+                }
+            }
+        }
+        
+        // Update saved values from UI controls
+        if (exposureSlider_) profile.saved_values["exposure"] = exposureSlider_->value();
+        if (gainSlider_) profile.saved_values["gain"] = gainSlider_->value();
+        if (brightnessSlider_) profile.saved_values["brightness"] = brightnessSlider_->value();
+        if (contrastSlider_) profile.saved_values["contrast"] = contrastSlider_->value();
+        if (saturationSlider_) profile.saved_values["saturation"] = saturationSlider_->value();
+        if (sharpnessSlider_) profile.saved_values["sharpness"] = sharpnessSlider_->value();
+        if (modeCombo_ && modeCombo_->currentIndex() >= 0) {
+            profile.saved_values["mode_index"] = modeCombo_->currentIndex();
+        }
+        
+        // Update dynamic settings from currentCameraSettings_ if available
+        if (!currentCameraSettings_.camera_name.empty() && currentCameraSettings_.camera_name == cameraName) {
+            for (const auto& pair : currentCameraSettings_.saved_values) {
+                // Only add if not already updated from UI
+                if (profile.saved_values.find(pair.first) == profile.saved_values.end()) {
+                    profile.saved_values[pair.first] = pair.second;
+                }
+            }
+            // Preserve settings structure
+            if (profile.settings.empty() && !currentCameraSettings_.settings.empty()) {
+                profile.settings = currentCameraSettings_.settings;
+            }
+        }
+        
+        // Update current values in settings structure
+        for (size_t i = 0; i < profile.settings.size(); i++) {
+            const string& settingName = profile.settings[i].name;
+            if (profile.saved_values.find(settingName) != profile.saved_values.end()) {
+                profile.settings[i].current_value = profile.saved_values[settingName];
+            }
+        }
+        
+        // Ensure camera name and type are set correctly
+        profile.camera_name = cameraName;
+        profile.camera_type = isMindVision ? "MindVision" : "V4L2";
+        
+        // Save the profile (saves both structure and values per camera)
+        saveCameraSettingsProfile(profile);
+        
+        // Update currentCameraSettings_
+        currentCameraSettings_ = profile;
+        cameraSettingsProfiles_[cameraName] = profile;
+        
+        QMessageBox::information(this, "Camera Settings", 
+            QString("Camera settings saved for:\n%1\n\nSaved to: camera_settings.txt").arg(QString::fromStdString(cameraName)));
     }
     
     void loadCameraSettings() {
@@ -6302,7 +7850,12 @@ private:
                                 modeCombo_->blockSignals(true);
                                 modeCombo_->setCurrentIndex(intValue);
                                 modeCombo_->blockSignals(false);
-                                onModeChanged(intValue);
+                                // Apply the mode based on camera type
+                                if (useMindVision_) {
+                                    applyMVMode(intValue);
+                                } else {
+                                    applyMode(intValue);
+                                }
                             }
                         }
                     }
@@ -6327,116 +7880,227 @@ private:
             return;
         }
         
-        // Load camera settings from config file
+        // Always load from config file first (per camera settings)
+        // This ensures we get the saved values for this specific camera
         loadCameraSettingsForSettingsTab(actualCameraIndex);
     }
     
     void loadCameraSettingsForSettingsTab(int cameraIndex) {
         if (cameraIndex < 0 || cameraIndex >= (int)cameraList_.size()) return;
         
-        QString configPath = "camera_settings.txt";
-        QFile file(configPath);
-        if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            // Config file doesn't exist, use default values
-            return;
-        }
-        
-        QTextStream in(&file);
-        QString cameraName = QString::fromStdString(cameraList_[cameraIndex]);
+        string cameraName = cameraList_[cameraIndex];
         bool isMindVision = isMindVision_[cameraIndex];
-        QString currentType = isMindVision ? "MindVision" : "V4L2";
         
-        QString section;
-        bool settingsSection = false;
-        bool cameraMatches = false;
+        // Load camera settings profile from config file (per camera)
+        // This loads both the settings structure AND the saved values
+        map<string, CameraSettingsProfile> allProfiles = loadAllCameraSettingsProfiles();
         
-        while (!in.atEnd()) {
-            QString line = in.readLine().trimmed();
-            
-            // Skip comments and empty lines
-            if (line.startsWith("#") || line.isEmpty()) continue;
-            
-            // Check for section headers
-            if (line.startsWith("[") && line.endsWith("]")) {
-                section = line.mid(1, line.length() - 2);
-                settingsSection = (section == "Settings");
-                if (section == "Camera") {
-                    cameraMatches = false;
+        CameraSettingsProfile profile;
+        if (allProfiles.find(cameraName) != allProfiles.end()) {
+            // Load existing profile from config file (includes both structure and values)
+            profile = allProfiles[cameraName];
+            qDebug() << "Loaded profile for camera:" << QString::fromStdString(cameraName) 
+                     << "with" << profile.settings.size() << "settings and" 
+                     << profile.saved_values.size() << "saved values";
+        } else {
+            // Create new profile based on camera type
+            if (isMindVision) {
+                // Try to use camera handle if available
+                CameraHandle handle = 0;
+                if (useMindVision_ && mvHandle_ != 0 && cameraName == cameraList_[selectedCameraIndex_]) {
+                    handle = mvHandle_;
                 }
-                continue;
-            }
-            
-            // Parse Camera section
-            if (section == "Camera") {
-                if (line.startsWith("name=")) {
-                    QString savedName = line.mid(5).trimmed();
-                    if (savedName == cameraName) {
-                        cameraMatches = true;
-                    }
-                } else if (line.startsWith("type=")) {
-                    QString savedType = line.mid(5).trimmed();
-                    if (savedType != currentType) {
-                        cameraMatches = false;  // Type mismatch
-                    }
-                }
-            }
-            
-            // Parse Settings section (only if camera matches)
-            if (settingsSection && cameraMatches) {
-                if (line.contains("=")) {
-                    QStringList parts = line.split("=");
-                    if (parts.size() == 2) {
-                        QString key = parts[0].trimmed();
-                        QString value = parts[1].trimmed();
-                        bool ok;
-                        int intValue = value.toInt(&ok);
-                        
-                        if (!ok) continue;
-                        
-                        // Block signals while setting values
-                        if (key == "exposure" && settingsExposureSlider_ && settingsExposureSpin_) {
-                            settingsExposureSlider_->blockSignals(true);
-                            settingsExposureSlider_->setValue(intValue);
-                            settingsExposureSpin_->setValue(intValue);
-                            settingsExposureSlider_->blockSignals(false);
-                        } else if (key == "gain" && settingsGainSlider_ && settingsGainSpin_) {
-                            settingsGainSlider_->blockSignals(true);
-                            settingsGainSlider_->setValue(intValue);
-                            settingsGainSpin_->setValue(intValue);
-                            settingsGainSlider_->blockSignals(false);
-                        } else if (key == "brightness" && settingsBrightnessSlider_ && settingsBrightnessSpin_) {
-                            settingsBrightnessSlider_->blockSignals(true);
-                            settingsBrightnessSlider_->setValue(intValue);
-                            settingsBrightnessSpin_->setValue(intValue);
-                            settingsBrightnessSlider_->blockSignals(false);
-                        } else if (key == "contrast" && settingsContrastSlider_ && settingsContrastSpin_) {
-                            settingsContrastSlider_->blockSignals(true);
-                            settingsContrastSlider_->setValue(intValue);
-                            settingsContrastSpin_->setValue(intValue);
-                            settingsContrastSlider_->blockSignals(false);
-                        } else if (key == "saturation" && settingsSaturationSlider_ && settingsSaturationSpin_) {
-                            settingsSaturationSlider_->blockSignals(true);
-                            settingsSaturationSlider_->setValue(intValue);
-                            settingsSaturationSpin_->setValue(intValue);
-                            settingsSaturationSlider_->blockSignals(false);
-                        } else if (key == "sharpness" && settingsSharpnessSlider_ && settingsSharpnessSpin_) {
-                            settingsSharpnessSlider_->blockSignals(true);
-                            settingsSharpnessSlider_->setValue(intValue);
-                            settingsSharpnessSpin_->setValue(intValue);
-                            settingsSharpnessSlider_->blockSignals(false);
-                        } else if (key == "mode_index" && settingsModeCombo_) {
-                            if (intValue >= 0 && intValue < settingsModeCombo_->count()) {
-                                settingsModeCombo_->blockSignals(true);
-                                settingsModeCombo_->setCurrentIndex(intValue);
-                                settingsModeCombo_->blockSignals(false);
-                            }
-                        }
-                    }
+                profile = defineMindVisionSettings(cameraName, handle);
+            } else {
+                profile.camera_name = cameraName;
+                profile.camera_type = "V4L2";
+                // For Arducam, try to use currentCameraSettings_ if available
+                if (!currentCameraSettings_.camera_name.empty() && currentCameraSettings_.camera_name == cameraName) {
+                    profile = currentCameraSettings_;
                 }
             }
         }
         
-        file.close();
+        // Store in profiles map
+        cameraSettingsProfiles_[cameraName] = profile;
+        currentCameraSettings_ = profile;  // Update current settings
+        
+        // Populate UI with settings values from saved_values
+        // First, apply saved values directly (these come from config file)
+        // For standard settings, always try to load from saved_values
+        if (profile.saved_values.find("exposure") != profile.saved_values.end() && settingsExposureSlider_ && settingsExposureSpin_) {
+            int value = profile.saved_values.at("exposure");
+            settingsExposureSlider_->blockSignals(true);
+            settingsExposureSlider_->setValue(value);
+            settingsExposureSpin_->setValue(value);
+            settingsExposureSlider_->blockSignals(false);
+        }
+        if (profile.saved_values.find("gain") != profile.saved_values.end() && settingsGainSlider_ && settingsGainSpin_) {
+            int value = profile.saved_values.at("gain");
+            settingsGainSlider_->blockSignals(true);
+            settingsGainSlider_->setValue(value);
+            settingsGainSpin_->setValue(value);
+            settingsGainSlider_->blockSignals(false);
+        }
+        if (profile.saved_values.find("brightness") != profile.saved_values.end() && settingsBrightnessSlider_ && settingsBrightnessSpin_) {
+            int value = profile.saved_values.at("brightness");
+            settingsBrightnessSlider_->blockSignals(true);
+            settingsBrightnessSlider_->setValue(value);
+            settingsBrightnessSpin_->setValue(value);
+            settingsBrightnessSlider_->blockSignals(false);
+        }
+        if (profile.saved_values.find("contrast") != profile.saved_values.end() && settingsContrastSlider_ && settingsContrastSpin_) {
+            int value = profile.saved_values.at("contrast");
+            settingsContrastSlider_->blockSignals(true);
+            settingsContrastSlider_->setValue(value);
+            settingsContrastSpin_->setValue(value);
+            settingsContrastSlider_->blockSignals(false);
+        }
+        if (profile.saved_values.find("saturation") != profile.saved_values.end() && settingsSaturationSlider_ && settingsSaturationSpin_) {
+            int value = profile.saved_values.at("saturation");
+            settingsSaturationSlider_->blockSignals(true);
+            settingsSaturationSlider_->setValue(value);
+            settingsSaturationSpin_->setValue(value);
+            settingsSaturationSlider_->blockSignals(false);
+        }
+        if (profile.saved_values.find("sharpness") != profile.saved_values.end() && settingsSharpnessSlider_ && settingsSharpnessSpin_) {
+            int value = profile.saved_values.at("sharpness");
+            settingsSharpnessSlider_->blockSignals(true);
+            settingsSharpnessSlider_->setValue(value);
+            settingsSharpnessSpin_->setValue(value);
+            settingsSharpnessSlider_->blockSignals(false);
+        }
+        if (profile.saved_values.find("mode_index") != profile.saved_values.end() && settingsModeCombo_) {
+            int value = profile.saved_values.at("mode_index");
+            if (value >= 0 && value < settingsModeCombo_->count()) {
+                settingsModeCombo_->blockSignals(true);
+                settingsModeCombo_->setCurrentIndex(value);
+                settingsModeCombo_->blockSignals(false);
+            }
+        }
+        
+        // Also update ranges from settings structure if available
+        // For MindVision, use standard UI elements with ranges from structure
+        if (isMindVision) {
+            for (const auto& setting : profile.settings) {
+                int value = setting.current_value;
+                if (profile.saved_values.find(setting.name) != profile.saved_values.end()) {
+                    value = profile.saved_values.at(setting.name);
+                }
+                
+                if (setting.name == "exposure" && settingsExposureSlider_ && settingsExposureSpin_) {
+                    settingsExposureSlider_->blockSignals(true);
+                    settingsExposureSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsExposureSlider_->setValue(value);
+                    settingsExposureSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsExposureSpin_->setValue(value);
+                    settingsExposureSlider_->blockSignals(false);
+                } else if (setting.name == "gain" && settingsGainSlider_ && settingsGainSpin_) {
+                    settingsGainSlider_->blockSignals(true);
+                    settingsGainSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsGainSlider_->setValue(value);
+                    settingsGainSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsGainSpin_->setValue(value);
+                    settingsGainSlider_->blockSignals(false);
+                } else if (setting.name == "brightness" && settingsBrightnessSlider_ && settingsBrightnessSpin_) {
+                    settingsBrightnessSlider_->blockSignals(true);
+                    settingsBrightnessSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsBrightnessSlider_->setValue(value);
+                    settingsBrightnessSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsBrightnessSpin_->setValue(value);
+                    settingsBrightnessSlider_->blockSignals(false);
+                } else if (setting.name == "contrast" && settingsContrastSlider_ && settingsContrastSpin_) {
+                    settingsContrastSlider_->blockSignals(true);
+                    settingsContrastSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsContrastSlider_->setValue(value);
+                    settingsContrastSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsContrastSpin_->setValue(value);
+                    settingsContrastSlider_->blockSignals(false);
+                } else if (setting.name == "saturation" && settingsSaturationSlider_ && settingsSaturationSpin_) {
+                    settingsSaturationSlider_->blockSignals(true);
+                    settingsSaturationSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsSaturationSlider_->setValue(value);
+                    settingsSaturationSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsSaturationSpin_->setValue(value);
+                    settingsSaturationSlider_->blockSignals(false);
+                } else if (setting.name == "sharpness" && settingsSharpnessSlider_ && settingsSharpnessSpin_) {
+                    settingsSharpnessSlider_->blockSignals(true);
+                    settingsSharpnessSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsSharpnessSlider_->setValue(value);
+                    settingsSharpnessSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsSharpnessSpin_->setValue(value);
+                    settingsSharpnessSlider_->blockSignals(false);
+                } else if (setting.name == "mode_index" && settingsModeCombo_) {
+                    if (value >= 0 && value < settingsModeCombo_->count()) {
+                        settingsModeCombo_->blockSignals(true);
+                        settingsModeCombo_->setCurrentIndex(value);
+                        settingsModeCombo_->blockSignals(false);
+                    }
+                }
+            }
+        } else {
+            // For Arducam/V4L2, load settings from profile
+            // Load standard settings that have UI controls
+            for (const auto& setting : profile.settings) {
+                int value = setting.current_value;
+                if (profile.saved_values.find(setting.name) != profile.saved_values.end()) {
+                    value = profile.saved_values.at(setting.name);
+                }
+                
+                if (setting.name == "exposure" && settingsExposureSlider_ && settingsExposureSpin_) {
+                    settingsExposureSlider_->blockSignals(true);
+                    settingsExposureSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsExposureSlider_->setValue(value);
+                    settingsExposureSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsExposureSpin_->setValue(value);
+                    settingsExposureSlider_->blockSignals(false);
+                } else if (setting.name == "gain" && settingsGainSlider_ && settingsGainSpin_) {
+                    settingsGainSlider_->blockSignals(true);
+                    settingsGainSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsGainSlider_->setValue(value);
+                    settingsGainSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsGainSpin_->setValue(value);
+                    settingsGainSlider_->blockSignals(false);
+                } else if (setting.name == "brightness" && settingsBrightnessSlider_ && settingsBrightnessSpin_) {
+                    settingsBrightnessSlider_->blockSignals(true);
+                    settingsBrightnessSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsBrightnessSlider_->setValue(value);
+                    settingsBrightnessSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsBrightnessSpin_->setValue(value);
+                    settingsBrightnessSlider_->blockSignals(false);
+                } else if (setting.name == "contrast" && settingsContrastSlider_ && settingsContrastSpin_) {
+                    settingsContrastSlider_->blockSignals(true);
+                    settingsContrastSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsContrastSlider_->setValue(value);
+                    settingsContrastSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsContrastSpin_->setValue(value);
+                    settingsContrastSlider_->blockSignals(false);
+                } else if (setting.name == "saturation" && settingsSaturationSlider_ && settingsSaturationSpin_) {
+                    settingsSaturationSlider_->blockSignals(true);
+                    settingsSaturationSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsSaturationSlider_->setValue(value);
+                    settingsSaturationSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsSaturationSpin_->setValue(value);
+                    settingsSaturationSlider_->blockSignals(false);
+                } else if (setting.name == "sharpness" && settingsSharpnessSlider_ && settingsSharpnessSpin_) {
+                    settingsSharpnessSlider_->blockSignals(true);
+                    settingsSharpnessSlider_->setRange(setting.min_value, setting.max_value);
+                    settingsSharpnessSlider_->setValue(value);
+                    settingsSharpnessSpin_->setRange(setting.min_value, setting.max_value);
+                    settingsSharpnessSpin_->setValue(value);
+                    settingsSharpnessSlider_->blockSignals(false);
+                } else if (setting.name == "mode_index" && settingsModeCombo_) {
+                    if (value >= 0 && value < settingsModeCombo_->count()) {
+                        settingsModeCombo_->blockSignals(true);
+                        settingsModeCombo_->setCurrentIndex(value);
+                        settingsModeCombo_->blockSignals(false);
+                    }
+                }
+            }
+            
+            // Store the full profile for saving (includes all dynamic settings)
+            currentCameraSettings_ = profile;
+        }
     }
     
     void saveCameraSettingsFromSettingsTab() {
@@ -6448,99 +8112,466 @@ private:
             return;
         }
         
-        QString configPath = "camera_settings.txt";
-        QFile file(configPath);
-        
-        // Read existing settings to preserve other cameras
-        QMap<QString, QStringList> cameraSections;
-        QString currentCamera;
-        QStringList currentSection;
-        bool inCameraSection = false;
-        bool inSettingsSection = false;
-        
-        if (file.exists() && file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&file);
-            while (!in.atEnd()) {
-                QString line = in.readLine();
-                
-                QString trimmed = line.trimmed();
-                if (trimmed.startsWith("[Camera]")) {
-                    if (!currentCamera.isEmpty() && !currentSection.isEmpty()) {
-                        cameraSections[currentCamera] = currentSection;
-                    }
-                    currentCamera = "";
-                    currentSection.clear();
-                    inCameraSection = true;
-                    inSettingsSection = false;
-                } else if (trimmed.startsWith("[Settings]")) {
-                    inSettingsSection = true;
-                } else if (trimmed.startsWith("name=") && inCameraSection) {
-                    currentCamera = trimmed.mid(5).trimmed();
-                } else if (inSettingsSection && !currentCamera.isEmpty()) {
-                    currentSection.append(line);
-                }
-            }
-            file.close();
-            
-            // Save current camera section
-            if (!currentCamera.isEmpty() && !currentSection.isEmpty()) {
-                cameraSections[currentCamera] = currentSection;
-            }
-        }
-        
-        // Update settings for selected camera
-        QString cameraName = QString::fromStdString(cameraList_[actualCameraIndex]);
+        string cameraName = cameraList_[actualCameraIndex];
         bool isMindVision = isMindVision_[actualCameraIndex];
         
-        QStringList newSettings;
-        newSettings.append("exposure=" + QString::number(settingsExposureSlider_ ? settingsExposureSlider_->value() : 50));
-        newSettings.append("gain=" + QString::number(settingsGainSlider_ ? settingsGainSlider_->value() : 50));
-        newSettings.append("brightness=" + QString::number(settingsBrightnessSlider_ ? settingsBrightnessSlider_->value() : 50));
-        newSettings.append("contrast=" + QString::number(settingsContrastSlider_ ? settingsContrastSlider_->value() : 50));
-        newSettings.append("saturation=" + QString::number(settingsSaturationSlider_ ? settingsSaturationSlider_->value() : 50));
-        newSettings.append("sharpness=" + QString::number(settingsSharpnessSlider_ ? settingsSharpnessSlider_->value() : 50));
-        if (settingsModeCombo_ && settingsModeCombo_->currentIndex() >= 0) {
-            newSettings.append("mode_index=" + QString::number(settingsModeCombo_->currentIndex()));
-        }
-        cameraSections[cameraName] = newSettings;
+        // Always load from config file first to get per-camera settings
+        map<string, CameraSettingsProfile> allProfiles = loadAllCameraSettingsProfiles();
         
-        // Write all settings back to file
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QMessageBox::warning(this, "Error", "Failed to save camera settings to " + configPath);
+        // Get or create camera settings profile
+        CameraSettingsProfile profile;
+        if (allProfiles.find(cameraName) != allProfiles.end()) {
+            // Load existing profile from config file (per camera)
+            profile = allProfiles[cameraName];
+        } else if (cameraSettingsProfiles_.find(cameraName) != cameraSettingsProfiles_.end()) {
+            // Use cached profile if available
+            profile = cameraSettingsProfiles_[cameraName];
+        } else {
+            // Create new profile based on camera type
+            if (isMindVision) {
+                // Try to use camera handle if available
+                CameraHandle handle = 0;
+                if (useMindVision_ && mvHandle_ != 0 && cameraName == cameraList_[selectedCameraIndex_]) {
+                    handle = mvHandle_;
+                }
+                profile = defineMindVisionSettings(cameraName, handle);
+            } else {
+                profile.camera_name = cameraName;
+                profile.camera_type = "V4L2";
+                // For Arducam, try to use currentCameraSettings_ if available
+                if (!currentCameraSettings_.camera_name.empty() && currentCameraSettings_.camera_name == cameraName) {
+                    profile = currentCameraSettings_;
+                }
+            }
+        }
+        
+        // Update saved values from UI
+        if (isMindVision) {
+            // MindVision settings
+            if (settingsExposureSlider_) profile.saved_values["exposure"] = settingsExposureSlider_->value();
+            if (settingsGainSlider_) profile.saved_values["gain"] = settingsGainSlider_->value();
+            if (settingsBrightnessSlider_) profile.saved_values["brightness"] = settingsBrightnessSlider_->value();
+            if (settingsContrastSlider_) profile.saved_values["contrast"] = settingsContrastSlider_->value();
+            if (settingsSaturationSlider_) profile.saved_values["saturation"] = settingsSaturationSlider_->value();
+            if (settingsSharpnessSlider_) profile.saved_values["sharpness"] = settingsSharpnessSlider_->value();
+            if (settingsModeCombo_ && settingsModeCombo_->currentIndex() >= 0) {
+                profile.saved_values["mode_index"] = settingsModeCombo_->currentIndex();
+            }
+        } else {
+            // For Arducam/V4L2, update values from UI and currentCameraSettings_
+            if (!currentCameraSettings_.camera_name.empty() && currentCameraSettings_.camera_name == cameraName) {
+                profile = currentCameraSettings_;
+            }
+            
+            // Update standard settings from UI
+            if (settingsExposureSlider_) profile.saved_values["exposure"] = settingsExposureSlider_->value();
+            if (settingsGainSlider_) profile.saved_values["gain"] = settingsGainSlider_->value();
+            if (settingsBrightnessSlider_) profile.saved_values["brightness"] = settingsBrightnessSlider_->value();
+            if (settingsContrastSlider_) profile.saved_values["contrast"] = settingsContrastSlider_->value();
+            if (settingsSaturationSlider_) profile.saved_values["saturation"] = settingsSaturationSlider_->value();
+            if (settingsSharpnessSlider_) profile.saved_values["sharpness"] = settingsSharpnessSlider_->value();
+            if (settingsModeCombo_ && settingsModeCombo_->currentIndex() >= 0) {
+                profile.saved_values["mode_index"] = settingsModeCombo_->currentIndex();
+            }
+            
+            // Update all other settings from currentCameraSettings_ saved_values (preserves dynamic settings)
+            for (const auto& pair : currentCameraSettings_.saved_values) {
+                // Only add if not already updated from UI
+                if (profile.saved_values.find(pair.first) == profile.saved_values.end()) {
+                    profile.saved_values[pair.first] = pair.second;
+                }
+            }
+        }
+        
+        // Update current values in settings structure
+        for (size_t i = 0; i < profile.settings.size(); i++) {
+            const string& settingName = profile.settings[i].name;
+            if (profile.saved_values.find(settingName) != profile.saved_values.end()) {
+                profile.settings[i].current_value = profile.saved_values[settingName];
+            }
+        }
+        
+        // Ensure camera name is set correctly (per camera)
+        profile.camera_name = cameraName;
+        profile.camera_type = isMindVision ? "MindVision" : "V4L2";
+        
+        // Save the profile (saves both structure and values per camera)
+        // This function saves all cameras, preserving other cameras' settings
+        saveCameraSettingsProfile(profile);
+        
+        // Update the profiles map
+        cameraSettingsProfiles_[cameraName] = profile;
+        
+        // Update currentCameraSettings_ if this is the currently selected camera
+        if (currentCameraSettings_.camera_name == cameraName) {
+            currentCameraSettings_ = profile;
+        }
+        
+        QMessageBox::information(this, "Camera Settings", 
+            QString("Camera settings saved for:\n%1\n\nSaved to: camera_settings.txt").arg(QString::fromStdString(cameraName)));
+    }
+    
+    // Get current algorithm parameter values from UI (shared by all algorithms)
+    void getCurrentAlgorithmParameters(double& quad_decimate, double& quad_sigma, bool& refine_edges,
+                                       double& decode_sharpening, int& nthreads,
+                                       int& min_cluster_pixels, double& max_line_fit_mse,
+                                       double& critical_angle_degrees, int& min_white_black_diff) {
+        quad_decimate = quadDecimateSpin_ ? quadDecimateSpin_->value() : 2.0;
+        quad_sigma = quadSigmaSpin_ ? quadSigmaSpin_->value() : 0.0;
+        refine_edges = refineEdgesCheck_ ? refineEdgesCheck_->isChecked() : true;
+        decode_sharpening = decodeSharpeningSpin_ ? decodeSharpeningSpin_->value() : 0.5;
+        nthreads = nthreadsSpin_ ? nthreadsSpin_->value() : 4;
+        min_cluster_pixels = minClusterPixelsSpin_ ? minClusterPixelsSpin_->value() : 4;
+        max_line_fit_mse = maxLineFitMseSpin_ ? maxLineFitMseSpin_->value() : 12.0;
+        critical_angle_degrees = criticalAngleSpin_ ? criticalAngleSpin_->value() : 10.0;
+        min_white_black_diff = minWhiteBlackDiffSpin_ ? minWhiteBlackDiffSpin_->value() : 4;
+    }
+    
+    // Apply algorithm settings to a specific algorithm instance
+    void applyAlgorithmSettingsToAlgorithm(AprilTagAlgorithm* algorithm) {
+        if (!algorithm) return;
+        
+        double quad_decimate, quad_sigma, decode_sharpening, max_line_fit_mse, critical_angle_degrees;
+        bool refine_edges;
+        int nthreads, min_cluster_pixels, min_white_black_diff;
+        
+        getCurrentAlgorithmParameters(quad_decimate, quad_sigma, refine_edges, decode_sharpening, nthreads,
+                                     min_cluster_pixels, max_line_fit_mse, critical_angle_degrees, min_white_black_diff);
+        
+        algorithm->updateDetectorParameters(
+            quad_decimate, quad_sigma, refine_edges, decode_sharpening, nthreads,
+            min_cluster_pixels, max_line_fit_mse, critical_angle_degrees, min_white_black_diff
+        );
+    }
+    
+    // Apply algorithm settings to detector and processing functions
+    void applyAlgorithmSettings() {
+        // Get parameter values from UI (shared by all algorithms)
+        double quad_decimate, quad_sigma, decode_sharpening, max_line_fit_mse, critical_angle_degrees;
+        bool refine_edges;
+        int nthreads, min_cluster_pixels, min_white_black_diff;
+        
+        getCurrentAlgorithmParameters(quad_decimate, quad_sigma, refine_edges, decode_sharpening, nthreads,
+                                     min_cluster_pixels, max_line_fit_mse, critical_angle_degrees, min_white_black_diff);
+        
+        // Apply to CPU detector (for Capture tab)
+        if (td_) {
+            td_->quad_decimate = quad_decimate;
+            td_->quad_sigma = quad_sigma;
+            td_->refine_edges = refine_edges ? 1 : 0;
+            td_->decode_sharpening = decode_sharpening;
+            td_->nthreads = nthreads;
+            // Recreate worker pool with new thread count
+            if (td_->wp) {
+                workerpool_destroy(td_->wp);
+            }
+            td_->wp = workerpool_create(nthreads);
+            
+            // Apply quad threshold parameters
+            td_->qtp.min_cluster_pixels = min_cluster_pixels;
+            td_->qtp.max_line_fit_mse = max_line_fit_mse;
+            td_->qtp.cos_critical_rad = cos(critical_angle_degrees * M_PI / 180.0);
+            td_->qtp.min_white_black_diff = min_white_black_diff;
+        }
+        
+        // Apply to all algorithms (both CPU and Fast AprilTag) - use same parameters
+        // Apply to current algorithm (if running in Processing tab)
+        if (currentAlgorithm_) {
+            applyAlgorithmSettingsToAlgorithm(currentAlgorithm_.get());
+        }
+        
+        // Apply to capture algorithm (if running in Capture tab)
+        if (captureAlgorithm_) {
+            applyAlgorithmSettingsToAlgorithm(captureAlgorithm_.get());
+        }
+        
+        // Save algorithm settings to current camera's profile
+        saveAlgorithmSettingsToCamera();
+        
+        QMessageBox::information(this, "Algorithm Settings", 
+            "Algorithm settings applied successfully!\n\nSettings saved for current camera.\nChanges will take effect for new detections.");
+    }
+    
+    // Save algorithm settings to current camera's profile
+    void saveAlgorithmSettingsToCamera() {
+        if (currentCameraSettings_.camera_name.empty()) {
+            qDebug() << "No camera selected, cannot save algorithm settings";
             return;
         }
         
-        QTextStream out(&file);
-        out << "# Camera Settings Configuration\n";
-        out << "# Format: camera_name=setting_name=value\n";
-        out << "\n";
+        // Clear existing algorithm settings
+        currentCameraSettings_.algorithm_settings.clear();
         
-        // Write all camera sections
-        for (auto it = cameraSections.begin(); it != cameraSections.end(); ++it) {
-            QString camName = it.key();
-            QStringList settings = it.value();
-            
-            // Find camera type
-            QString camType = "V4L2";
-            for (size_t i = 0; i < cameraList_.size(); i++) {
-                if (QString::fromStdString(cameraList_[i]) == camName) {
-                    camType = isMindVision_[i] ? "MindVision" : "V4L2";
-                    break;
-                }
-            }
-            
-            out << "[Camera]\n";
-            out << "name=" << camName << "\n";
-            out << "type=" << camType << "\n";
-            out << "\n";
-            out << "[Settings]\n";
-            for (const QString& setting : settings) {
-                out << setting << "\n";
-            }
-            out << "\n";
+        // Save algorithm tuning settings to current camera profile
+        // Preprocessing
+        if (preprocessHistEqCheck_) {
+            currentCameraSettings_.algorithm_settings["histogram_equalization"] = preprocessHistEqCheck_->isChecked() ? 1.0 : 0.0;
+        }
+        if (preprocessClaheClipSpin_) {
+            currentCameraSettings_.algorithm_settings["clahe_clip"] = preprocessClaheClipSpin_->value();
+        }
+        if (preprocessGammaSpin_) {
+            currentCameraSettings_.algorithm_settings["gamma"] = preprocessGammaSpin_->value();
+        }
+        if (preprocessContrastSpin_) {
+            currentCameraSettings_.algorithm_settings["contrast_multiplier"] = preprocessContrastSpin_->value();
         }
         
-        file.close();
+        // Edge Detection
+        if (cannyLowSpin_) {
+            currentCameraSettings_.algorithm_settings["canny_low"] = cannyLowSpin_->value();
+        }
+        if (cannyHighSpin_) {
+            currentCameraSettings_.algorithm_settings["canny_high"] = cannyHighSpin_->value();
+        }
+        if (adaptiveThreshBlockSpin_) {
+            currentCameraSettings_.algorithm_settings["adaptive_thresh_block"] = adaptiveThreshBlockSpin_->value();
+        }
+        if (adaptiveThreshConstantSpin_) {
+            currentCameraSettings_.algorithm_settings["adaptive_thresh_constant"] = adaptiveThreshConstantSpin_->value();
+        }
+        
+        // Detection Parameters
+        if (quadDecimateSpin_) {
+            currentCameraSettings_.algorithm_settings["quad_decimate"] = quadDecimateSpin_->value();
+        }
+        if (quadSigmaSpin_) {
+            currentCameraSettings_.algorithm_settings["quad_sigma"] = quadSigmaSpin_->value();
+        }
+        if (refineEdgesCheck_) {
+            currentCameraSettings_.algorithm_settings["refine_edges"] = refineEdgesCheck_->isChecked() ? 1.0 : 0.0;
+        }
+        if (decodeSharpeningSpin_) {
+            currentCameraSettings_.algorithm_settings["decode_sharpening"] = decodeSharpeningSpin_->value();
+        }
+        if (nthreadsSpin_) {
+            currentCameraSettings_.algorithm_settings["nthreads"] = nthreadsSpin_->value();
+        }
+        
+        // Quad Threshold Parameters
+        if (minClusterPixelsSpin_) {
+            currentCameraSettings_.algorithm_settings["min_cluster_pixels"] = minClusterPixelsSpin_->value();
+        }
+        if (maxLineFitMseSpin_) {
+            currentCameraSettings_.algorithm_settings["max_line_fit_mse"] = maxLineFitMseSpin_->value();
+        }
+        if (criticalAngleSpin_) {
+            currentCameraSettings_.algorithm_settings["critical_angle_degrees"] = criticalAngleSpin_->value();
+        }
+        if (minWhiteBlackDiffSpin_) {
+            currentCameraSettings_.algorithm_settings["min_white_black_diff"] = minWhiteBlackDiffSpin_->value();
+        }
+        
+        // Advanced Parameters
+        if (cornerRefineWinSizeSpin_) {
+            currentCameraSettings_.algorithm_settings["corner_refine_win_size"] = cornerRefineWinSizeSpin_->value();
+        }
+        if (cornerRefineMaxIterSpin_) {
+            currentCameraSettings_.algorithm_settings["corner_refine_max_iter"] = cornerRefineMaxIterSpin_->value();
+        }
+        if (patternBorderSizeSpin_) {
+            currentCameraSettings_.algorithm_settings["pattern_border_size"] = patternBorderSizeSpin_->value();
+        }
+        if (tagMinAreaSpin_) {
+            currentCameraSettings_.algorithm_settings["tag_min_area"] = tagMinAreaSpin_->value();
+        }
+        if (tagMaxAreaSpin_) {
+            currentCameraSettings_.algorithm_settings["tag_max_area"] = tagMaxAreaSpin_->value();
+        }
+        
+        // Save to camera_settings.txt file
+        saveCameraSettingsProfile(currentCameraSettings_);
+        
+        qDebug() << "Algorithm settings saved for camera:" << QString::fromStdString(currentCameraSettings_.camera_name);
+    }
+    
+    // Load algorithm settings for current camera from camera profile
+    void loadAlgorithmSettingsForCamera() {
+        if (currentCameraSettings_.camera_name.empty()) {
+            return;
+        }
+        
+        // Load algorithm settings from current camera's profile
+        const map<string, double>& algoSettings = currentCameraSettings_.algorithm_settings;
+        
+        if (algoSettings.empty()) {
+            // No saved settings for this camera, reset to default values
+            resetAlgorithmSettingsToDefaults();
+            return;
+        }
+        
+        // Preprocessing
+        if (algoSettings.find("histogram_equalization") != algoSettings.end() && preprocessHistEqCheck_) {
+            preprocessHistEqCheck_->setChecked(algoSettings.at("histogram_equalization") != 0.0);
+        }
+        if (algoSettings.find("clahe_clip") != algoSettings.end() && preprocessClaheClipSpin_) {
+            preprocessClaheClipSpin_->setValue(algoSettings.at("clahe_clip"));
+        }
+        if (algoSettings.find("gamma") != algoSettings.end() && preprocessGammaSpin_) {
+            preprocessGammaSpin_->setValue(algoSettings.at("gamma"));
+        }
+        if (algoSettings.find("contrast_multiplier") != algoSettings.end() && preprocessContrastSpin_) {
+            preprocessContrastSpin_->setValue(algoSettings.at("contrast_multiplier"));
+        }
+        
+        // Edge Detection
+        if (algoSettings.find("canny_low") != algoSettings.end() && cannyLowSpin_) {
+            cannyLowSpin_->setValue(static_cast<int>(algoSettings.at("canny_low")));
+        }
+        if (algoSettings.find("canny_high") != algoSettings.end() && cannyHighSpin_) {
+            cannyHighSpin_->setValue(static_cast<int>(algoSettings.at("canny_high")));
+        }
+        if (algoSettings.find("adaptive_thresh_block") != algoSettings.end() && adaptiveThreshBlockSpin_) {
+            adaptiveThreshBlockSpin_->setValue(static_cast<int>(algoSettings.at("adaptive_thresh_block")));
+        }
+        if (algoSettings.find("adaptive_thresh_constant") != algoSettings.end() && adaptiveThreshConstantSpin_) {
+            adaptiveThreshConstantSpin_->setValue(static_cast<int>(algoSettings.at("adaptive_thresh_constant")));
+        }
+        
+        // Detection Parameters
+        if (algoSettings.find("quad_decimate") != algoSettings.end() && quadDecimateSpin_) {
+            quadDecimateSpin_->setValue(algoSettings.at("quad_decimate"));
+        }
+        if (algoSettings.find("quad_sigma") != algoSettings.end() && quadSigmaSpin_) {
+            quadSigmaSpin_->setValue(algoSettings.at("quad_sigma"));
+        }
+        if (algoSettings.find("refine_edges") != algoSettings.end() && refineEdgesCheck_) {
+            refineEdgesCheck_->setChecked(algoSettings.at("refine_edges") != 0.0);
+        }
+        if (algoSettings.find("decode_sharpening") != algoSettings.end() && decodeSharpeningSpin_) {
+            decodeSharpeningSpin_->setValue(algoSettings.at("decode_sharpening"));
+        }
+        if (algoSettings.find("nthreads") != algoSettings.end() && nthreadsSpin_) {
+            nthreadsSpin_->setValue(static_cast<int>(algoSettings.at("nthreads")));
+        }
+        
+        // Quad Threshold Parameters
+        if (algoSettings.find("min_cluster_pixels") != algoSettings.end() && minClusterPixelsSpin_) {
+            minClusterPixelsSpin_->setValue(static_cast<int>(algoSettings.at("min_cluster_pixels")));
+        }
+        if (algoSettings.find("max_line_fit_mse") != algoSettings.end() && maxLineFitMseSpin_) {
+            maxLineFitMseSpin_->setValue(algoSettings.at("max_line_fit_mse"));
+        }
+        if (algoSettings.find("critical_angle_degrees") != algoSettings.end() && criticalAngleSpin_) {
+            criticalAngleSpin_->setValue(algoSettings.at("critical_angle_degrees"));
+        }
+        if (algoSettings.find("min_white_black_diff") != algoSettings.end() && minWhiteBlackDiffSpin_) {
+            minWhiteBlackDiffSpin_->setValue(static_cast<int>(algoSettings.at("min_white_black_diff")));
+        }
+        
+        // Advanced Parameters
+        if (algoSettings.find("corner_refine_win_size") != algoSettings.end() && cornerRefineWinSizeSpin_) {
+            cornerRefineWinSizeSpin_->setValue(static_cast<int>(algoSettings.at("corner_refine_win_size")));
+        }
+        if (algoSettings.find("corner_refine_max_iter") != algoSettings.end() && cornerRefineMaxIterSpin_) {
+            cornerRefineMaxIterSpin_->setValue(static_cast<int>(algoSettings.at("corner_refine_max_iter")));
+        }
+        if (algoSettings.find("pattern_border_size") != algoSettings.end() && patternBorderSizeSpin_) {
+            patternBorderSizeSpin_->setValue(static_cast<int>(algoSettings.at("pattern_border_size")));
+        }
+        if (algoSettings.find("tag_min_area") != algoSettings.end() && tagMinAreaSpin_) {
+            tagMinAreaSpin_->setValue(static_cast<int>(algoSettings.at("tag_min_area")));
+        }
+        if (algoSettings.find("tag_max_area") != algoSettings.end() && tagMaxAreaSpin_) {
+            tagMaxAreaSpin_->setValue(static_cast<int>(algoSettings.at("tag_max_area")));
+        }
+        
+        // Apply loaded settings to detector
+        applyAlgorithmSettings();
+        
+        qDebug() << "Algorithm settings loaded for camera:" << QString::fromStdString(currentCameraSettings_.camera_name);
+    }
+    
+    // Load default algorithm settings (public slot for button)
+    void loadDefaultAlgorithmSettings() {
+        resetAlgorithmSettingsToDefaults();
+        QMessageBox::information(this, "Algorithm Settings", 
+            "Default algorithm settings loaded and applied!\n\nAll algorithms (CPU and Fast AprilTag) will use these default values.");
+    }
+    
+    // Reset algorithm settings to default values
+    void resetAlgorithmSettingsToDefaults() {
+        // Preprocessing defaults
+        if (preprocessHistEqCheck_) {
+            preprocessHistEqCheck_->setChecked(false);
+        }
+        if (preprocessClaheClipSpin_) {
+            preprocessClaheClipSpin_->setValue(3.0);
+        }
+        if (preprocessGammaSpin_) {
+            preprocessGammaSpin_->setValue(1.5);
+        }
+        if (preprocessContrastSpin_) {
+            preprocessContrastSpin_->setValue(1.5);
+        }
+        
+        // Edge Detection defaults
+        if (cannyLowSpin_) {
+            cannyLowSpin_->setValue(50);
+        }
+        if (cannyHighSpin_) {
+            cannyHighSpin_->setValue(150);
+        }
+        if (adaptiveThreshBlockSpin_) {
+            adaptiveThreshBlockSpin_->setValue(11);
+        }
+        if (adaptiveThreshConstantSpin_) {
+            adaptiveThreshConstantSpin_->setValue(2);
+        }
+        
+        // Detection Parameters defaults
+        if (quadDecimateSpin_) {
+            quadDecimateSpin_->setValue(2.0);
+        }
+        if (quadSigmaSpin_) {
+            quadSigmaSpin_->setValue(0.0);
+        }
+        if (refineEdgesCheck_) {
+            refineEdgesCheck_->setChecked(true);
+        }
+        if (decodeSharpeningSpin_) {
+            decodeSharpeningSpin_->setValue(0.5);  // Increased from 0.25 to 0.5 for better decoding in various lighting
+        }
+        if (nthreadsSpin_) {
+            nthreadsSpin_->setValue(4);
+        }
+        
+        // Quad Threshold Parameters defaults (more sensitive for better detection)
+        // Lower values = more sensitive (detects more tags, including lower quality ones)
+        if (minClusterPixelsSpin_) {
+            minClusterPixelsSpin_->setValue(4);  // Lowered from 6 to 4 for better sensitivity
+        }
+        if (maxLineFitMseSpin_) {
+            maxLineFitMseSpin_->setValue(12.0);  // Increased from 8.0 to 12.0 (more lenient line fitting)
+        }
+        if (criticalAngleSpin_) {
+            criticalAngleSpin_->setValue(10.0);  // Increased from 7.0 to 10.0 (more angle tolerance)
+        }
+        if (minWhiteBlackDiffSpin_) {
+            minWhiteBlackDiffSpin_->setValue(4);  // Lowered from 6 to 4 (detect tags with lower contrast)
+        }
+        
+        // Advanced Parameters defaults
+        if (cornerRefineWinSizeSpin_) {
+            cornerRefineWinSizeSpin_->setValue(5);
+        }
+        if (cornerRefineMaxIterSpin_) {
+            cornerRefineMaxIterSpin_->setValue(30);
+        }
+        if (patternBorderSizeSpin_) {
+            patternBorderSizeSpin_->setValue(4);
+        }
+        if (tagMinAreaSpin_) {
+            tagMinAreaSpin_->setValue(500);
+        }
+        if (tagMaxAreaSpin_) {
+            tagMaxAreaSpin_->setValue(50000);
+        }
+        
+        // Apply default settings to detector
+        applyAlgorithmSettings();
+        
+        qDebug() << "Algorithm settings reset to defaults for camera:" << QString::fromStdString(currentCameraSettings_.camera_name);
     }
     
     void loadCameraSettingsForAlgorithm() {
@@ -6552,21 +8583,14 @@ private:
         }
         
         QTextStream in(&file);
-        int cameraIndex = algorithmCameraCombo_->currentIndex();
-        if (cameraIndex < 0 || cameraIndex >= (int)algorithmCameraCombo_->count()) {
+        // Use the shared camera from top-level controls
+        if (!cameraOpen_ || selectedCameraIndex_ < 0) {
             file.close();
             return;
         }
         
-        // Map algorithm camera index to actual camera list index (skip "None" at index 0)
-        int actualCameraIndex = cameraIndex + 1;  // +1 to skip "None"
-        if (actualCameraIndex < 0 || actualCameraIndex >= (int)cameraList_.size()) {
-            file.close();
-            return;
-        }
-        
-        QString cameraName = QString::fromStdString(cameraList_[actualCameraIndex]);
-        QString currentType = algorithmUseMindVision_ ? "MindVision" : "V4L2";
+        QString cameraName = QString::fromStdString(cameraList_[selectedCameraIndex_]);
+        QString currentType = useMindVision_ ? "MindVision" : "V4L2";
         
         QString section;
         bool settingsSection = false;
@@ -6642,64 +8666,64 @@ private:
         
         // Apply settings directly to camera if they were loaded
         if (cameraMatches) {
-            if (algorithmUseMindVision_) {
+            if (useMindVision_) {
 #ifdef HAVE_MINDVISION_SDK
-                if (algorithmMvHandle_ != 0) {
+                if (mvHandle_ != 0) {
                     // Apply exposure
                     if (savedExposure >= 0) {
                         double min_exposure = 1000.0;
                         double max_exposure = 100000.0;
                         double exposure = max_exposure - (savedExposure / 100.0) * (max_exposure - min_exposure);
-                        CameraSetExposureTime(algorithmMvHandle_, exposure);
+                        CameraSetExposureTime(mvHandle_, exposure);
                     }
                     
                     // Apply gain
                     if (savedGain >= 0) {
-                        CameraSetGain(algorithmMvHandle_, savedGain, savedGain, savedGain);
+                        CameraSetGain(mvHandle_, savedGain, savedGain, savedGain);
                     }
                     
                     // Apply brightness (analog gain)
                     if (savedBrightness >= 0) {
                         INT analogGain = (savedBrightness * 100) / 255;
-                        CameraSetAnalogGain(algorithmMvHandle_, analogGain);
+                        CameraSetAnalogGain(mvHandle_, analogGain);
                     }
                     
                     // Apply contrast
                     if (savedContrast >= 0) {
-                        CameraSetContrast(algorithmMvHandle_, savedContrast);
+                        CameraSetContrast(mvHandle_, savedContrast);
                     }
                     
                     // Apply saturation
                     if (savedSaturation >= 0) {
-                        CameraSetSaturation(algorithmMvHandle_, savedSaturation);
+                        CameraSetSaturation(mvHandle_, savedSaturation);
                     }
                     
                     // Apply sharpness
                     if (savedSharpness >= 0) {
-                        CameraSetSharpness(algorithmMvHandle_, savedSharpness);
+                        CameraSetSharpness(mvHandle_, savedSharpness);
                     }
                 }
 #endif
             } else {
-                // Apply V4L2 settings
-                if (algorithmCamera_.isOpened()) {
+                // Apply V4L2 settings (use shared camera)
+                if (cameraCap_.isOpened()) {
                     if (savedExposure >= 0) {
-                        algorithmCamera_.set(CAP_PROP_EXPOSURE, savedExposure);
+                        cameraCap_.set(CAP_PROP_EXPOSURE, savedExposure);
                     }
                     if (savedGain >= 0) {
-                        algorithmCamera_.set(CAP_PROP_GAIN, savedGain);
+                        cameraCap_.set(CAP_PROP_GAIN, savedGain);
                     }
                     if (savedBrightness >= 0) {
-                        algorithmCamera_.set(CAP_PROP_BRIGHTNESS, savedBrightness);
+                        cameraCap_.set(CAP_PROP_BRIGHTNESS, savedBrightness);
                     }
                     if (savedContrast >= 0) {
-                        algorithmCamera_.set(CAP_PROP_CONTRAST, savedContrast);
+                        cameraCap_.set(CAP_PROP_CONTRAST, savedContrast);
                     }
                     if (savedSaturation >= 0) {
-                        algorithmCamera_.set(CAP_PROP_SATURATION, savedSaturation);
+                        cameraCap_.set(CAP_PROP_SATURATION, savedSaturation);
                     }
                     if (savedSharpness >= 0) {
-                        algorithmCamera_.set(CAP_PROP_SHARPNESS, savedSharpness);
+                        cameraCap_.set(CAP_PROP_SHARPNESS, savedSharpness);
                     }
                 }
             }
